@@ -1,1 +1,5 @@
-
+alpaca-trade-api==3.3.2
+flask==3.0.3
+flask-socketio==5.3.6
+pytz==2024.1
+eventlet==0.36.1
