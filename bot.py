@@ -5,8 +5,8 @@ import alpaca_trade_api as tradeapi
 from flask import Flask, render_template, jsonify
 from flask_socketio import SocketIO
 
-API_KEY    = os.environ.get("ALPACA_API_KEY")
-SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+API_KEY    = os.environ.get("AKKV2ZK5ZAHGNPPY4JT7SLWPF2")
+SECRET_KEY = os.environ.get("A6R4jsRgJiLoFGJR3ZpzbThGktZsVkkY4V4xpmXHvqzR")
 BASE_URL   = "https://paper-api.alpaca.markets"
 
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
