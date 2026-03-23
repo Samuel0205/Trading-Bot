@@ -1,4 +1,4 @@
-import os, time, json, threading
+import os, time, threading
 from datetime import datetime
 import pytz
 import alpaca_trade_api as tradeapi
@@ -9,14 +9,17 @@ API_KEY    = os.environ.get("APCA_API_KEY_ID")
 SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
 BASE_URL   = "https://paper-api.alpaca.markets"
 
+if not API_KEY or not SECRET_KEY:
+    raise ValueError("Missing Alpaca API keys. Set APCA_API_KEY_ID and APCA_API_SECRET_KEY in environment variables.")
+
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-TICKERS    = ["AAPL", "TSLA", "NVDA", "MSFT"]
-RISK_PCT   = 0.015   # 1.5% of portfolio per trade
-THRESHOLD  = 3       # bots that must agree to trade
-INTERVAL   = 60      # seconds between cycles (1 min)
+TICKERS   = ["AAPL", "TSLA", "NVDA", "MSFT"]
+RISK_PCT  = 0.015  # 1.5% of portfolio per trade
+THRESHOLD = 3      # bots that must agree to trade
+INTERVAL  = 60     # seconds between cycles
 
 price_history = {t: [] for t in TICKERS}
 trade_log     = []
@@ -48,34 +51,29 @@ def calc_bollinger(prices, n=20):
 def get_signals(ticker, price):
     hist = price_history[ticker]
     if len(hist) < 5:
-        return [{"action": "hold", "signal": 50}] * 4
-
-    rsi         = calc_rsi(hist)
-    ma50        = calc_ma(hist, min(50,  len(hist)))
-    ma200       = calc_ma(hist, min(200, len(hist)))
+        return [{"name": n, "action": "hold", "signal": 50}
+                for n in ["MA Crossover","RSI","Bollinger","Mean Reversion"]]
+    rsi              = calc_rsi(hist)
+    ma50             = calc_ma(hist, min(50,  len(hist)))
+    ma200            = calc_ma(hist, min(200, len(hist)))
     mean, upper, lower = calc_bollinger(hist)
-    z_score     = (price - mean) / max((upper - mean), 0.01)
-
+    z_score          = (price - mean) / max((upper - mean), 0.01)
     return [
-        # MA Crossover
         {"name": "MA Crossover",
          "action": "buy" if ma50 > ma200*1.005 else "sell" if ma200 > ma50*1.005 else "hold",
          "signal": min(95, 50 + (ma50-ma200)/max(ma200,1)*600)},
-        # RSI
         {"name": "RSI",
          "action": "buy" if rsi < 32 else "sell" if rsi > 68 else "hold",
          "signal": 100 - rsi},
-        # Bollinger Bands
         {"name": "Bollinger",
          "action": "buy" if price < lower*0.99 else "sell" if price > upper*1.01 else "hold",
          "signal": max(5, min(95, 50 - z_score*40))},
-        # Mean Reversion
         {"name": "Mean Reversion",
          "action": "buy" if price < mean*0.96 else "sell" if price > mean*1.04 else "hold",
          "signal": min(92, max(8, 50 + (mean-price)/max(mean,1)*250))},
     ]
 
-# ── Market hours check ────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────
 
 def is_market_open():
     ny  = pytz.timezone("America/New_York")
@@ -84,13 +82,33 @@ def is_market_open():
         return False
     return 9 <= now.hour < 16
 
-# ── Position sizing ───────────────────────────────────────────
-
 def position_size(price):
-    account    = api.get_account()
-    portfolio  = float(account.portfolio_value)
-    risk_amt   = portfolio * RISK_PCT
+    acct     = api.get_account()
+    risk_amt = float(acct.equity) * RISK_PCT
     return max(1, int(risk_amt / price))
+
+def get_account_state():
+    acct = api.get_account()
+    return {
+        "portfolio": round(float(acct.equity), 2),
+        "cash":      round(float(acct.cash), 2),
+        "pnl":       round(float(acct.equity) - float(acct.last_equity), 2),
+    }
+
+# ── On client connect — send data immediately ─────────────────
+
+@socketio.on("connect")
+def on_connect():
+    print("Client connected")
+    try:
+        socketio.emit("state", {
+            "tickers":       {},
+            "account":       get_account_state(),
+            "trades":        trade_log[:40],
+            "market_status": "open" if is_market_open() else "closed"
+        })
+    except Exception as e:
+        print(f"on_connect error: {e}")
 
 # ── Trade execution ───────────────────────────────────────────
 
@@ -98,29 +116,21 @@ def execute(ticker, action, price):
     try:
         if action == "buy":
             qty = position_size(price)
-            api.submit_order(
-                symbol=ticker, qty=qty,
-                side="buy", type="market",
-                time_in_force="day"
-            )
+            api.submit_order(symbol=ticker, qty=qty, side="buy",
+                             type="market", time_in_force="day")
             trade_log.insert(0, {"type":"BUY","ticker":ticker,"qty":qty,"price":round(price,2),"pnl":None})
             print(f"BUY  {qty}x {ticker} @ ${price:.2f}")
-
         elif action == "sell":
             try:
                 pos = api.get_position(ticker)
                 qty = max(1, int(int(pos.qty) / 2))
-                avg = float(pos.avg_entry_price)
-                pnl = round((price - avg) * qty, 2)
-                api.submit_order(
-                    symbol=ticker, qty=qty,
-                    side="sell", type="market",
-                    time_in_force="day"
-                )
+                pnl = round((price - float(pos.avg_entry_price)) * qty, 2)
+                api.submit_order(symbol=ticker, qty=qty, side="sell",
+                                 type="market", time_in_force="day")
                 trade_log.insert(0, {"type":"SELL","ticker":ticker,"qty":qty,"price":round(price,2),"pnl":pnl})
                 print(f"SELL {qty}x {ticker} @ ${price:.2f}  PnL ${pnl}")
             except:
-                pass  # no position to sell
+                pass
     except Exception as e:
         print(f"Order error: {e}")
 
@@ -129,11 +139,20 @@ def execute(ticker, action, price):
 def bot_loop():
     while True:
         if not is_market_open():
-            print("Market closed — sleeping 5 min")
-            time.sleep(300)
+            print("Market closed — sleeping 60s")
+            try:
+                socketio.emit("state", {
+                    "tickers":       {},
+                    "account":       get_account_state(),
+                    "trades":        trade_log[:40],
+                    "market_status": "closed"
+                })
+            except Exception as e:
+                print(f"Account fetch error: {e}")
+            time.sleep(60)
             continue
 
-        state = {"tickers": {}, "account": {}}
+        state = {"tickers": {}, "account": {}, "market_status": "open"}
 
         for ticker in TICKERS:
             try:
@@ -146,11 +165,9 @@ def bot_loop():
                 sigs  = get_signals(ticker, price)
                 buys  = sum(1 for s in sigs if s["action"] == "buy")
                 sells = sum(1 for s in sigs if s["action"] == "sell")
-
                 action = "hold"
                 if buys  >= THRESHOLD: action = "buy"
                 elif sells >= THRESHOLD: action = "sell"
-
                 if action != "hold":
                     execute(ticker, action, price)
 
@@ -165,12 +182,7 @@ def bot_loop():
                 print(f"{ticker} error: {e}")
 
         try:
-            acct = api.get_account()
-            state["account"] = {
-                "portfolio": round(float(acct.portfolio_value), 2),
-                "cash":      round(float(acct.cash), 2),
-                "pnl":       round(float(acct.portfolio_value) - 10000, 2),
-            }
+            state["account"] = get_account_state()
         except Exception as e:
             print(f"Account error: {e}")
 
