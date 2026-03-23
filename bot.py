@@ -11,7 +11,8 @@ SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
 BASE_URL   = "https://paper-api.alpaca.markets"
 
 TICKERS   = ["AAPL", "TSLA", "NVDA", "MSFT"]
-RISK_PCT  = 0.01
+RISK_PCT  = 0.015
+THRESHOLD = 3
 INTERVAL  = 60
 STOP_LOSS = 0.02
 TAKE_PROFIT = 0.04
@@ -68,13 +69,14 @@ def volume_spike(volumes):
     avg = sum(volumes[:-1]) / len(volumes[:-1])
     return volumes[-1] > avg * 1.5
 
-# ================= SIGNAL ENGINE =================
+# ================= SIGNAL ENGINE (UI SAFE) =================
 def get_signals(ticker, price):
     hist = price_history[ticker]
     vols = volume_history[ticker]
 
-    if len(hist) < 20:
-        return []
+    if len(hist) < 5:
+        return [{"name": n, "action": "hold", "signal": 50}
+                for n in ["MA Crossover","RSI","Bollinger","Mean Reversion"]]
 
     rsi = calc_rsi(hist)
     ma50 = calc_ma(hist, min(50, len(hist)))
@@ -84,47 +86,51 @@ def get_signals(ticker, price):
 
     signals = []
 
-    # Trend
-    if ma50 > ma200:
-        signals.append({"name":"Trend","action":"buy","signal":70})
-    else:
-        signals.append({"name":"Trend","action":"sell","signal":70})
+    # MA Crossover
+    signals.append({
+        "name": "MA Crossover",
+        "action": "buy" if ma50 > ma200 else "sell",
+        "signal": 70
+    })
 
     # RSI
-    if rsi < 30:
-        signals.append({"name":"RSI","action":"buy","signal":80})
-    elif rsi > 70:
-        signals.append({"name":"RSI","action":"sell","signal":80})
-    else:
-        signals.append({"name":"RSI","action":"hold","signal":50})
+    signals.append({
+        "name": "RSI",
+        "action": "buy" if rsi < 32 else "sell" if rsi > 68 else "hold",
+        "signal": 100 - rsi
+    })
 
     # Bollinger
-    if price < lower:
-        signals.append({"name":"Bollinger","action":"buy","signal":75})
-    elif price > upper:
-        signals.append({"name":"Bollinger","action":"sell","signal":75})
-    else:
-        signals.append({"name":"Bollinger","action":"hold","signal":50})
+    signals.append({
+        "name": "Bollinger",
+        "action": "buy" if price < lower else "sell" if price > upper else "hold",
+        "signal": 60
+    })
 
-    # Momentum
+    # Mean Reversion
+    signals.append({
+        "name": "Mean Reversion",
+        "action": "buy" if price < mean else "sell" if price > mean else "hold",
+        "signal": 60
+    })
+
+    # Momentum boost
     if mom > 0:
         signals.append({"name":"Momentum","action":"buy","signal":65})
     else:
         signals.append({"name":"Momentum","action":"sell","signal":65})
 
-    # Volume spike
+    # Volume boost
     if volume_spike(vols):
-        signals.append({"name":"Volume Spike","action":"buy","signal":85})
+        signals.append({"name":"Volume Spike","action":"buy","signal":80})
 
     return signals
 
-# ================= RISK =================
+# ================= EXECUTION =================
 def position_size(price):
     acct = api.get_account()
-    equity = float(acct.equity)
-    return max(1, int((equity * RISK_PCT) / price))
+    return max(1, int(float(acct.equity) * RISK_PCT / price))
 
-# ================= EXECUTION =================
 def execute(ticker, action, price):
     try:
         if action == "buy":
@@ -133,18 +139,16 @@ def execute(ticker, action, price):
                              type="market", time_in_force="day")
             positions[ticker] = price
             trade_log.insert(0, {"type":"BUY","ticker":ticker,"qty":qty,"price":round(price,2)})
-            print(f"BUY {ticker} {qty} @ {price}")
 
         elif action == "sell":
             pos = api.get_position(ticker)
-            qty = int(pos.qty)
+            qty = max(1, int(int(pos.qty) / 2))
+            pnl = round((price - float(pos.avg_entry_price)) * qty, 2)
+
             api.submit_order(symbol=ticker, qty=qty, side="sell",
                              type="market", time_in_force="day")
-            entry = positions.get(ticker, price)
-            pnl = round((price - entry) * qty, 2)
-            positions.pop(ticker, None)
+
             trade_log.insert(0, {"type":"SELL","ticker":ticker,"qty":qty,"price":round(price,2),"pnl":pnl})
-            print(f"SELL {ticker} {qty} @ {price} PnL={pnl}")
 
     except Exception as e:
         print("Order error:", e)
@@ -153,40 +157,20 @@ def execute(ticker, action, price):
 @socketio.on("connect")
 def on_connect():
     print("Client connected")
-    try:
-        state = {
-            "tickers": {},
-            "account": get_account_state(),
-            "trades": trade_log[:40],
-            "market_status": "open"
-        }
-
-        for ticker in TICKERS:
-            try:
-                bar = api.get_latest_bar(ticker)
-                price = float(bar.c)
-
-                state["tickers"][ticker] = {
-                    "price": round(price, 2),
-                    "score": 0,
-                    "action": "hold",
-                    "signals": [],
-                    "buys": 0,
-                    "sells": 0
-                }
-            except Exception as e:
-                print("Connect ticker error:", e)
-
-        socketio.emit("state", state)
-
-    except Exception as e:
-        print("Connect error:", e)
+    state = {
+        "tickers": {},
+        "account": get_account_state(),
+        "trades": trade_log[:40],
+        "market_status": "open"
+    }
+    socketio.emit("state", state)
 
 # ================= BOT LOOP =================
 def bot_loop():
     while True:
         try:
             clock = api.get_clock()
+
             if not clock.is_open:
                 socketio.emit("state", {
                     "tickers": {},
@@ -221,15 +205,7 @@ def bot_loop():
                 buys  = sum(1 for s in sigs if s["action"] == "buy")
                 sells = sum(1 for s in sigs if s["action"] == "sell")
 
-                score = sum(s["signal"] if s["action"] == "buy"
-                            else -s["signal"] if s["action"] == "sell"
-                            else 0 for s in sigs)
-
-                action = "hold"
-                if score > 100:
-                    action = "buy"
-                elif score < -100:
-                    action = "sell"
+                action = "buy" if buys >= THRESHOLD else "sell" if sells >= THRESHOLD else "hold"
 
                 # Risk exits
                 if ticker in positions:
@@ -244,9 +220,8 @@ def bot_loop():
 
                 state["tickers"][ticker] = {
                     "price": round(price, 2),
-                    "score": score,
-                    "action": action,
                     "signals": sigs,
+                    "action": action,
                     "buys": buys,
                     "sells": sells
                 }
