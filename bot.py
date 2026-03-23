@@ -28,8 +28,16 @@ volume_history = {t: [] for t in TICKERS}
 positions = {}
 trade_log = []
 
-# ================= INDICATORS =================
+# ================= ACCOUNT =================
+def get_account_state():
+    acct = api.get_account()
+    return {
+        "portfolio": round(float(acct.equity), 2),
+        "cash": round(float(acct.cash), 2),
+        "pnl": round(float(acct.equity) - float(acct.last_equity), 2),
+    }
 
+# ================= INDICATORS =================
 def calc_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50
@@ -61,7 +69,6 @@ def volume_spike(volumes):
     return volumes[-1] > avg * 1.5
 
 # ================= MARKET REGIME =================
-
 def market_regime(prices):
     if len(prices) < 50:
         return "neutral"
@@ -75,17 +82,8 @@ def market_regime(prices):
     else:
         return "sideways"
 
-# ================= CANDLE PATTERNS =================
-
-def bullish_engulfing(prev_open, prev_close, open_, close):
-    return prev_close < prev_open and close > open_ and close > prev_open and open_ < prev_close
-
-def bearish_engulfing(prev_open, prev_close, open_, close):
-    return prev_close > prev_open and close < open_ and close < prev_open and open_ > prev_close
-
 # ================= SIGNAL ENGINE =================
-
-def get_score(ticker, price, bar):
+def get_score(ticker, price):
     hist = price_history[ticker]
     vols = volume_history[ticker]
 
@@ -102,8 +100,7 @@ def get_score(ticker, price, bar):
     score = 0
 
     # Trend
-    if ma50 > ma200: score += 20
-    else: score -= 20
+    score += 20 if ma50 > ma200 else -20
 
     # RSI
     if rsi < 30: score += 15
@@ -114,57 +111,102 @@ def get_score(ticker, price, bar):
     elif price > upper: score -= 10
 
     # Momentum
-    if mom > 0: score += 10
-    else: score -= 10
+    score += 10 if mom > 0 else -10
 
     # Volume
     if volume_spike(vols): score += 15
 
-    # Regime adjustment
+    # Regime
     if regime == "bull": score += 10
     elif regime == "bear": score -= 10
 
     return score
 
 # ================= RISK =================
-
 def position_size(price):
     acct = api.get_account()
     equity = float(acct.equity)
     return max(1, int((equity * RISK_PCT) / price))
 
 # ================= EXECUTION =================
-
 def execute(ticker, action, price):
     try:
         if action == "buy":
             qty = position_size(price)
-            api.submit_order(symbol=ticker, qty=qty, side="buy", type="market", time_in_force="day")
+            api.submit_order(symbol=ticker, qty=qty, side="buy",
+                             type="market", time_in_force="day")
             positions[ticker] = price
             trade_log.insert(0, {"type":"BUY","ticker":ticker,"qty":qty,"price":round(price,2)})
+            print(f"BUY {ticker} {qty} @ {price}")
 
         elif action == "sell":
             pos = api.get_position(ticker)
             qty = int(pos.qty)
-            api.submit_order(symbol=ticker, qty=qty, side="sell", type="market", time_in_force="day")
+            api.submit_order(symbol=ticker, qty=qty, side="sell",
+                             type="market", time_in_force="day")
             entry = positions.get(ticker, price)
             pnl = round((price - entry) * qty, 2)
             positions.pop(ticker, None)
             trade_log.insert(0, {"type":"SELL","ticker":ticker,"qty":qty,"price":round(price,2),"pnl":pnl})
+            print(f"SELL {ticker} {qty} @ {price} PnL={pnl}")
+
     except Exception as e:
         print("Order error:", e)
 
-# ================= BOT LOOP =================
+# ================= SOCKET CONNECT =================
+@socketio.on("connect")
+def on_connect():
+    print("Client connected")
+    try:
+        state = {
+            "tickers": {},
+            "account": get_account_state(),
+            "trades": trade_log[:40],
+            "market_status": "open"
+        }
 
+        for ticker in TICKERS:
+            try:
+                bar = api.get_latest_bar(ticker)
+                price = float(bar.c)
+
+                state["tickers"][ticker] = {
+                    "price": round(price, 2),
+                    "score": 0,
+                    "action": "hold",
+                    "signals": [],
+                    "buys": 0,
+                    "sells": 0
+                }
+            except Exception as e:
+                print("Connect ticker error:", e)
+
+        socketio.emit("state", state)
+
+    except Exception as e:
+        print("Connect error:", e)
+
+# ================= BOT LOOP =================
 def bot_loop():
     while True:
         try:
             clock = api.get_clock()
             if not clock.is_open:
+                socketio.emit("state", {
+                    "tickers": {},
+                    "account": get_account_state(),
+                    "trades": trade_log[:40],
+                    "market_status": "closed"
+                })
                 time.sleep(60)
                 continue
 
-            state = {"tickers":{}, "market_status":"open"}
+            state = {
+                "tickers": {},
+                "account": {},
+                "trades": trade_log[:40],
+                "market_status": "open"
+            }
 
             for ticker in TICKERS:
                 bar = api.get_latest_bar(ticker)
@@ -178,7 +220,7 @@ def bot_loop():
                     price_history[ticker].pop(0)
                     volume_history[ticker].pop(0)
 
-                score = get_score(ticker, price, bar)
+                score = get_score(ticker, price)
 
                 action = "hold"
                 if score > 40:
@@ -198,12 +240,15 @@ def bot_loop():
                     execute(ticker, action, price)
 
                 state["tickers"][ticker] = {
-                    "price": round(price,2),
+                    "price": round(price, 2),
                     "score": score,
-                    "action": action
+                    "action": action,
+                    "signals": [],
+                    "buys": 0,
+                    "sells": 0
                 }
 
-            state["trades"] = trade_log[:40]
+            state["account"] = get_account_state()
             socketio.emit("state", state)
 
         except Exception as e:
@@ -212,7 +257,6 @@ def bot_loop():
         time.sleep(INTERVAL)
 
 # ================= ROUTES =================
-
 @app.route("/")
 def index():
     return render_template("dashboard.html")
@@ -222,7 +266,6 @@ def state_json():
     return jsonify({"trades": trade_log[:20]})
 
 # ================= START =================
-
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
