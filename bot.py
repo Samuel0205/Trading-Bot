@@ -76,11 +76,12 @@ def get_signals(ticker, price):
 # ── Helpers ───────────────────────────────────────────────────
 
 def is_market_open():
-    ny  = pytz.timezone("America/New_York")
-    now = datetime.now(ny)
-    if now.weekday() >= 5:
+    try:
+        clock = api.get_clock()
+        return clock.is_open
+    except Exception as e:
+        print(f"Clock error: {e}")
         return False
-    return 9 <= now.hour < 16
 
 def position_size(price):
     acct     = api.get_account()
