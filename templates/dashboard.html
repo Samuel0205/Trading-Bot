@@ -5,66 +5,78 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Trading Bot</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f1117; color: #e8e8e8; padding: 12px; font-size: 14px; }
-  h2 { font-size: 13px; font-weight: 500; color: #888; margin: 16px 0 8px; text-transform: uppercase; letter-spacing: .05em; }
-  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
-  .header h1 { font-size: 18px; font-weight: 600; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: #1D9E75; animation: pulse 1.5s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1}50%{opacity:.3} }
-  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 4px; }
-  .card { background: #1a1d27; border-radius: 10px; padding: 12px; }
-  .card .lbl { font-size: 11px; color: #666; margin-bottom: 4px; }
-  .card .val { font-size: 22px; font-weight: 600; }
-  .up { color: #1D9E75; } .down { color: #D85A30; }
-  .bots { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  .bot { background: #1a1d27; border-radius: 10px; padding: 12px; }
-  .bot-top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-  .bot-icon { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; flex-shrink: 0; }
-  .bot-name { font-size: 12px; font-weight: 500; }
-  .bar-bg { height: 5px; border-radius: 3px; background: #2a2d3a; margin-bottom: 6px; overflow: hidden; }
-  .bar-fill { height: 100%; border-radius: 3px; transition: width .7s ease; }
-  .badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 600; }
-  .badge-buy { background: #0F6E5622; color: #1D9E75; }
-  .badge-sell { background: #D85A3022; color: #D85A30; }
-  .badge-hold { background: #44444422; color: #888; }
-  .consensus { background: #1a1d27; border-radius: 10px; padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
-  .votes { display: flex; gap: 5px; }
-  .vote { width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; }
-  .v-buy { background: #0F6E5622; color: #1D9E75; }
-  .v-sell { background: #D85A3022; color: #D85A30; }
-  .v-hold { background: #2a2d3a; color: #888; }
-  .verdict { font-size: 12px; font-weight: 500; }
-  .tickers { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
-  .tchip { padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 500; background: #1a1d27; color: #888; cursor: pointer; border: 1px solid transparent; }
-  .tchip.active { color: #4a9eff; border-color: #4a9eff33; background: #4a9eff11; }
-  .trades { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
-  .trade { display: flex; align-items: center; gap: 8px; background: #1a1d27; border-radius: 8px; padding: 10px 12px; font-size: 12px; }
-  .trade-type { font-weight: 600; min-width: 36px; }
-  .trade-pnl { margin-left: auto; font-weight: 600; }
-  .status-bar { font-size: 11px; color: #555; text-align: center; margin-top: 16px; }
-  .price-tag { font-size: 11px; color: #888; margin-left: auto; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f1117; color: #e8e8e8; padding: 12px; font-size: 14px; }
+h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-transform: uppercase; letter-spacing: .08em; }
+.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #1D9E75; animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100%{opacity:1}50%{opacity:.3} }
+.cards { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 4px; }
+.card { background: #1a1d27; border-radius: 10px; padding: 12px; }
+.card .lbl { font-size: 11px; color: #666; margin-bottom: 4px; }
+.card .val { font-size: 22px; font-weight: 600; }
+.up { color: #1D9E75; } .down { color: #D85A30; }
+.chart-card { background: #1a1d27; border-radius: 10px; padding: 14px; margin-top: 8px; }
+.chart-wrap { position: relative; width: 100%; height: 160px; }
+.bots { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.bot { background: #1a1d27; border-radius: 10px; padding: 12px; }
+.bot-top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.bot-icon { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; flex-shrink: 0; }
+.bot-name { font-size: 12px; font-weight: 500; }
+.bar-bg { height: 5px; border-radius: 3px; background: #2a2d3a; margin-bottom: 6px; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 3px; transition: width .7s ease; }
+.badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+.badge-buy { background: #0F6E5622; color: #1D9E75; }
+.badge-sell { background: #D85A3022; color: #D85A30; }
+.badge-hold { background: #44444422; color: #888; }
+.consensus { background: #1a1d27; border-radius: 10px; padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.votes { display: flex; gap: 5px; }
+.vote { width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; }
+.v-buy { background: #0F6E5622; color: #1D9E75; }
+.v-sell { background: #D85A3022; color: #D85A30; }
+.v-hold { background: #2a2d3a; color: #888; }
+.verdict { font-size: 12px; font-weight: 500; }
+.tickers { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.tchip { padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 500; background: #1a1d27; color: #888; cursor: pointer; border: 1px solid transparent; }
+.tchip.active { color: #4a9eff; border-color: #4a9eff33; background: #4a9eff11; }
+.tchip .price { font-size: 10px; color: #555; margin-left: 3px; }
+.trades { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+.trade { display: flex; align-items: center; gap: 8px; background: #1a1d27; border-radius: 8px; padding: 10px 12px; font-size: 12px; }
+.trade-type { font-weight: 600; min-width: 36px; }
+.trade-pnl { margin-left: auto; font-weight: 600; }
+.status-bar { font-size: 11px; color: #444; text-align: center; margin-top: 16px; padding-bottom: 8px; }
+.market-closed { color: #555; font-size: 13px; padding: 16px; text-align: center; grid-column: span 2; }
 </style>
 </head>
 <body>
 
 <div class="header">
   <h1>Trading Bot</h1>
-  <div style="display:flex;align-items:center;gap:8px;"><div class="dot" id="dot"></div><span id="statusTxt" style="font-size:12px;color:#555;">Connecting...</span></div>
+  <div style="display:flex;align-items:center;gap:8px;">
+    <div class="dot" id="dot"></div>
+    <span id="statusTxt" style="font-size:12px;color:#555;">Connecting...</span>
+  </div>
 </div>
 
 <div class="cards">
   <div class="card"><div class="lbl">Portfolio</div><div class="val" id="port">—</div></div>
   <div class="card"><div class="lbl">Cash</div><div class="val" id="cash">—</div></div>
-  <div class="card" style="grid-column:span 2;"><div class="lbl">Total P&L</div><div class="val" id="pnl">—</div></div>
+  <div class="card" style="grid-column:span 2;"><div class="lbl">Total P&L (vs yesterday)</div><div class="val" id="pnl">—</div></div>
+</div>
+
+<div class="chart-card">
+  <div style="font-size:11px;color:#555;margin-bottom:10px;text-transform:uppercase;letter-spacing:.08em;">Portfolio over session</div>
+  <div class="chart-wrap"><canvas id="portChart"></canvas></div>
 </div>
 
 <h2>Watching</h2>
 <div class="tickers" id="tickers"></div>
 
 <div class="consensus" id="consensus">
-  <div style="font-size:12px;color:#666;">Bot consensus</div>
+  <div style="font-size:12px;color:#555;">Bot consensus</div>
   <div class="votes" id="votes"></div>
   <div class="verdict" id="verdict">Waiting...</div>
 </div>
@@ -78,11 +90,59 @@
 <div class="status-bar" id="lastUpdate">Not yet connected</div>
 
 <script>
-const COLORS = ['#4a9eff','#1D9E75','#E9A84C','#C45C8A'];
+const COLORS   = ['#4a9eff','#1D9E75','#E9A84C','#C45C8A'];
 const BOT_NAMES = ['MA','RSI','BB','MR'];
+const DEFAULT_TICKERS = ['AAPL','TSLA','NVDA','MSFT'];
 let activeTicker = null;
-let lastState = null;
+let lastState    = null;
+let portHistory  = [];
+let portChart;
 
+// ── Chart ─────────────────────────────────────────────────────
+function initChart() {
+  portChart = new Chart(document.getElementById('portChart'), {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        data: [],
+        borderColor: '#4a9eff',
+        borderWidth: 2,
+        fill: true,
+        backgroundColor: 'rgba(74,158,255,0.08)',
+        pointRadius: 0,
+        tension: 0.3
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        y: {
+          ticks: { color: '#555', font: { size: 11 }, callback: v => '$' + v.toLocaleString() },
+          grid: { color: '#1e2130' }
+        },
+        x: { display: false }
+      }
+    }
+  });
+}
+
+function updateChart(portfolioVal) {
+  if (!portfolioVal) return;
+  portHistory.push(portfolioVal);
+  portChart.data.labels = portHistory.map((_,i) => i);
+  portChart.data.datasets[0].data = [...portHistory];
+  // color line green if up, red if down from first point
+  const first = portHistory[0];
+  portChart.data.datasets[0].borderColor = portfolioVal >= first ? '#1D9E75' : '#D85A30';
+  portChart.data.datasets[0].backgroundColor = portfolioVal >= first
+    ? 'rgba(29,158,117,0.08)' : 'rgba(216,90,48,0.08)';
+  portChart.update('none');
+}
+
+// ── Socket ────────────────────────────────────────────────────
 const socket = io();
 
 socket.on('connect', () => {
@@ -96,52 +156,71 @@ socket.on('disconnect', () => {
 
 socket.on('state', (data) => {
   lastState = data;
-  const tickers = Object.keys(data.tickers);
-  if (!activeTicker || !tickers.includes(activeTicker)) activeTicker = tickers[0];
-  renderTickers(tickers, data.tickers);
+  const tickers = Object.keys(data.tickers || {});
+  const display  = tickers.length ? tickers : DEFAULT_TICKERS;
+  if (!activeTicker) activeTicker = display[0];
+
+  renderTickers(display, data.tickers || {});
   renderAccount(data.account);
-  renderBots(data.tickers[activeTicker]);
+  updateChart(data.account?.portfolio);
+
+  if (data.market_status === 'closed') {
+    document.getElementById('bots').innerHTML =
+      '<div class="market-closed">Market closed — bot resumes at 9:30 AM ET</div>';
+    document.getElementById('votes').innerHTML = '';
+    document.getElementById('verdict').textContent = 'Market closed';
+    document.getElementById('verdict').style.color = '#555';
+  } else if (activeTicker && data.tickers && data.tickers[activeTicker]) {
+    renderBots(data.tickers[activeTicker]);
+  }
+
   renderTrades(data.trades || []);
-  document.getElementById('lastUpdate').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  document.getElementById('lastUpdate').textContent =
+    'Updated ' + new Date().toLocaleTimeString();
 });
 
+// ── Renderers ─────────────────────────────────────────────────
 function renderTickers(tickers, tickerData) {
-  document.getElementById('tickers').innerHTML = tickers.map(t =>
-    `<div class="tchip${t===activeTicker?' active':''}" onclick="switchTicker('${t}')">${t} <span style="font-size:10px;color:#555;">$${tickerData[t]?.price ?? '—'}</span></div>`
-  ).join('');
+  document.getElementById('tickers').innerHTML = tickers.map(t => {
+    const p = tickerData[t]?.price;
+    return `<div class="tchip${t===activeTicker?' active':''}" onclick="switchTicker('${t}')">
+      ${t}${p ? `<span class="price">$${p}</span>` : ''}
+    </div>`;
+  }).join('');
 }
 
 function switchTicker(t) {
   activeTicker = t;
   if (lastState) {
-    renderTickers(Object.keys(lastState.tickers), lastState.tickers);
-    renderBots(lastState.tickers[t]);
+    renderTickers(Object.keys(lastState.tickers||{}).length
+      ? Object.keys(lastState.tickers) : DEFAULT_TICKERS, lastState.tickers||{});
+    if (lastState.tickers && lastState.tickers[t]) renderBots(lastState.tickers[t]);
   }
 }
 
 function renderAccount(acct) {
-  if (!acct || !acct.portfolio) return;
+  if (!acct || acct.portfolio == null) return;
   document.getElementById('port').textContent = '$' + acct.portfolio.toLocaleString();
   document.getElementById('cash').textContent = '$' + acct.cash.toLocaleString();
   const pnl = acct.pnl;
-  const el = document.getElementById('pnl');
+  const el  = document.getElementById('pnl');
   el.textContent = (pnl >= 0 ? '+' : '') + '$' + Math.abs(pnl).toFixed(2);
-  el.className = 'val ' + (pnl > 0 ? 'up' : pnl < 0 ? 'down' : '');
+  el.className   = 'val ' + (pnl > 0 ? 'up' : pnl < 0 ? 'down' : '');
 }
 
 function renderBots(tdata) {
-  if (!tdata) return;
+  if (!tdata || !tdata.signals) return;
   const sigs = tdata.signals;
   document.getElementById('votes').innerHTML = sigs.map((s,i) => {
     const cls = s.action==='buy'?'v-buy':s.action==='sell'?'v-sell':'v-hold';
-    return `<div class="vote ${cls}">${BOT_NAMES[i]}</div>`;
+    return `<div class="vote ${cls}" title="${s.name}">${BOT_NAMES[i]}</div>`;
   }).join('');
-  const buys = sigs.filter(s=>s.action==='buy').length;
+  const buys  = sigs.filter(s=>s.action==='buy').length;
   const sells = sigs.filter(s=>s.action==='sell').length;
   const v = document.getElementById('verdict');
-  if (buys >= 3) { v.textContent = `BUY (${buys}/4)`; v.style.color='#1D9E75'; }
-  else if (sells >= 3) { v.textContent = `SELL (${sells}/4)`; v.style.color='#D85A30'; }
-  else { v.textContent = 'Hold'; v.style.color='#888'; }
+  if (buys >= 3)       { v.textContent=`BUY (${buys}/4)`;  v.style.color='#1D9E75'; }
+  else if (sells >= 3) { v.textContent=`SELL (${sells}/4)`; v.style.color='#D85A30'; }
+  else                 { v.textContent='Holding';            v.style.color='#888'; }
 
   document.getElementById('bots').innerHTML = sigs.map((s,i) => `
     <div class="bot">
@@ -150,6 +229,9 @@ function renderBots(tdata) {
         <div class="bot-name">${s.name}</div>
       </div>
       <div class="bar-bg"><div class="bar-fill" style="width:${s.signal.toFixed(0)}%;background:${COLORS[i]};"></div></div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:#555;margin-bottom:6px;">
+        <span>Signal</span><span>${s.signal.toFixed(0)}%</span>
+      </div>
       <span class="badge badge-${s.action}">${s.action.toUpperCase()}</span>
     </div>`).join('');
 }
@@ -157,7 +239,7 @@ function renderBots(tdata) {
 function renderTrades(trades) {
   if (!trades.length) return;
   document.getElementById('trades').innerHTML = trades.slice(0,20).map(t => {
-    const pnlHtml = t.pnl !== null
+    const pnlHtml = t.pnl != null
       ? `<span class="trade-pnl ${t.pnl>=0?'up':'down'}">${t.pnl>=0?'+':''}$${Math.abs(t.pnl).toFixed(2)}</span>`
       : '';
     return `<div class="trade">
@@ -168,6 +250,8 @@ function renderTrades(trades) {
     </div>`;
   }).join('');
 }
+
+initChart();
 </script>
 </body>
 </html>
