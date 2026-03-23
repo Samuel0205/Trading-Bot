@@ -68,59 +68,55 @@ def volume_spike(volumes):
     avg = sum(volumes[:-1]) / len(volumes[:-1])
     return volumes[-1] > avg * 1.5
 
-# ================= MARKET REGIME =================
-def market_regime(prices):
-    if len(prices) < 50:
-        return "neutral"
-    ma50 = calc_ma(prices, 50)
-    ma200 = calc_ma(prices, min(200, len(prices)))
-
-    if ma50 > ma200 * 1.01:
-        return "bull"
-    elif ma200 > ma50 * 1.01:
-        return "bear"
-    else:
-        return "sideways"
-
 # ================= SIGNAL ENGINE =================
-def get_score(ticker, price):
+def get_signals(ticker, price):
     hist = price_history[ticker]
     vols = volume_history[ticker]
 
     if len(hist) < 20:
-        return 0
+        return []
 
     rsi = calc_rsi(hist)
     ma50 = calc_ma(hist, min(50, len(hist)))
     ma200 = calc_ma(hist, min(200, len(hist)))
     mean, upper, lower = calc_bollinger(hist)
     mom = momentum(hist)
-    regime = market_regime(hist)
 
-    score = 0
+    signals = []
 
     # Trend
-    score += 20 if ma50 > ma200 else -20
+    if ma50 > ma200:
+        signals.append({"name":"Trend","action":"buy","signal":70})
+    else:
+        signals.append({"name":"Trend","action":"sell","signal":70})
 
     # RSI
-    if rsi < 30: score += 15
-    elif rsi > 70: score -= 15
+    if rsi < 30:
+        signals.append({"name":"RSI","action":"buy","signal":80})
+    elif rsi > 70:
+        signals.append({"name":"RSI","action":"sell","signal":80})
+    else:
+        signals.append({"name":"RSI","action":"hold","signal":50})
 
     # Bollinger
-    if price < lower: score += 10
-    elif price > upper: score -= 10
+    if price < lower:
+        signals.append({"name":"Bollinger","action":"buy","signal":75})
+    elif price > upper:
+        signals.append({"name":"Bollinger","action":"sell","signal":75})
+    else:
+        signals.append({"name":"Bollinger","action":"hold","signal":50})
 
     # Momentum
-    score += 10 if mom > 0 else -10
+    if mom > 0:
+        signals.append({"name":"Momentum","action":"buy","signal":65})
+    else:
+        signals.append({"name":"Momentum","action":"sell","signal":65})
 
-    # Volume
-    if volume_spike(vols): score += 15
+    # Volume spike
+    if volume_spike(vols):
+        signals.append({"name":"Volume Spike","action":"buy","signal":85})
 
-    # Regime
-    if regime == "bull": score += 10
-    elif regime == "bear": score -= 10
-
-    return score
+    return signals
 
 # ================= RISK =================
 def position_size(price):
@@ -220,12 +216,19 @@ def bot_loop():
                     price_history[ticker].pop(0)
                     volume_history[ticker].pop(0)
 
-                score = get_score(ticker, price)
+                sigs = get_signals(ticker, price)
+
+                buys  = sum(1 for s in sigs if s["action"] == "buy")
+                sells = sum(1 for s in sigs if s["action"] == "sell")
+
+                score = sum(s["signal"] if s["action"] == "buy"
+                            else -s["signal"] if s["action"] == "sell"
+                            else 0 for s in sigs)
 
                 action = "hold"
-                if score > 40:
+                if score > 100:
                     action = "buy"
-                elif score < -40:
+                elif score < -100:
                     action = "sell"
 
                 # Risk exits
@@ -243,9 +246,9 @@ def bot_loop():
                     "price": round(price, 2),
                     "score": score,
                     "action": action,
-                    "signals": [],
-                    "buys": 0,
-                    "sells": 0
+                    "signals": sigs,
+                    "buys": buys,
+                    "sells": sells
                 }
 
             state["account"] = get_account_state()
