@@ -10,16 +10,16 @@ SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
 BASE_URL   = "https://paper-api.alpaca.markets"
 
 if not API_KEY or not SECRET_KEY:
-    raise ValueError("Missing Alpaca API keys. Set APCA_API_KEY_ID and APCA_API_SECRET_KEY in environment variables.")
+    raise ValueError("Missing Alpaca API keys.")
 
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 TICKERS   = ["AAPL", "TSLA", "NVDA", "MSFT"]
-RISK_PCT  = 0.015  # 1.5% of portfolio per trade
-THRESHOLD = 3      # bots that must agree to trade
-INTERVAL  = 60     # seconds between cycles
+RISK_PCT  = 0.015
+THRESHOLD = 3
+INTERVAL  = 60
 
 price_history = {t: [] for t in TICKERS}
 trade_log     = []
@@ -35,8 +35,7 @@ def calc_rsi(prices, period=14):
         if d > 0: gains += d
         else:     losses += abs(d)
     if losses == 0: return 100
-    rs = gains / losses
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + gains/losses))
 
 def calc_ma(prices, n):
     s = prices[-n:] if len(prices) >= n else prices
@@ -78,15 +77,11 @@ def get_signals(ticker, price):
 def is_market_open():
     try:
         clock = api.get_clock()
+        print(f"Market open: {clock.is_open}")
         return clock.is_open
     except Exception as e:
         print(f"Clock error: {e}")
         return False
-
-def position_size(price):
-    acct     = api.get_account()
-    risk_amt = float(acct.equity) * RISK_PCT
-    return max(1, int(risk_amt / price))
 
 def get_account_state():
     acct = api.get_account()
@@ -96,18 +91,60 @@ def get_account_state():
         "pnl":       round(float(acct.equity) - float(acct.last_equity), 2),
     }
 
-# ── On client connect — send data immediately ─────────────────
+def position_size(price):
+    acct = api.get_account()
+    return max(1, int(float(acct.equity) * RISK_PCT / price))
+
+# ── Load existing Alpaca orders into trade_log on startup ─────
+
+def load_recent_trades():
+    try:
+        orders = api.list_orders(status="filled", limit=40, direction="desc")
+        for o in orders:
+            pnl = None
+            trade_log.append({
+                "type":   o.side.upper(),
+                "ticker": o.symbol,
+                "qty":    int(float(o.filled_qty)),
+                "price":  round(float(o.filled_avg_price), 2),
+                "pnl":    pnl
+            })
+        print(f"Loaded {len(trade_log)} historical trades")
+    except Exception as e:
+        print(f"load_recent_trades error: {e}")
+
+# ── On client connect ─────────────────────────────────────────
 
 @socketio.on("connect")
 def on_connect():
     print("Client connected")
     try:
-        socketio.emit("state", {
+        market_open = is_market_open()
+        state = {
             "tickers":       {},
             "account":       get_account_state(),
             "trades":        trade_log[:40],
-            "market_status": "open" if is_market_open() else "closed"
-        })
+            "market_status": "open" if market_open else "closed"
+        }
+        # If market is open, try to send current ticker prices too
+        if market_open:
+            for ticker in TICKERS:
+                try:
+                    bar   = api.get_latest_bar(ticker)
+                    price = float(bar.c)
+                    price_history[ticker].append(price)
+                    sigs  = get_signals(ticker, price)
+                    buys  = sum(1 for s in sigs if s["action"] == "buy")
+                    sells = sum(1 for s in sigs if s["action"] == "sell")
+                    action = "buy" if buys >= THRESHOLD else "sell" if sells >= THRESHOLD else "hold"
+                    state["tickers"][ticker] = {
+                        "price": round(price, 2), "signals": sigs,
+                        "action": action, "buys": buys, "sells": sells,
+                    }
+                    print(f"{ticker}: ${price:.2f}")
+                except Exception as e:
+                    print(f"on_connect {ticker} error: {e}")
+        socketio.emit("state", state)
     except Exception as e:
         print(f"on_connect error: {e}")
 
@@ -130,8 +167,8 @@ def execute(ticker, action, price):
                                  type="market", time_in_force="day")
                 trade_log.insert(0, {"type":"SELL","ticker":ticker,"qty":qty,"price":round(price,2),"pnl":pnl})
                 print(f"SELL {qty}x {ticker} @ ${price:.2f}  PnL ${pnl}")
-            except:
-                pass
+            except Exception as e:
+                print(f"Sell error {ticker}: {e}")
     except Exception as e:
         print(f"Order error: {e}")
 
@@ -139,7 +176,9 @@ def execute(ticker, action, price):
 
 def bot_loop():
     while True:
-        if not is_market_open():
+        market_open = is_market_open()
+
+        if not market_open:
             print("Market closed — sleeping 60s")
             try:
                 socketio.emit("state", {
@@ -149,10 +188,11 @@ def bot_loop():
                     "market_status": "closed"
                 })
             except Exception as e:
-                print(f"Account fetch error: {e}")
+                print(f"Closed loop error: {e}")
             time.sleep(60)
             continue
 
+        print(f"--- Cycle start {datetime.now(pytz.timezone('America/New_York')).strftime('%H:%M:%S')} ---")
         state = {"tickers": {}, "account": {}, "market_status": "open"}
 
         for ticker in TICKERS:
@@ -166,21 +206,18 @@ def bot_loop():
                 sigs  = get_signals(ticker, price)
                 buys  = sum(1 for s in sigs if s["action"] == "buy")
                 sells = sum(1 for s in sigs if s["action"] == "sell")
-                action = "hold"
-                if buys  >= THRESHOLD: action = "buy"
-                elif sells >= THRESHOLD: action = "sell"
+                action = "buy" if buys >= THRESHOLD else "sell" if sells >= THRESHOLD else "hold"
+
                 if action != "hold":
                     execute(ticker, action, price)
 
                 state["tickers"][ticker] = {
-                    "price":   round(price, 2),
-                    "signals": sigs,
-                    "action":  action,
-                    "buys":    buys,
-                    "sells":   sells,
+                    "price": round(price, 2), "signals": sigs,
+                    "action": action, "buys": buys, "sells": sells,
                 }
+                print(f"  {ticker}: ${price:.2f} | buys={buys} sells={sells} -> {action}")
             except Exception as e:
-                print(f"{ticker} error: {e}")
+                print(f"  {ticker} error: {e}")
 
         try:
             state["account"] = get_account_state()
@@ -189,6 +226,7 @@ def bot_loop():
 
         state["trades"] = trade_log[:40]
         socketio.emit("state", state)
+        print(f"State emitted with {len(state['tickers'])} tickers")
         time.sleep(INTERVAL)
 
 # ── Flask routes ──────────────────────────────────────────────
@@ -202,6 +240,7 @@ def state_json():
     return jsonify({"trades": trade_log[:20]})
 
 if __name__ == "__main__":
+    load_recent_trades()
     threading.Thread(target=bot_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     socketio.run(app, host="0.0.0.0", port=port)
