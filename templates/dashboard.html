@@ -4,8 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Trading Bot</title>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f1117; color: #e8e8e8; padding: 12px; font-size: 14px; }
@@ -51,6 +53,7 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
 .market-closed { color: #555; font-size: 13px; padding: 16px; text-align: center; grid-column: span 2; }
 </style>
 </head>
+
 <body>
 
 <div class="header">
@@ -72,14 +75,14 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
 </div>
 
 <div class="chart-card">
-  <div style="font-size:11px;color:#555;margin-bottom:10px;text-transform:uppercase;letter-spacing:.08em;">Portfolio over session</div>
+  <div style="font-size:11px;color:#555;margin-bottom:10px;text-transform:uppercase;">Portfolio over session</div>
   <div class="chart-wrap"><canvas id="portChart"></canvas></div>
 </div>
 
 <h2>Watching</h2>
 <div class="tickers" id="tickers"></div>
 
-<div class="consensus" id="consensus">
+<div class="consensus">
   <div style="font-size:12px;color:#555;">Bot consensus</div>
   <div class="votes" id="votes"></div>
   <div class="verdict" id="verdict">Waiting...</div>
@@ -89,330 +92,76 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
 <div class="bots" id="bots"></div>
 
 <h2>Trade log</h2>
-<div class="trades" id="trades"><div style="color:#555;font-size:12px;padding:8px;">Waiting for first trade...</div></div>
+<div class="trades" id="trades"></div>
 
 <div class="status-bar" id="lastUpdate">Not yet connected</div>
 
 <script>
-const COLORS   = ['#4a9eff','#1D9E75','#E9A84C','#C45C8A'];
+const COLORS = ['#4a9eff','#1D9E75','#E9A84C','#C45C8A'];
 const BOT_NAMES = ['MA','RSI','BB','MR'];
-const DEFAULT_TICKERS = ['AAPL','TSLA','NVDA','MSFT'];
-let activeTicker = null;
-let lastState    = null;
-let portHistory  = [];
-let portChart;
+let portChart, portHistory=[];
 
-// ── Chart ─────────────────────────────────────────────────────
-function initChart() {
-  portChart = new Chart(document.getElementById('portChart'), {
-    type: 'line',
-    data: {
-      labels: [],
-      datasets: [{
-        data: [],
-        borderColor: '#4a9eff',
-        borderWidth: 2,
-        fill: true,
-        backgroundColor: 'rgba(74,158,255,0.08)',
-        pointRadius: 0,
-        tension: 0.3
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        y: {
-          ticks: { color: '#555', font: { size: 11 }, callback: v => '$' + v.toLocaleString() },
-          grid: { color: '#1e2130' }
-        },
-        x: { display: false }
-      }
-    }
+// Chart
+function initChart(){
+  portChart=new Chart(document.getElementById('portChart'),{
+    type:'line',
+    data:{labels:[],datasets:[{data:[],borderWidth:2,pointRadius:0,tension:.3}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}}}
   });
 }
-
-function updateChart(portfolioVal) {
-  if (!portfolioVal) return;
-  portHistory.push(portfolioVal);
-  portChart.data.labels = portHistory.map((_,i) => i);
-  portChart.data.datasets[0].data = [...portHistory];
-  // color line green if up, red if down from first point
-  const first = portHistory[0];
-  portChart.data.datasets[0].borderColor = portfolioVal >= first ? '#1D9E75' : '#D85A30';
-  portChart.data.datasets[0].backgroundColor = portfolioVal >= first
-    ? 'rgba(29,158,117,0.08)' : 'rgba(216,90,48,0.08)';
-  portChart.update('none');
+function updateChart(v){
+  if(!v)return;
+  portHistory.push(v);
+  portChart.data.labels=portHistory.map((_,i)=>i);
+  portChart.data.datasets[0].data=portHistory;
+  portChart.update();
 }
 
-// ── Socket ────────────────────────────────────────────────────
-const socket = io();
-
-socket.on('connect', () => {
-  document.getElementById('dot').style.background = '#1D9E75';
-  document.getElementById('statusTxt').textContent = 'Live';
-});
-socket.on('disconnect', () => {
-  document.getElementById('dot').style.background = '#D85A30';
-  document.getElementById('statusTxt').textContent = 'Disconnected';
-});
-
-socket.on('state', (data) => {
-  lastState = data;
-  const tickers = Object.keys(data.tickers || {});
-  const display  = tickers.length ? tickers : DEFAULT_TICKERS;
-  if (!activeTicker) activeTicker = display[0];
-
-  renderTickers(display, data.tickers || {});
+// Socket
+const socket=io();
+socket.on('state',(data)=>{
   renderAccount(data.account);
   updateChart(data.account?.portfolio);
-
-  if (data.market_status === 'closed') {
-    document.getElementById('bots').innerHTML =
-      '<div class="market-closed">Market closed — bot resumes at 9:30 AM ET</div>';
-    document.getElementById('votes').innerHTML = '';
-    document.getElementById('verdict').textContent = 'Market closed';
-    document.getElementById('verdict').style.color = '#555';
-  } else if (activeTicker && data.tickers && data.tickers[activeTicker]) {
-    renderBots(data.tickers[activeTicker]);
-  }
-
-  renderTrades(data.trades || []);
-  document.getElementById('lastUpdate').textContent =
-    'Updated ' + new Date().toLocaleTimeString();
+  renderTrades(data.trades||[]);
 });
 
-// ── Renderers ─────────────────────────────────────────────────
-function renderTickers(tickers, tickerData) {
-  document.getElementById('tickers').innerHTML = tickers.map(t => {
-    const p = tickerData[t]?.price;
-    return `<div class="tchip${t===activeTicker?' active':''}" onclick="switchTicker('${t}')">
-      ${t}${p ? `<span class="price">$${p}</span>` : ''}
-    </div>`;
-  }).join('');
-}
+// FIXED FUNCTION
+function renderAccount(acct){
+  if(!acct)return;
 
-function switchTicker(t) {
-  activeTicker = t;
-  if (lastState) {
-    renderTickers(Object.keys(lastState.tickers||{}).length
-      ? Object.keys(lastState.tickers) : DEFAULT_TICKERS, lastState.tickers||{});
-    if (lastState.tickers && lastState.tickers[t]) renderBots(lastState.tickers[t]);
-  }
-}
+  document.getElementById('port').textContent='$'+acct.portfolio.toLocaleString();
+  document.getElementById('cash').textContent='$'+acct.cash.toLocaleString();
 
-function renderAccount(acct) {
-  if (!acct || acct.portfolio == null) return;
-  document.getElementById('port').textContent = ''
+  const pnl=acct.pnl;
+  const el=document.getElementById('pnl');
+  el.textContent=(pnl>=0?'+':'-')+'$'+Math.abs(pnl).toFixed(2);
+  el.className='val '+(pnl>0?'up':pnl<0?'down':'');
 
-function renderBots(tdata) {
-  if (!tdata || !tdata.signals) return;
-  const sigs = tdata.signals;
-  document.getElementById('votes').innerHTML = sigs.map((s,i) => {
-    const cls = s.action==='buy'?'v-buy':s.action==='sell'?'v-sell':'v-hold';
-    return `<div class="vote ${cls}" title="${s.name}">${BOT_NAMES[i]}</div>`;
-  }).join('');
-  const buys  = sigs.filter(s=>s.action==='buy').length;
-  const sells = sigs.filter(s=>s.action==='sell').length;
-  const v = document.getElementById('verdict');
-  if (buys >= 3)       { v.textContent=`BUY (${buys}/4)`;  v.style.color='#1D9E75'; }
-  else if (sells >= 3) { v.textContent=`SELL (${sells}/4)`; v.style.color='#D85A30'; }
-  else                 { v.textContent='Holding';            v.style.color='#888'; }
-
-  document.getElementById('bots').innerHTML = sigs.map((s,i) => `
-    <div class="bot">
-      <div class="bot-top">
-        <div class="bot-icon" style="background:${COLORS[i]}22;color:${COLORS[i]};">${BOT_NAMES[i]}</div>
-        <div class="bot-name">${s.name}</div>
-      </div>
-      <div class="bar-bg"><div class="bar-fill" style="width:${s.signal.toFixed(0)}%;background:${COLORS[i]};"></div></div>
-      <div style="display:flex;justify-content:space-between;font-size:10px;color:#555;margin-bottom:6px;">
-        <span>Signal</span><span>${s.signal.toFixed(0)}%</span>
-      </div>
-      <span class="badge badge-${s.action}">${s.action.toUpperCase()}</span>
-    </div>`).join('');
-}
-
-function renderTrades(trades) {
-  if (!trades.length) return;
-  document.getElementById('trades').innerHTML = trades.slice(0,20).map(t => {
-    const pnlHtml = t.pnl != null
-      ? `<span class="trade-pnl ${t.pnl>=0?'up':'down'}">${t.pnl>=0?'+':''}$${Math.abs(t.pnl).toFixed(2)}</span>`
-      : '';
-    return `<div class="trade">
-      <span class="trade-type ${t.type==='BUY'?'up':'down'}">${t.type}</span>
-      <span style="font-weight:500;">${t.ticker}</span>
-      <span style="color:#555;">${t.qty} @ $${t.price}</span>
-      ${pnlHtml}
-    </div>`;
-  }).join('');
-}
-
-initChart();
-</script>
-</body>
-</html>
- + acct.portfolio.toLocaleString();
-  document.getElementById('cash').textContent = '
-
-function renderBots(tdata) {
-  if (!tdata || !tdata.signals) return;
-  const sigs = tdata.signals;
-  document.getElementById('votes').innerHTML = sigs.map((s,i) => {
-    const cls = s.action==='buy'?'v-buy':s.action==='sell'?'v-sell':'v-hold';
-    return `<div class="vote ${cls}" title="${s.name}">${BOT_NAMES[i]}</div>`;
-  }).join('');
-  const buys  = sigs.filter(s=>s.action==='buy').length;
-  const sells = sigs.filter(s=>s.action==='sell').length;
-  const v = document.getElementById('verdict');
-  if (buys >= 3)       { v.textContent=`BUY (${buys}/4)`;  v.style.color='#1D9E75'; }
-  else if (sells >= 3) { v.textContent=`SELL (${sells}/4)`; v.style.color='#D85A30'; }
-  else                 { v.textContent='Holding';            v.style.color='#888'; }
-
-  document.getElementById('bots').innerHTML = sigs.map((s,i) => `
-    <div class="bot">
-      <div class="bot-top">
-        <div class="bot-icon" style="background:${COLORS[i]}22;color:${COLORS[i]};">${BOT_NAMES[i]}</div>
-        <div class="bot-name">${s.name}</div>
-      </div>
-      <div class="bar-bg"><div class="bar-fill" style="width:${s.signal.toFixed(0)}%;background:${COLORS[i]};"></div></div>
-      <div style="display:flex;justify-content:space-between;font-size:10px;color:#555;margin-bottom:6px;">
-        <span>Signal</span><span>${s.signal.toFixed(0)}%</span>
-      </div>
-      <span class="badge badge-${s.action}">${s.action.toUpperCase()}</span>
-    </div>`).join('');
-}
-
-function renderTrades(trades) {
-  if (!trades.length) return;
-  document.getElementById('trades').innerHTML = trades.slice(0,20).map(t => {
-    const pnlHtml = t.pnl != null
-      ? `<span class="trade-pnl ${t.pnl>=0?'up':'down'}">${t.pnl>=0?'+':''}$${Math.abs(t.pnl).toFixed(2)}</span>`
-      : '';
-    return `<div class="trade">
-      <span class="trade-type ${t.type==='BUY'?'up':'down'}">${t.type}</span>
-      <span style="font-weight:500;">${t.ticker}</span>
-      <span style="color:#555;">${t.qty} @ $${t.price}</span>
-      ${pnlHtml}
-    </div>`;
-  }).join('');
-}
-
-initChart();
-</script>
-</body>
-</html>
- + acct.cash.toLocaleString();
-  const pnl = acct.pnl;
-  const el  = document.getElementById('pnl');
-  el.textContent = (pnl >= 0 ? '+' : '') + '
-
-function renderBots(tdata) {
-  if (!tdata || !tdata.signals) return;
-  const sigs = tdata.signals;
-  document.getElementById('votes').innerHTML = sigs.map((s,i) => {
-    const cls = s.action==='buy'?'v-buy':s.action==='sell'?'v-sell':'v-hold';
-    return `<div class="vote ${cls}" title="${s.name}">${BOT_NAMES[i]}</div>`;
-  }).join('');
-  const buys  = sigs.filter(s=>s.action==='buy').length;
-  const sells = sigs.filter(s=>s.action==='sell').length;
-  const v = document.getElementById('verdict');
-  if (buys >= 3)       { v.textContent=`BUY (${buys}/4)`;  v.style.color='#1D9E75'; }
-  else if (sells >= 3) { v.textContent=`SELL (${sells}/4)`; v.style.color='#D85A30'; }
-  else                 { v.textContent='Holding';            v.style.color='#888'; }
-
-  document.getElementById('bots').innerHTML = sigs.map((s,i) => `
-    <div class="bot">
-      <div class="bot-top">
-        <div class="bot-icon" style="background:${COLORS[i]}22;color:${COLORS[i]};">${BOT_NAMES[i]}</div>
-        <div class="bot-name">${s.name}</div>
-      </div>
-      <div class="bar-bg"><div class="bar-fill" style="width:${s.signal.toFixed(0)}%;background:${COLORS[i]};"></div></div>
-      <div style="display:flex;justify-content:space-between;font-size:10px;color:#555;margin-bottom:6px;">
-        <span>Signal</span><span>${s.signal.toFixed(0)}%</span>
-      </div>
-      <span class="badge badge-${s.action}">${s.action.toUpperCase()}</span>
-    </div>`).join('');
-}
-
-function renderTrades(trades) {
-  if (!trades.length) return;
-  document.getElementById('trades').innerHTML = trades.slice(0,20).map(t => {
-    const pnlHtml = t.pnl != null
-      ? `<span class="trade-pnl ${t.pnl>=0?'up':'down'}">${t.pnl>=0?'+':''}$${Math.abs(t.pnl).toFixed(2)}</span>`
-      : '';
-    return `<div class="trade">
-      <span class="trade-type ${t.type==='BUY'?'up':'down'}">${t.type}</span>
-      <span style="font-weight:500;">${t.ticker}</span>
-      <span style="color:#555;">${t.qty} @ $${t.price}</span>
-      ${pnlHtml}
-    </div>`;
-  }).join('');
-}
-
-initChart();
-</script>
-</body>
-</html>
- + Math.abs(pnl).toFixed(2);
-  el.className   = 'val ' + (pnl > 0 ? 'up' : pnl < 0 ? 'down' : '');
-  const regimeEl = document.getElementById('regime');
-  const regimeMap = {
-    trending_up:   { label: 'Trending up',   color: '#1D9E75' },
-    trending_down: { label: 'Trending down',  color: '#D85A30' },
-    ranging:       { label: 'Ranging',        color: '#E9A84C' },
-    unknown:       { label: 'Detecting...',   color: '#555'    },
+  const regimeMap={
+    trending_up:{label:'Trending up',color:'#1D9E75'},
+    trending_down:{label:'Trending down',color:'#D85A30'},
+    ranging:{label:'Ranging',color:'#E9A84C'},
+    unknown:{label:'Detecting...',color:'#555'}
   };
-  const r = regimeMap[acct.regime] || regimeMap.unknown;
-  regimeEl.textContent = r.label;
-  regimeEl.style.color = r.color;
+
+  const r=regimeMap[acct.regime]||regimeMap.unknown;
+  const regimeEl=document.getElementById('regime');
+  regimeEl.textContent=r.label;
+  regimeEl.style.color=r.color;
 }
 
-function renderBots(tdata) {
-  if (!tdata || !tdata.signals) return;
-  const sigs = tdata.signals;
-  document.getElementById('votes').innerHTML = sigs.map((s,i) => {
-    const cls = s.action==='buy'?'v-buy':s.action==='sell'?'v-sell':'v-hold';
-    return `<div class="vote ${cls}" title="${s.name}">${BOT_NAMES[i]}</div>`;
-  }).join('');
-  const buys  = sigs.filter(s=>s.action==='buy').length;
-  const sells = sigs.filter(s=>s.action==='sell').length;
-  const v = document.getElementById('verdict');
-  if (buys >= 3)       { v.textContent=`BUY (${buys}/4)`;  v.style.color='#1D9E75'; }
-  else if (sells >= 3) { v.textContent=`SELL (${sells}/4)`; v.style.color='#D85A30'; }
-  else                 { v.textContent='Holding';            v.style.color='#888'; }
-
-  document.getElementById('bots').innerHTML = sigs.map((s,i) => `
-    <div class="bot">
-      <div class="bot-top">
-        <div class="bot-icon" style="background:${COLORS[i]}22;color:${COLORS[i]};">${BOT_NAMES[i]}</div>
-        <div class="bot-name">${s.name}</div>
-      </div>
-      <div class="bar-bg"><div class="bar-fill" style="width:${s.signal.toFixed(0)}%;background:${COLORS[i]};"></div></div>
-      <div style="display:flex;justify-content:space-between;font-size:10px;color:#555;margin-bottom:6px;">
-        <span>Signal</span><span>${s.signal.toFixed(0)}%</span>
-      </div>
-      <span class="badge badge-${s.action}">${s.action.toUpperCase()}</span>
-    </div>`).join('');
-}
-
-function renderTrades(trades) {
-  if (!trades.length) return;
-  document.getElementById('trades').innerHTML = trades.slice(0,20).map(t => {
-    const pnlHtml = t.pnl != null
-      ? `<span class="trade-pnl ${t.pnl>=0?'up':'down'}">${t.pnl>=0?'+':''}$${Math.abs(t.pnl).toFixed(2)}</span>`
-      : '';
-    return `<div class="trade">
-      <span class="trade-type ${t.type==='BUY'?'up':'down'}">${t.type}</span>
-      <span style="font-weight:500;">${t.ticker}</span>
-      <span style="color:#555;">${t.qty} @ $${t.price}</span>
-      ${pnlHtml}
-    </div>`;
-  }).join('');
+function renderTrades(trades){
+  document.getElementById('trades').innerHTML=trades.map(t=>`
+    <div class="trade">
+      <span class="trade-type">${t.type}</span>
+      <span>${t.ticker}</span>
+      <span>${t.qty} @ $${t.price}</span>
+    </div>
+  `).join('');
 }
 
 initChart();
 </script>
+
 </body>
 </html>
