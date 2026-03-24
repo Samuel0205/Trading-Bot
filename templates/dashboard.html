@@ -55,16 +55,20 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
 
 <div class="header">
   <h1>Trading Bot</h1>
-  <div style="display:flex;align-items:center;gap:8px;">
-    <div class="dot" id="dot"></div>
-    <span id="statusTxt" style="font-size:12px;color:#555;">Connecting...</span>
+  <div style="display:flex;align-items:center;gap:10px;">
+    <a href="/scanner" style="font-size:12px;color:#4a9eff;text-decoration:none;background:#4a9eff11;padding:5px 10px;border-radius:8px;">Scanner</a>
+    <div style="display:flex;align-items:center;gap:6px;">
+      <div class="dot" id="dot"></div>
+      <span id="statusTxt" style="font-size:12px;color:#555;">Connecting...</span>
+    </div>
   </div>
 </div>
 
 <div class="cards">
   <div class="card"><div class="lbl">Portfolio</div><div class="val" id="port">—</div></div>
   <div class="card"><div class="lbl">Cash</div><div class="val" id="cash">—</div></div>
-  <div class="card" style="grid-column:span 2;"><div class="lbl">Total P&L (vs yesterday)</div><div class="val" id="pnl">—</div></div>
+  <div class="card"><div class="lbl">Total P&L</div><div class="val" id="pnl">—</div></div>
+  <div class="card"><div class="lbl">Market regime</div><div class="val" id="regime" style="font-size:13px;">—</div></div>
 </div>
 
 <div class="chart-card">
@@ -200,12 +204,169 @@ function switchTicker(t) {
 
 function renderAccount(acct) {
   if (!acct || acct.portfolio == null) return;
-  document.getElementById('port').textContent = '$' + acct.portfolio.toLocaleString();
-  document.getElementById('cash').textContent = '$' + acct.cash.toLocaleString();
+  document.getElementById('port').textContent = '
+
+function renderBots(tdata) {
+  if (!tdata || !tdata.signals) return;
+  const sigs = tdata.signals;
+  document.getElementById('votes').innerHTML = sigs.map((s,i) => {
+    const cls = s.action==='buy'?'v-buy':s.action==='sell'?'v-sell':'v-hold';
+    return `<div class="vote ${cls}" title="${s.name}">${BOT_NAMES[i]}</div>`;
+  }).join('');
+  const buys  = sigs.filter(s=>s.action==='buy').length;
+  const sells = sigs.filter(s=>s.action==='sell').length;
+  const v = document.getElementById('verdict');
+  if (buys >= 3)       { v.textContent=`BUY (${buys}/4)`;  v.style.color='#1D9E75'; }
+  else if (sells >= 3) { v.textContent=`SELL (${sells}/4)`; v.style.color='#D85A30'; }
+  else                 { v.textContent='Holding';            v.style.color='#888'; }
+
+  document.getElementById('bots').innerHTML = sigs.map((s,i) => `
+    <div class="bot">
+      <div class="bot-top">
+        <div class="bot-icon" style="background:${COLORS[i]}22;color:${COLORS[i]};">${BOT_NAMES[i]}</div>
+        <div class="bot-name">${s.name}</div>
+      </div>
+      <div class="bar-bg"><div class="bar-fill" style="width:${s.signal.toFixed(0)}%;background:${COLORS[i]};"></div></div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:#555;margin-bottom:6px;">
+        <span>Signal</span><span>${s.signal.toFixed(0)}%</span>
+      </div>
+      <span class="badge badge-${s.action}">${s.action.toUpperCase()}</span>
+    </div>`).join('');
+}
+
+function renderTrades(trades) {
+  if (!trades.length) return;
+  document.getElementById('trades').innerHTML = trades.slice(0,20).map(t => {
+    const pnlHtml = t.pnl != null
+      ? `<span class="trade-pnl ${t.pnl>=0?'up':'down'}">${t.pnl>=0?'+':''}$${Math.abs(t.pnl).toFixed(2)}</span>`
+      : '';
+    return `<div class="trade">
+      <span class="trade-type ${t.type==='BUY'?'up':'down'}">${t.type}</span>
+      <span style="font-weight:500;">${t.ticker}</span>
+      <span style="color:#555;">${t.qty} @ $${t.price}</span>
+      ${pnlHtml}
+    </div>`;
+  }).join('');
+}
+
+initChart();
+</script>
+</body>
+</html>
+ + acct.portfolio.toLocaleString();
+  document.getElementById('cash').textContent = '
+
+function renderBots(tdata) {
+  if (!tdata || !tdata.signals) return;
+  const sigs = tdata.signals;
+  document.getElementById('votes').innerHTML = sigs.map((s,i) => {
+    const cls = s.action==='buy'?'v-buy':s.action==='sell'?'v-sell':'v-hold';
+    return `<div class="vote ${cls}" title="${s.name}">${BOT_NAMES[i]}</div>`;
+  }).join('');
+  const buys  = sigs.filter(s=>s.action==='buy').length;
+  const sells = sigs.filter(s=>s.action==='sell').length;
+  const v = document.getElementById('verdict');
+  if (buys >= 3)       { v.textContent=`BUY (${buys}/4)`;  v.style.color='#1D9E75'; }
+  else if (sells >= 3) { v.textContent=`SELL (${sells}/4)`; v.style.color='#D85A30'; }
+  else                 { v.textContent='Holding';            v.style.color='#888'; }
+
+  document.getElementById('bots').innerHTML = sigs.map((s,i) => `
+    <div class="bot">
+      <div class="bot-top">
+        <div class="bot-icon" style="background:${COLORS[i]}22;color:${COLORS[i]};">${BOT_NAMES[i]}</div>
+        <div class="bot-name">${s.name}</div>
+      </div>
+      <div class="bar-bg"><div class="bar-fill" style="width:${s.signal.toFixed(0)}%;background:${COLORS[i]};"></div></div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:#555;margin-bottom:6px;">
+        <span>Signal</span><span>${s.signal.toFixed(0)}%</span>
+      </div>
+      <span class="badge badge-${s.action}">${s.action.toUpperCase()}</span>
+    </div>`).join('');
+}
+
+function renderTrades(trades) {
+  if (!trades.length) return;
+  document.getElementById('trades').innerHTML = trades.slice(0,20).map(t => {
+    const pnlHtml = t.pnl != null
+      ? `<span class="trade-pnl ${t.pnl>=0?'up':'down'}">${t.pnl>=0?'+':''}$${Math.abs(t.pnl).toFixed(2)}</span>`
+      : '';
+    return `<div class="trade">
+      <span class="trade-type ${t.type==='BUY'?'up':'down'}">${t.type}</span>
+      <span style="font-weight:500;">${t.ticker}</span>
+      <span style="color:#555;">${t.qty} @ $${t.price}</span>
+      ${pnlHtml}
+    </div>`;
+  }).join('');
+}
+
+initChart();
+</script>
+</body>
+</html>
+ + acct.cash.toLocaleString();
   const pnl = acct.pnl;
   const el  = document.getElementById('pnl');
-  el.textContent = (pnl >= 0 ? '+' : '') + '$' + Math.abs(pnl).toFixed(2);
+  el.textContent = (pnl >= 0 ? '+' : '') + '
+
+function renderBots(tdata) {
+  if (!tdata || !tdata.signals) return;
+  const sigs = tdata.signals;
+  document.getElementById('votes').innerHTML = sigs.map((s,i) => {
+    const cls = s.action==='buy'?'v-buy':s.action==='sell'?'v-sell':'v-hold';
+    return `<div class="vote ${cls}" title="${s.name}">${BOT_NAMES[i]}</div>`;
+  }).join('');
+  const buys  = sigs.filter(s=>s.action==='buy').length;
+  const sells = sigs.filter(s=>s.action==='sell').length;
+  const v = document.getElementById('verdict');
+  if (buys >= 3)       { v.textContent=`BUY (${buys}/4)`;  v.style.color='#1D9E75'; }
+  else if (sells >= 3) { v.textContent=`SELL (${sells}/4)`; v.style.color='#D85A30'; }
+  else                 { v.textContent='Holding';            v.style.color='#888'; }
+
+  document.getElementById('bots').innerHTML = sigs.map((s,i) => `
+    <div class="bot">
+      <div class="bot-top">
+        <div class="bot-icon" style="background:${COLORS[i]}22;color:${COLORS[i]};">${BOT_NAMES[i]}</div>
+        <div class="bot-name">${s.name}</div>
+      </div>
+      <div class="bar-bg"><div class="bar-fill" style="width:${s.signal.toFixed(0)}%;background:${COLORS[i]};"></div></div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:#555;margin-bottom:6px;">
+        <span>Signal</span><span>${s.signal.toFixed(0)}%</span>
+      </div>
+      <span class="badge badge-${s.action}">${s.action.toUpperCase()}</span>
+    </div>`).join('');
+}
+
+function renderTrades(trades) {
+  if (!trades.length) return;
+  document.getElementById('trades').innerHTML = trades.slice(0,20).map(t => {
+    const pnlHtml = t.pnl != null
+      ? `<span class="trade-pnl ${t.pnl>=0?'up':'down'}">${t.pnl>=0?'+':''}$${Math.abs(t.pnl).toFixed(2)}</span>`
+      : '';
+    return `<div class="trade">
+      <span class="trade-type ${t.type==='BUY'?'up':'down'}">${t.type}</span>
+      <span style="font-weight:500;">${t.ticker}</span>
+      <span style="color:#555;">${t.qty} @ $${t.price}</span>
+      ${pnlHtml}
+    </div>`;
+  }).join('');
+}
+
+initChart();
+</script>
+</body>
+</html>
+ + Math.abs(pnl).toFixed(2);
   el.className   = 'val ' + (pnl > 0 ? 'up' : pnl < 0 ? 'down' : '');
+  const regimeEl = document.getElementById('regime');
+  const regimeMap = {
+    trending_up:   { label: 'Trending up',   color: '#1D9E75' },
+    trending_down: { label: 'Trending down',  color: '#D85A30' },
+    ranging:       { label: 'Ranging',        color: '#E9A84C' },
+    unknown:       { label: 'Detecting...',   color: '#555'    },
+  };
+  const r = regimeMap[acct.regime] || regimeMap.unknown;
+  regimeEl.textContent = r.label;
+  regimeEl.style.color = r.color;
 }
 
 function renderBots(tdata) {
