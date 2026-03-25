@@ -24,6 +24,13 @@ INTERVAL         = 60
 ATR_STOP_MULT    = 1.5
 ATR_TARGET_MULT  = 3.0
 
+# Trading window — ET
+TRADING_START = (8, 45)   # 8:45 AM
+TRADING_END   = (14, 0)   # 2:00 PM
+
+# Scanner fires at these hours
+SCAN_HOURS = [9, 11, 13]  # 9 AM, 11 AM, 1 PM ET
+
 price_history  = {}
 volume_history = {}
 trade_log      = []
@@ -33,6 +40,21 @@ open_positions = {}
 market_regime  = "unknown"
 
 NY = pytz.timezone("America/New_York")
+
+# ── Trading window check ──────────────────────────────────────
+
+def in_trading_window():
+    now = datetime.now(NY)
+    if now.weekday() >= 5:
+        return False
+    t = (now.hour, now.minute)
+    return TRADING_START <= t < TRADING_END
+
+def is_market_open():
+    try:
+        return api.get_clock().is_open
+    except:
+        return False
 
 # ── Indicators ────────────────────────────────────────────────
 
@@ -199,27 +221,28 @@ def force_sell(ticker, price, reason="stop_loss"):
 
 # ── Helpers ───────────────────────────────────────────────────
 
-def is_market_open():
-    try:
-        return api.get_clock().is_open
-    except:
-        return False
-
 def get_account_state():
-    acct = api.get_account()
-    return {
-        "portfolio": round(float(acct.equity), 2),
-        "cash":      round(float(acct.cash), 2),
-        "pnl":       round(float(acct.equity) - float(acct.last_equity), 2),
-        "regime":    market_regime,
-    }
+    try:
+        acct = api.get_account()
+        return {
+            "portfolio": round(float(acct.equity), 2),
+            "cash":      round(float(acct.cash), 2),
+            "pnl":       round(float(acct.equity) - float(acct.last_equity), 2),
+            "regime":    market_regime,
+        }
+    except Exception as e:
+        print(f"get_account_state error: {e}")
+        return {"portfolio": 0, "cash": 0, "pnl": 0, "regime": market_regime}
 
 def position_size(price, atr):
-    acct     = api.get_account()
-    equity   = float(acct.equity)
-    risk_amt = equity * RISK_PCT
-    stop_dist = atr * ATR_STOP_MULT if atr else price * 0.02
-    return max(1, int(risk_amt / stop_dist))
+    try:
+        acct      = api.get_account()
+        equity    = float(acct.equity)
+        risk_amt  = equity * RISK_PCT
+        stop_dist = atr * ATR_STOP_MULT if atr else price * 0.02
+        return max(1, int(risk_amt / stop_dist))
+    except:
+        return 1
 
 def close_all_positions_eod():
     try:
@@ -230,20 +253,36 @@ def close_all_positions_eod():
     except Exception as e:
         print(f"EOD close error: {e}")
 
-# ── Scanner loop ──────────────────────────────────────────────
+# ── Scanner loop — fires at 9 AM, 11 AM, 1 PM ET ─────────────
 
 def scanner_loop():
     global scan_results
-    last_scan_date = None
+    scanned_hours = set()
+
+    # Run regime immediately on startup
+    print("Running initial regime detection...")
+    update_market_regime()
+
     while True:
-        now   = datetime.now(NY)
-        today = now.date()
-        if now.weekday() < 5 and now.hour >= 9 and last_scan_date != today:
-            print("Starting daily scan...")
+        now  = datetime.now(NY)
+        hour = now.hour
+        day  = now.date()
+
+        # Reset scanned hours each new day
+        if not hasattr(scanner_loop, '_last_day') or scanner_loop._last_day != day:
+            scanned_hours.clear()
+            scanner_loop._last_day = day
+
+        # Fire scanner at 9, 11, 1 on weekdays within trading window
+        if (now.weekday() < 5
+                and hour in SCAN_HOURS
+                and hour not in scanned_hours
+                and in_trading_window()):
+            print(f"Scanner firing at {now.strftime('%H:%M')} ET...")
             try:
                 update_market_regime()
                 scan_results   = run_full_scan(api)
-                last_scan_date = today
+                scanned_hours.add(hour)
                 if scan_results["today"]:
                     new_tickers = [s["ticker"] for s in scan_results["today"]]
                     for t in new_tickers:
@@ -252,11 +291,13 @@ def scanner_loop():
                             volume_history[t] = []
                     active_tickers.clear()
                     active_tickers.extend(new_tickers)
-                    print(f"Bot now trading: {active_tickers}")
+                    print(f"Active tickers updated: {active_tickers}")
                 socketio.emit("scan", scan_results)
+                print(f"Scan complete. Regime: {market_regime}")
             except Exception as e:
                 print(f"Scanner error: {e}")
-        time.sleep(300)
+
+        time.sleep(60)  # check every minute
 
 # ── On connect ────────────────────────────────────────────────
 
@@ -264,7 +305,8 @@ def scanner_loop():
 def on_connect():
     print("Client connected")
     try:
-        market_open = is_market_open()
+        window_open = in_trading_window()
+        market_open = is_market_open() if window_open else False
         state = {
             "tickers":       {},
             "account":       get_account_state(),
@@ -325,29 +367,53 @@ def execute(ticker, action, price):
 
 def bot_loop():
     last_regime_update = None
+
     while True:
         try:
-            market_open = is_market_open()
-            now = datetime.now(NY)
+            now         = datetime.now(NY)
+            window_open = in_trading_window()
+            market_open = is_market_open() if window_open else False
 
-            if not market_open:
+            # Outside trading window — send closed state and sleep
+            if not window_open:
+                next_open = "8:45 AM ET"
                 socketio.emit("state", {
                     "tickers": {}, "account": get_account_state(),
-                    "trades": trade_log[:40], "market_status": "closed"
+                    "trades": trade_log[:40],
+                    "market_status": "closed",
+                    "message": f"Trading window closed — resumes {next_open}"
                 })
                 time.sleep(60)
                 continue
 
-            if not last_regime_update or (now - last_regime_update).seconds > 1800:
+            # In window but market not open yet (8:45–9:30 AM warmup)
+            if not market_open:
+                socketio.emit("state", {
+                    "tickers": {}, "account": get_account_state(),
+                    "trades": trade_log[:40],
+                    "market_status": "closed",
+                    "message": "Warming up — market opens 9:30 AM ET"
+                })
+                time.sleep(30)
+                continue
+
+            # Update regime every 30 min
+            if (not last_regime_update or
+                    (now - last_regime_update).total_seconds() > 1800):
                 update_market_regime()
                 last_regime_update = now
 
-            if now.hour == 15 and now.minute >= 45:
+            # EOD close at 1:50 PM (10 min before our 2 PM cutoff)
+            if now.hour == 13 and now.minute >= 50:
                 close_all_positions_eod()
-                time.sleep(900)
+                print("Positions closed for the day. Waiting for window close.")
+                time.sleep(600)
                 continue
 
-            state = {"tickers": {}, "account": {}, "market_status": "open", "regime": market_regime}
+            state = {
+                "tickers": {}, "account": {},
+                "market_status": "open", "regime": market_regime
+            }
 
             for ticker in list(active_tickers):
                 try:
@@ -407,7 +473,15 @@ def state_json():
 def scan_json():
     return jsonify(scan_results)
 
+@app.route("/ping")
+def ping():
+    return "pong", 200
+
 if __name__ == "__main__":
+    # Run regime detection immediately on startup
+    print("Starting up — detecting market regime...")
+    update_market_regime()
+
     threading.Thread(target=bot_loop,     daemon=True).start()
     threading.Thread(target=scanner_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
