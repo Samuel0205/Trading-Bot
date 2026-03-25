@@ -21,16 +21,16 @@ FALLBACK_TICKERS = ["AAPL", "TSLA", "NVDA", "MSFT"]
 RISK_PCT         = 0.015
 THRESHOLD        = 3
 INTERVAL         = 60
-ATR_STOP_MULT    = 1.5   # stop-loss = entry - (ATR * multiplier)
-ATR_TARGET_MULT  = 3.0   # take-profit = entry + (ATR * multiplier)
+ATR_STOP_MULT    = 1.5
+ATR_TARGET_MULT  = 3.0
 
 price_history  = {}
 volume_history = {}
 trade_log      = []
 scan_results   = {"today": [], "yesterday": [], "scanned_at": None}
 active_tickers = list(FALLBACK_TICKERS)
-open_positions = {}   # { ticker: { entry, stop, target, qty } }
-market_regime  = "unknown"  # "trending_up", "trending_down", "ranging"
+open_positions = {}
+market_regime  = "unknown"
 
 NY = pytz.timezone("America/New_York")
 
@@ -58,7 +58,6 @@ def calc_bollinger(prices, n=20):
     return mean, mean + 2*std, mean - 2*std
 
 def calc_atr(highs, lows, closes, period=14):
-    """Average True Range — measures volatility for stop sizing."""
     if len(closes) < 2:
         return closes[-1] * 0.02 if closes else 1.0
     trs = []
@@ -70,13 +69,11 @@ def calc_atr(highs, lows, closes, period=14):
     return sum(trs) / len(trs) if trs else closes[-1] * 0.02
 
 def calc_vwap(prices, volumes):
-    """VWAP = sum(price * volume) / sum(volume) — intraday anchor."""
     if not prices or not volumes or sum(volumes) == 0:
         return prices[-1] if prices else 0
     return sum(p * v for p, v in zip(prices, volumes)) / sum(volumes)
 
 def calc_macd(prices):
-    """MACD line = EMA12 - EMA26, Signal = EMA9 of MACD."""
     def ema(data, period):
         if len(data) < period:
             return data[-1] if data else 0
@@ -86,33 +83,28 @@ def calc_macd(prices):
             val = p * k + val * (1 - k)
         return val
     if len(prices) < 26:
-        return 0, 0
-    macd_line = ema(prices, 12) - ema(prices, 26)
-    return macd_line, macd_line  # signal needs history; simplified here
+        return 0
+    return ema(prices, 12) - ema(prices, 26)
 
 def get_signals(ticker, price):
     hist = price_history.get(ticker, [])
     vols = volume_history.get(ticker, [])
-
     if len(hist) < 5:
         return [{"name": n, "action": "hold", "signal": 50}
                 for n in ["MA Crossover","RSI","Bollinger","VWAP","MACD","Mean Reversion"]]
-
     rsi              = calc_rsi(hist)
     ma50             = calc_ma(hist, min(50,  len(hist)))
     ma200            = calc_ma(hist, min(200, len(hist)))
     mean, upper, lower = calc_bollinger(hist)
-    vwap             = calc_vwap(hist[-78:], vols[-78:])  # ~78 min = full session
-    macd_line, _     = calc_macd(hist)
+    vwap             = calc_vwap(hist[-78:], vols[-78:])
+    macd_line        = calc_macd(hist)
     z_score          = (price - mean) / max((upper - mean), 0.01)
+    regime_ok_buy    = market_regime in ("trending_up",  "ranging", "unknown")
+    regime_ok_sell   = market_regime in ("trending_down", "ranging", "unknown")
 
-    # Regime filter — only trade in direction of market trend
-    regime_ok_buy  = market_regime in ("trending_up",  "ranging", "unknown")
-    regime_ok_sell = market_regime in ("trending_down", "ranging", "unknown")
-
-    def act(buy_cond, sell_cond, regime_buy=True, regime_sell=True):
-        if buy_cond  and regime_ok_buy  and regime_buy:  return "buy"
-        if sell_cond and regime_ok_sell and regime_sell: return "sell"
+    def act(buy_cond, sell_cond):
+        if buy_cond  and regime_ok_buy:  return "buy"
+        if sell_cond and regime_ok_sell: return "sell"
         return "hold"
 
     return [
@@ -139,7 +131,6 @@ def get_signals(ticker, price):
 # ── Market regime ─────────────────────────────────────────────
 
 def update_market_regime():
-    """Check SPY to determine if market is trending or ranging."""
     global market_regime
     try:
         end   = datetime.now(pytz.utc)
@@ -154,18 +145,14 @@ def update_market_regime():
         ma5    = calc_ma(closes, 5)
         ma10   = calc_ma(closes, min(10, len(closes)))
         latest = closes[-1]
-
-        if ma5 > ma10 * 1.005 and latest > ma5:
-            market_regime = "trending_up"
-        elif ma5 < ma10 * 0.995 and latest < ma5:
-            market_regime = "trending_down"
-        else:
-            market_regime = "ranging"
+        if   ma5 > ma10*1.005 and latest > ma5: market_regime = "trending_up"
+        elif ma5 < ma10*0.995 and latest < ma5: market_regime = "trending_down"
+        else:                                    market_regime = "ranging"
         print(f"Market regime: {market_regime} (SPY ${latest:.2f})")
     except Exception as e:
         print(f"Regime error: {e}")
 
-# ── ATR-based stop/target management ─────────────────────────
+# ── ATR & stops ───────────────────────────────────────────────
 
 def fetch_atr(ticker):
     try:
@@ -175,26 +162,19 @@ def fetch_atr(ticker):
                     start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     limit=5).df
-        if bars.empty:
-            return None
-        return calc_atr(
-            list(bars["high"]),
-            list(bars["low"]),
-            list(bars["close"])
-        )
+        if bars.empty: return None
+        return calc_atr(list(bars["high"]), list(bars["low"]), list(bars["close"]))
     except:
         return None
 
 def check_stops(ticker, price):
-    """Check if any open position has hit its stop-loss or take-profit."""
     pos = open_positions.get(ticker)
-    if not pos:
-        return
+    if not pos: return
     if price <= pos["stop"]:
-        print(f"STOP-LOSS hit: {ticker} @ ${price:.2f} (stop ${pos['stop']:.2f})")
+        print(f"STOP-LOSS hit: {ticker} @ ${price:.2f}")
         force_sell(ticker, price, reason="stop_loss")
     elif price >= pos["target"]:
-        print(f"TAKE-PROFIT hit: {ticker} @ ${price:.2f} (target ${pos['target']:.2f})")
+        print(f"TAKE-PROFIT hit: {ticker} @ ${price:.2f}")
         force_sell(ticker, price, reason="take_profit")
 
 def force_sell(ticker, price, reason="stop_loss"):
@@ -209,7 +189,8 @@ def force_sell(ticker, price, reason="stop_loss"):
                          type="market", time_in_force="day")
         trade_log.insert(0, {
             "type": "SELL", "ticker": ticker, "qty": qty,
-            "price": round(price, 2), "pnl": pnl, "reason": reason
+            "price": round(price, 2), "pnl": pnl, "reason": reason,
+            "ts": int(time.time() * 1000)
         })
         open_positions.pop(ticker, None)
         print(f"FORCE SELL {qty}x {ticker} @ ${price:.2f} | {reason} | PnL ${pnl}")
@@ -234,22 +215,17 @@ def get_account_state():
     }
 
 def position_size(price, atr):
-    """Kelly-inspired sizing: risk exactly RISK_PCT of portfolio per trade."""
-    acct      = api.get_account()
-    equity    = float(acct.equity)
-    risk_amt  = equity * RISK_PCT
-    # Use ATR as the risk-per-share (stop distance)
+    acct     = api.get_account()
+    equity   = float(acct.equity)
+    risk_amt = equity * RISK_PCT
     stop_dist = atr * ATR_STOP_MULT if atr else price * 0.02
     return max(1, int(risk_amt / stop_dist))
 
 def close_all_positions_eod():
-    """Force-close all positions 15 min before market close."""
     try:
         positions = api.list_positions()
         for pos in positions:
-            ticker = pos.symbol
-            price  = float(pos.current_price)
-            force_sell(ticker, price, reason="eod_close")
+            force_sell(pos.symbol, float(pos.current_price), reason="eod_close")
         print("EOD: all positions closed")
     except Exception as e:
         print(f"EOD close error: {e}")
@@ -300,7 +276,7 @@ def on_connect():
                 try:
                     bar   = api.get_latest_bar(ticker)
                     price = float(bar.c)
-                    price_history.setdefault(ticker, []).append(price)
+                    price_history.setdefault(ticker,  []).append(price)
                     volume_history.setdefault(ticker, []).append(float(bar.v))
                     sigs  = get_signals(ticker, price)
                     buys  = sum(1 for s in sigs if s["action"] == "buy")
@@ -308,7 +284,7 @@ def on_connect():
                     action = "buy" if buys >= THRESHOLD else "sell" if sells >= THRESHOLD else "hold"
                     pos = open_positions.get(ticker)
                     state["tickers"][ticker] = {
-                        "price": round(price, 2), "signals": sigs,
+                        "price":  round(price, 2), "signals": sigs,
                         "action": action, "buys": buys, "sells": sells,
                         "stop":   round(pos["stop"],   2) if pos else None,
                         "target": round(pos["target"], 2) if pos else None,
@@ -326,23 +302,22 @@ def on_connect():
 def execute(ticker, action, price):
     try:
         if action == "buy" and ticker not in open_positions:
-            atr = fetch_atr(ticker)
-            qty = position_size(price, atr)
-            stop   = price - (atr * ATR_STOP_MULT)   if atr else price * 0.98
-            target = price + (atr * ATR_TARGET_MULT)  if atr else price * 1.06
+            atr    = fetch_atr(ticker)
+            qty    = position_size(price, atr)
+            stop   = price - (atr * ATR_STOP_MULT)  if atr else price * 0.98
+            target = price + (atr * ATR_TARGET_MULT) if atr else price * 1.06
             api.submit_order(symbol=ticker, qty=qty, side="buy",
                              type="market", time_in_force="day")
             open_positions[ticker] = {"entry": price, "stop": stop, "target": target, "qty": qty}
             trade_log.insert(0, {
                 "type": "BUY", "ticker": ticker, "qty": qty,
                 "price": round(price, 2), "pnl": None,
-                "stop": round(stop, 2), "target": round(target, 2)
+                "stop": round(stop, 2), "target": round(target, 2),
+                "ts": int(time.time() * 1000)
             })
             print(f"BUY {qty}x {ticker} @ ${price:.2f} | stop ${stop:.2f} | target ${target:.2f}")
-
         elif action == "sell" and ticker in open_positions:
             force_sell(ticker, price, reason="signal")
-
     except Exception as e:
         print(f"Order error {ticker}: {e}")
 
@@ -363,12 +338,10 @@ def bot_loop():
                 time.sleep(60)
                 continue
 
-            # Update regime every 30 min during market hours
             if not last_regime_update or (now - last_regime_update).seconds > 1800:
                 update_market_regime()
                 last_regime_update = now
 
-            # EOD close — 15 min before close (3:45 PM ET)
             if now.hour == 15 and now.minute >= 45:
                 close_all_positions_eod()
                 time.sleep(900)
@@ -381,23 +354,17 @@ def bot_loop():
                     bar   = api.get_latest_bar(ticker)
                     price = float(bar.c)
                     vol   = float(bar.v)
-
                     price_history.setdefault(ticker,  []).append(price)
                     volume_history.setdefault(ticker, []).append(vol)
                     if len(price_history[ticker])  > 200: price_history[ticker].pop(0)
                     if len(volume_history[ticker]) > 200: volume_history[ticker].pop(0)
-
-                    # Check stops before signal logic
                     check_stops(ticker, price)
-
                     sigs  = get_signals(ticker, price)
                     buys  = sum(1 for s in sigs if s["action"] == "buy")
                     sells = sum(1 for s in sigs if s["action"] == "sell")
                     action = "buy" if buys >= THRESHOLD else "sell" if sells >= THRESHOLD else "hold"
-
                     if action != "hold":
                         execute(ticker, action, price)
-
                     pos = open_positions.get(ticker)
                     state["tickers"][ticker] = {
                         "price":  round(price, 2), "signals": sigs,
