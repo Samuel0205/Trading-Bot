@@ -278,12 +278,17 @@ def run_scan(api, universe, days_back=1, account_size=20):
     print(f"=== Top 5 ({label}): {[(r['ticker'], r['grade'], r['score']) for r in top5]} ===\n")
     return top5
 
+MAX_ACCOUNT = 20.00  # your real capital limit — update as you grow
+
 def get_account_size(api):
-    """Pulls real account equity so scanner self-scales."""
+    """
+    Returns the SMALLER of MAX_ACCOUNT or actual equity.
+    Keeps scanner scaled to your real capital, not paper balance.
+    """
     try:
-        return float(api.get_account().equity)
+        return min(float(api.get_account().equity), MAX_ACCOUNT)
     except:
-        return 20.0
+        return MAX_ACCOUNT
 
 def run_full_scan(api):
     account_size = get_account_size(api)
