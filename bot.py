@@ -310,13 +310,13 @@ def update_market_regime():
         print(f"Regime error: {e}")
 
 def update_market_regime_with_retry(attempts=5, delay=10):
+    global market_regime
     for i in range(attempts):
         update_market_regime()
         if market_regime != "unknown":
             return
         print(f"  Regime retry {i+1}/{attempts} in {delay}s...")
         time.sleep(delay)
-    global market_regime
     market_regime = "ranging"
     print("  Regime defaulting to: ranging")
 
