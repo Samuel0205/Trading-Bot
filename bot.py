@@ -282,9 +282,9 @@ def get_signals(ticker, price):
     ]
 
 # ── Market regime ─────────────────────────────────────────────
-
+global market_regime
 def update_market_regime():
-    global market_regime
+    
     try:
         end   = datetime.now(pytz.utc)
         start = end - timedelta(days=10)
