@@ -26,7 +26,7 @@ THRESHOLD           = 2
 INTERVAL            = 15
 MIN_PRICE           = 0.50
 MIN_VOLUME          = 100_000
-MIN_GRADE           = ["A", "B", "C"]   # skip D and F rated stocks
+MIN_GRADE = ["A", "B", "C", "D"]  # include D — F only is truly bad
 COOLDOWN_STOP       = 600               # 10 min cooldown after stop-loss
 COOLDOWN_PROFIT     = 180               # 3 min cooldown after take-profit
 COOLDOWN_SIGNAL     = 300               # 5 min cooldown after signal exit
@@ -60,8 +60,16 @@ def get_account():
         return None
 
 def get_account_size():
+    """
+    Returns the SMALLER of MAX_ACCOUNT or actual equity.
+    This means the bot scales based on your real capital
+    limit ($20), not the full paper account balance.
+    Once your real capital grows past MAX_ACCOUNT, update
+    MAX_ACCOUNT at the top of this file.
+    """
     acct = get_account()
-    return float(acct.equity) if acct else MAX_ACCOUNT
+    actual = float(acct.equity) if acct else MAX_ACCOUNT
+    return min(actual, MAX_ACCOUNT)
 
 def get_available_cash():
     acct = get_account()
@@ -321,7 +329,11 @@ def update_market_regime():
                     end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     limit=10).df
         if bars.empty or len(bars) < 5:
+            print("Regime: not enough SPY data yet")
             return
+        # Handle MultiIndex
+        if hasattr(bars.index, 'levels'):
+            bars = bars.loc["SPY"] if "SPY" in bars.index.get_level_values(0) else bars
         closes = list(bars["close"])
         ma5    = calc_ma(closes, 5)
         ma10   = calc_ma(closes, min(10, len(closes)))
@@ -332,6 +344,18 @@ def update_market_regime():
         print(f"Regime: {market_regime} (SPY ${latest:.2f})")
     except Exception as e:
         print(f"Regime error: {e}")
+
+def update_market_regime_with_retry(attempts=5, delay=10):
+    """Keeps retrying regime detection until it succeeds."""
+    for i in range(attempts):
+        update_market_regime()
+        if market_regime != "unknown":
+            return
+        print(f"  Regime retry {i+1}/{attempts} in {delay}s...")
+        time.sleep(delay)
+    print("  Regime detection failed after retries — defaulting to ranging")
+    global market_regime
+    market_regime = "ranging"
 
 # ── Stops ─────────────────────────────────────────────────────
 
@@ -534,151 +558,3 @@ def on_connect():
                     sigs  = get_signals(ticker, price)
                     buys  = sum(1 for s in sigs if s["action"] == "buy")
                     sells = sum(1 for s in sigs if s["action"] == "sell")
-                    action = "buy" if buys >= THRESHOLD else "sell" if sells >= THRESHOLD else "hold"
-                    pos = open_positions.get(ticker)
-                    state["tickers"][ticker] = {
-                        "price":    round(price, 2), "signals": sigs,
-                        "action":   action, "buys": buys, "sells": sells,
-                        "stop":     pos["stop"]   if pos else None,
-                        "target":   pos["target"] if pos else None,
-                        "cooldown": cooldown_remaining(ticker),
-                        "grade":    ticker_grades.get(ticker, "—"),
-                    }
-                except Exception as e:
-                    print(f"on_connect {ticker}: {e}")
-        socketio.emit("state", state)
-        if scan_results["scanned_at"]:
-            socketio.emit("scan", scan_results)
-    except Exception as e:
-        print(f"on_connect error: {e}")
-
-# ── Main bot loop ─────────────────────────────────────────────
-
-def bot_loop():
-    last_regime_update = None
-
-    while True:
-        try:
-            now         = datetime.now(NY)
-            window_open = in_trading_window()
-            market_open = is_market_open() if window_open else False
-
-            if not window_open:
-                socketio.emit("state", {
-                    "tickers": {}, "account": get_account_state(),
-                    "trades": trade_log[:40], "market_status": "closed",
-                    "message": "Trading window closed — resumes 8:45 AM ET"
-                })
-                time.sleep(60)
-                continue
-
-            if not market_open:
-                socketio.emit("state", {
-                    "tickers": {}, "account": get_account_state(),
-                    "trades": trade_log[:40], "market_status": "closed",
-                    "message": "Warming up — market opens 9:30 AM ET"
-                })
-                time.sleep(30)
-                continue
-
-            if (not last_regime_update or
-                    (now - last_regime_update).total_seconds() > 1800):
-                update_market_regime()
-                last_regime_update = now
-
-            if now.hour == 13 and now.minute >= 50:
-                close_all_positions_eod()
-                print("EOD close done. Waiting.")
-                time.sleep(600)
-                continue
-
-            state = {
-                "tickers": {}, "account": {},
-                "market_status": "open", "regime": market_regime
-            }
-
-            for ticker in list(active_tickers):
-                try:
-                    bar   = api.get_latest_bar(ticker)
-                    price = float(bar.c)
-                    vol   = float(bar.v)
-
-                    price_history.setdefault(ticker,  []).append(price)
-                    volume_history.setdefault(ticker, []).append(vol)
-                    if len(price_history[ticker])  > 200: price_history[ticker].pop(0)
-                    if len(volume_history[ticker]) > 200: volume_history[ticker].pop(0)
-
-                    check_stops(ticker, price)
-
-                    sigs  = get_signals(ticker, price)
-                    buys  = sum(1 for s in sigs if s["action"] == "buy")
-                    sells = sum(1 for s in sigs if s["action"] == "sell")
-                    action = "buy" if buys >= THRESHOLD else "sell" if sells >= THRESHOLD else "hold"
-
-                    if action != "hold":
-                        execute(ticker, action, price)
-
-                    pos = open_positions.get(ticker)
-                    cd  = cooldown_remaining(ticker)
-
-                    state["tickers"][ticker] = {
-                        "price":    round(price, 2), "signals": sigs,
-                        "action":   action, "buys": buys, "sells": sells,
-                        "stop":     pos["stop"]   if pos else None,
-                        "target":   pos["target"] if pos else None,
-                        "cooldown": cd,
-                        "grade":    ticker_grades.get(ticker, "—"),
-                    }
-                    print(f"  {ticker}: ${price:.2f} | {action} | "
-                          f"buys={buys} sells={sells} | regime:{market_regime}"
-                          + (f" | cd:{cd}s" if cd else "")
-                          + (f" | grade:{ticker_grades.get(ticker,'?')}" if ticker in ticker_grades else ""))
-                except Exception as e:
-                    print(f"  {ticker} error: {e}")
-
-            state["account"] = get_account_state()
-            state["trades"]  = trade_log[:40]
-            socketio.emit("state", state)
-
-        except Exception as e:
-            print(f"Loop error: {e}")
-
-        time.sleep(INTERVAL)
-
-# ── Flask routes ──────────────────────────────────────────────
-
-@app.route("/")
-def index():
-    return render_template("dashboard.html")
-
-@app.route("/scanner")
-def scanner_page():
-    return render_template("scanner.html")
-
-@app.route("/predictions")
-def predictions_page():
-    return render_template("predictions.html")
-
-@app.route("/state")
-def state_json():
-    return jsonify({"trades": trade_log[:20]})
-
-@app.route("/scan")
-def scan_json():
-    return jsonify(scan_results)
-
-@app.route("/ping")
-def ping():
-    return "pong", 200
-
-if __name__ == "__main__":
-    print("Starting — detecting market regime...")
-    update_market_regime()
-
-    print("Validating fallback tickers...")
-    validate_fallback_tickers()
-
-    threading.Thread(target=bot_loop,     daemon=True).start()
-    threading.Thread(target=scanner_loop, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))
-    socketio.run(app, host="0.0.0.0", port=port)
