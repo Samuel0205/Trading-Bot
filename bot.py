@@ -18,25 +18,22 @@ app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # ── Config ────────────────────────────────────────────────────
-MAX_ACCOUNT         = 20.00
-MAX_TRADE_PCT       = 0.50
-STOP_LOSS_PCT       = 0.05
-TAKE_PROFIT_PCT     = 0.10
-THRESHOLD           = 2
-INTERVAL            = 15
-MIN_PRICE           = 0.50
-MIN_VOLUME          = 100_000
-MIN_GRADE = ["A", "B", "C", "D"]
-
-COOLDOWN_STOP       = 600
-COOLDOWN_PROFIT     = 180
-COOLDOWN_SIGNAL     = 300
-
-TRADING_START       = (8, 45)
-TRADING_END         = (14, 0)
-SCAN_HOURS          = [9, 11, 13]
-
-FALLBACK_TICKERS    = ["SIRI", "TELL", "CLOV", "NKLA", "MVIS"]
+MAX_ACCOUNT      = 20.00
+MAX_TRADE_PCT    = 0.50
+STOP_LOSS_PCT    = 0.05
+TAKE_PROFIT_PCT  = 0.10
+THRESHOLD        = 2
+INTERVAL         = 15
+MIN_PRICE        = 0.50
+MIN_VOLUME       = 100_000
+MIN_GRADE        = ["A", "B", "C", "D"]
+COOLDOWN_STOP    = 600
+COOLDOWN_PROFIT  = 180
+COOLDOWN_SIGNAL  = 300
+TRADING_START    = (8, 45)
+TRADING_END      = (14, 0)
+SCAN_HOURS       = [9, 11, 13]
+FALLBACK_TICKERS = ["SIRI", "TELL", "CLOV", "NKLA", "MVIS"]
 
 price_history  = {}
 volume_history = {}
@@ -50,7 +47,7 @@ ticker_grades  = {}
 
 NY = pytz.timezone("America/New_York")
 
-# ── Helpers ───────────────────────────────────────────────────
+# ── Account helpers ───────────────────────────────────────────
 
 def get_account():
     try:
@@ -85,7 +82,395 @@ def get_account_state():
         print(f"get_account_state error: {e}")
         return {"portfolio": 0, "cash": 0, "pnl": 0, "regime": market_regime}
 
-# ── Socket Connect (FIXED) ────────────────────────────────────
+# ── Dynamic scaling helpers ───────────────────────────────────
+
+def get_price_ceiling(account_size=None):
+    if account_size is None:
+        account_size = get_account_size()
+    return max(min(account_size * 0.45, 10.00), 0.60)
+
+def get_price_floor(account_size=None):
+    if account_size is None:
+        account_size = get_account_size()
+    if account_size > 2000: return 5.00
+    if account_size > 500:  return 2.00
+    if account_size > 100:  return 1.00
+    return 0.50
+
+def get_min_volume(account_size=None):
+    if account_size is None:
+        account_size = get_account_size()
+    if account_size > 5000: return 1_000_000
+    if account_size > 1000: return 500_000
+    if account_size > 200:  return 250_000
+    return 100_000
+
+# ── Window helpers ────────────────────────────────────────────
+
+def in_trading_window():
+    now = datetime.now(NY)
+    if now.weekday() >= 5:
+        return False
+    t = (now.hour, now.minute)
+    return TRADING_START <= t < TRADING_END
+
+def is_market_open():
+    try:
+        return api.get_clock().is_open
+    except:
+        return False
+
+# ── Cooldown helpers ──────────────────────────────────────────
+
+def set_cooldown(ticker, reason="signal"):
+    durations = {
+        "stop_loss":   COOLDOWN_STOP,
+        "take_profit": COOLDOWN_PROFIT,
+        "signal":      COOLDOWN_SIGNAL,
+        "eod_close":   COOLDOWN_SIGNAL,
+    }
+    duration = durations.get(reason, COOLDOWN_SIGNAL)
+    cooldowns[ticker] = {"until": time.time() + duration, "reason": reason}
+    print(f"  Cooldown: {ticker} for {duration}s ({reason})")
+
+def is_on_cooldown(ticker):
+    cd = cooldowns.get(ticker)
+    if not cd: return False
+    return time.time() < cd["until"]
+
+def cooldown_remaining(ticker):
+    cd = cooldowns.get(ticker)
+    if not cd: return 0
+    return max(0, int(cd["until"] - time.time()))
+
+# ── Filters ───────────────────────────────────────────────────
+
+def passes_filters(ticker, price, account_size=None):
+    if account_size is None:
+        account_size = get_account_size()
+    floor   = get_price_floor(account_size)
+    ceiling = get_price_ceiling(account_size)
+    min_vol = get_min_volume(account_size)
+    if price < floor or price > ceiling:
+        print(f"  {ticker} filtered — price ${price:.2f} outside ${floor}–${ceiling:.2f}")
+        return False
+    grade = ticker_grades.get(ticker)
+    if grade and grade not in MIN_GRADE:
+        print(f"  {ticker} filtered — grade {grade}")
+        return False
+    try:
+        end   = datetime.now(pytz.utc)
+        start = end - timedelta(days=3)
+        bars  = api.get_bars(ticker, "1Day",
+                    start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    limit=3).df
+        if bars.empty:
+            return False
+        if hasattr(bars.index, 'levels'):
+            if ticker in bars.index.get_level_values(0):
+                bars = bars.loc[ticker]
+            else:
+                return False
+        avg_vol = bars["volume"].mean()
+        if avg_vol < min_vol:
+            print(f"  {ticker} filtered — vol {int(avg_vol):,} < {min_vol:,}")
+            return False
+        return True
+    except Exception as e:
+        print(f"  Volume check error {ticker}: {e}")
+        return False
+
+# ── Position sizing ───────────────────────────────────────────
+
+def position_size(price, account_size=None):
+    try:
+        available     = get_available_cash()
+        if account_size is None:
+            account_size = get_account_size()
+        usable        = min(available, MAX_ACCOUNT)
+        max_per_trade = usable * MAX_TRADE_PCT
+        if max_per_trade < price:
+            print(f"  Can't afford ${price:.2f} (max: ${max_per_trade:.2f})")
+            return 0
+        return max(0, int(max_per_trade / price))
+    except Exception as e:
+        print(f"  position_size error: {e}")
+        return 0
+
+# ── Indicators ────────────────────────────────────────────────
+
+def calc_rsi(prices, period=14):
+    if len(prices) < period + 1:
+        return 50
+    gains, losses = 0, 0
+    for i in range(-period, 0):
+        d = prices[i] - prices[i-1]
+        if d > 0: gains += d
+        else:     losses += abs(d)
+    if losses == 0: return 100
+    return 100 - (100 / (1 + gains / losses))
+
+def calc_ma(prices, n):
+    s = prices[-n:] if len(prices) >= n else prices
+    return sum(s) / len(s)
+
+def calc_bollinger(prices, n=20):
+    s = prices[-n:] if len(prices) >= n else prices
+    mean = sum(s) / len(s)
+    std  = (sum((v - mean)**2 for v in s) / len(s)) ** 0.5
+    return mean, mean + 2*std, mean - 2*std
+
+def calc_vwap(prices, volumes):
+    if not prices or not volumes or sum(volumes) == 0:
+        return prices[-1] if prices else 0
+    return sum(p * v for p, v in zip(prices, volumes)) / sum(volumes)
+
+def calc_macd(prices):
+    def ema(data, period):
+        if len(data) < period:
+            return data[-1] if data else 0
+        k = 2 / (period + 1)
+        val = sum(data[:period]) / period
+        for p in data[period:]:
+            val = p * k + val * (1 - k)
+        return val
+    if len(prices) < 26:
+        return 0
+    return ema(prices, 12) - ema(prices, 26)
+
+def get_signals(ticker, price):
+    hist = price_history.get(ticker, [])
+    vols = volume_history.get(ticker, [])
+    if len(hist) < 5:
+        return [{"name": n, "action": "hold", "signal": 50}
+                for n in ["MA Crossover","RSI","Bollinger","VWAP","MACD","Mean Reversion"]]
+    rsi              = calc_rsi(hist)
+    ma50             = calc_ma(hist, min(50,  len(hist)))
+    ma200            = calc_ma(hist, min(200, len(hist)))
+    mean, upper, lower = calc_bollinger(hist)
+    vwap             = calc_vwap(hist[-78:], vols[-78:])
+    macd_line        = calc_macd(hist)
+    z_score          = (price - mean) / max((upper - mean), 0.01)
+    regime_ok_buy    = market_regime in ("trending_up",  "ranging", "unknown")
+    regime_ok_sell   = market_regime in ("trending_down", "ranging", "unknown")
+
+    def act(buy_cond, sell_cond):
+        if buy_cond  and regime_ok_buy:  return "buy"
+        if sell_cond and regime_ok_sell: return "sell"
+        return "hold"
+
+    return [
+        {"name": "MA Crossover",
+         "action": act(ma50 > ma200*1.005, ma200 > ma50*1.005),
+         "signal": min(95, 50 + (ma50-ma200)/max(ma200,1)*600)},
+        {"name": "RSI",
+         "action": act(rsi < 35, rsi > 65),
+         "signal": 100 - rsi},
+        {"name": "Bollinger",
+         "action": act(price < lower*0.99, price > upper*1.01),
+         "signal": max(5, min(95, 50 - z_score*40))},
+        {"name": "VWAP",
+         "action": act(price > vwap*1.001, price < vwap*0.999),
+         "signal": min(95, max(5, 50 + (price-vwap)/max(vwap,1)*500))},
+        {"name": "MACD",
+         "action": act(macd_line > 0, macd_line < 0),
+         "signal": min(95, max(5, 50 + macd_line * 10))},
+        {"name": "Mean Reversion",
+         "action": act(price < mean*0.96, price > mean*1.04),
+         "signal": min(92, max(8, 50 + (mean-price)/max(mean,1)*250))},
+    ]
+
+# ── Market regime ─────────────────────────────────────────────
+
+def update_market_regime():
+    global market_regime
+    try:
+        end   = datetime.now(pytz.utc)
+        start = end - timedelta(days=10)
+        bars  = api.get_bars("SPY", "1Day",
+                    start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    limit=10).df
+        if bars.empty or len(bars) < 5:
+            print("Regime: not enough SPY data")
+            return
+        if hasattr(bars.index, 'levels'):
+            if "SPY" in bars.index.get_level_values(0):
+                bars = bars.loc["SPY"]
+        closes = list(bars["close"])
+        ma5    = calc_ma(closes, 5)
+        ma10   = calc_ma(closes, min(10, len(closes)))
+        latest = closes[-1]
+        if   ma5 > ma10*1.005 and latest > ma5: market_regime = "trending_up"
+        elif ma5 < ma10*0.995 and latest < ma5: market_regime = "trending_down"
+        else:                                    market_regime = "ranging"
+        print(f"Regime: {market_regime} (SPY ${latest:.2f})")
+    except Exception as e:
+        print(f"Regime error: {e}")
+
+def update_market_regime_with_retry(attempts=5, delay=10):
+    for i in range(attempts):
+        update_market_regime()
+        if market_regime != "unknown":
+            return
+        print(f"  Regime retry {i+1}/{attempts} in {delay}s...")
+        time.sleep(delay)
+    global market_regime
+    market_regime = "ranging"
+    print("  Regime defaulting to: ranging")
+
+# ── Stops ─────────────────────────────────────────────────────
+
+def check_stops(ticker, price):
+    pos = open_positions.get(ticker)
+    if not pos: return
+    if price <= pos["stop"]:
+        print(f"STOP-LOSS: {ticker} @ ${price:.2f}")
+        force_sell(ticker, price, reason="stop_loss")
+    elif price >= pos["target"]:
+        print(f"TAKE-PROFIT: {ticker} @ ${price:.2f}")
+        force_sell(ticker, price, reason="take_profit")
+
+def force_sell(ticker, price, reason="stop_loss"):
+    try:
+        pos = api.get_position(ticker)
+        qty = int(pos.qty)
+        if qty <= 0:
+            open_positions.pop(ticker, None)
+            return
+        pnl = round((price - float(pos.avg_entry_price)) * qty, 2)
+        api.submit_order(symbol=ticker, qty=qty, side="sell",
+                         type="market", time_in_force="day")
+        trade_log.insert(0, {
+            "type":   "SELL", "ticker": ticker, "qty": qty,
+            "price":  round(price, 2), "pnl": pnl, "reason": reason,
+            "ts":     int(time.time() * 1000)
+        })
+        open_positions.pop(ticker, None)
+        set_cooldown(ticker, reason)
+        print(f"SELL {qty}x {ticker} @ ${price:.2f} | {reason} | PnL ${pnl:+.2f}")
+    except Exception as e:
+        print(f"Force sell error {ticker}: {e}")
+
+def close_all_positions_eod():
+    try:
+        positions = api.list_positions()
+        for pos in positions:
+            force_sell(pos.symbol, float(pos.current_price), reason="eod_close")
+        print("EOD: all positions closed")
+    except Exception as e:
+        print(f"EOD close error: {e}")
+
+# ── Trade execution ───────────────────────────────────────────
+
+def execute(ticker, action, price):
+    try:
+        if action == "buy" and ticker not in open_positions:
+            if is_on_cooldown(ticker):
+                print(f"  {ticker} on cooldown — {cooldown_remaining(ticker)}s left")
+                return
+            acct_size = get_account_size()
+            if not passes_filters(ticker, price, acct_size):
+                return
+            qty = position_size(price, acct_size)
+            if qty == 0:
+                print(f"  Skipping {ticker} — qty is 0")
+                return
+            stop   = round(price * (1 - STOP_LOSS_PCT),  2)
+            target = round(price * (1 + TAKE_PROFIT_PCT), 2)
+            api.submit_order(symbol=ticker, qty=qty, side="buy",
+                             type="market", time_in_force="day")
+            open_positions[ticker] = {
+                "entry": price, "stop": stop, "target": target, "qty": qty
+            }
+            trade_log.insert(0, {
+                "type":   "BUY", "ticker": ticker, "qty": qty,
+                "price":  round(price, 2), "pnl": None,
+                "stop":   stop, "target": target,
+                "ts":     int(time.time() * 1000)
+            })
+            print(f"BUY {qty}x {ticker} @ ${price:.2f} | SL ${stop} | TP ${target}")
+        elif action == "sell" and ticker in open_positions:
+            force_sell(ticker, price, reason="signal")
+    except Exception as e:
+        print(f"Order error {ticker}: {e}")
+
+# ── Validate fallback tickers ─────────────────────────────────
+
+def validate_fallback_tickers():
+    global active_tickers
+    acct_size = get_account_size()
+    floor     = get_price_floor(acct_size)
+    ceiling   = get_price_ceiling(acct_size)
+    valid     = []
+    for ticker in FALLBACK_TICKERS:
+        try:
+            bar   = api.get_latest_bar(ticker)
+            price = float(bar.c)
+            if floor <= price <= ceiling:
+                valid.append(ticker)
+                print(f"  Fallback {ticker} OK @ ${price:.2f}")
+            else:
+                print(f"  Fallback {ticker} out of range @ ${price:.2f}")
+        except Exception as e:
+            print(f"  Fallback check error {ticker}: {e}")
+    active_tickers = valid if valid else []
+    print(f"Validated fallback tickers: {active_tickers}")
+
+# ── Scanner loop ──────────────────────────────────────────────
+
+def scanner_loop():
+    global scan_results, active_tickers
+    scanned_hours = set()
+    print("Running initial regime detection...")
+    update_market_regime()
+
+    while True:
+        now  = datetime.now(NY)
+        hour = now.hour
+        day  = now.date()
+        if not hasattr(scanner_loop, '_last_day') or scanner_loop._last_day != day:
+            scanned_hours.clear()
+            scanner_loop._last_day = day
+        if (now.weekday() < 5
+                and hour in SCAN_HOURS
+                and hour not in scanned_hours
+                and in_trading_window()):
+            print(f"Scanner firing at {now.strftime('%H:%M')} ET...")
+            try:
+                update_market_regime()
+                if market_regime == "unknown":
+                    market_regime = "ranging"
+                acct_size    = get_account_size()
+                scan_results = run_full_scan(api)
+                scanned_hours.add(hour)
+                if scan_results["today"]:
+                    ceiling    = get_price_ceiling(acct_size)
+                    floor      = get_price_floor(acct_size)
+                    affordable = [
+                        s for s in scan_results["today"]
+                        if floor <= s["price"] <= ceiling
+                        and s.get("grade", "F") in MIN_GRADE
+                    ]
+                    if affordable:
+                        new_tickers = [s["ticker"] for s in affordable[:5]]
+                        for s in affordable[:5]:
+                            ticker_grades[s["ticker"]] = s.get("grade", "C")
+                    else:
+                        print("  No affordable stocks — keeping current tickers")
+                        new_tickers = list(active_tickers) or list(FALLBACK_TICKERS)
+                    for t in new_tickers:
+                        price_history.setdefault(t,  [])
+                        volume_history.setdefault(t, [])
+                    active_tickers = new_tickers
+                    print(f"Active tickers: {active_tickers}")
+                socketio.emit("scan", scan_results)
+            except Exception as e:
+                print(f"Scanner error: {e}")
+        time.sleep(60)
+
+# ── On connect ────────────────────────────────────────────────
 
 @socketio.on("connect")
 def on_connect():
@@ -93,53 +478,163 @@ def on_connect():
     try:
         window_open = in_trading_window()
         market_open = is_market_open() if window_open else False
-
         state = {
             "tickers":       {},
             "account":       get_account_state(),
             "trades":        trade_log[:40],
             "market_status": "open" if market_open else "closed",
         }
-
         if market_open:
             for ticker in list(active_tickers):
                 try:
                     bar   = api.get_latest_bar(ticker)
                     price = float(bar.c)
-
-                    price_history.setdefault(ticker, []).append(price)
+                    price_history.setdefault(ticker,  []).append(price)
                     volume_history.setdefault(ticker, []).append(float(bar.v))
-
                     sigs  = get_signals(ticker, price)
                     buys  = sum(1 for s in sigs if s["action"] == "buy")
                     sells = sum(1 for s in sigs if s["action"] == "sell")
-
+                    action = "buy" if buys >= THRESHOLD else "sell" if sells >= THRESHOLD else "hold"
+                    pos = open_positions.get(ticker)
                     state["tickers"][ticker] = {
-                        "price": price,
-                        "buys": buys,
-                        "sells": sells,
-                        "signals": sigs
+                        "price":    round(price, 2), "signals": sigs,
+                        "action":   action, "buys": buys, "sells": sells,
+                        "stop":     pos["stop"]   if pos else None,
+                        "target":   pos["target"] if pos else None,
+                        "cooldown": cooldown_remaining(ticker),
+                        "grade":    ticker_grades.get(ticker, "—"),
                     }
-
                 except Exception as e:
-                    print(f"Error processing {ticker}: {e}")
-                    continue
-
+                    print(f"on_connect {ticker}: {e}")
         socketio.emit("state", state)
-
+        if scan_results["scanned_at"]:
+            socketio.emit("scan", scan_results)
     except Exception as e:
         print(f"on_connect error: {e}")
 
-# ── Dummy placeholders (unchanged logic elsewhere) ─────────────
-# NOTE: These exist only because your original paste was cut.
-# Your real file already has these — keep yours.
+# ── Main bot loop ─────────────────────────────────────────────
 
-def in_trading_window():
-    now = datetime.now(NY)
-    return True
+def bot_loop():
+    last_regime_update = None
+    while True:
+        try:
+            now         = datetime.now(NY)
+            window_open = in_trading_window()
+            market_open = is_market_open() if window_open else False
 
-def is_market_open():
-    return True
+            if not window_open:
+                socketio.emit("state", {
+                    "tickers": {}, "account": get_account_state(),
+                    "trades": trade_log[:40], "market_status": "closed",
+                    "message": "Trading window closed — resumes 8:45 AM ET"
+                })
+                time.sleep(60)
+                continue
 
-def get_signals(ticker, price):
-    return []
+            if not market_open:
+                socketio.emit("state", {
+                    "tickers": {}, "account": get_account_state(),
+                    "trades": trade_log[:40], "market_status": "closed",
+                    "message": "Warming up — market opens 9:30 AM ET"
+                })
+                time.sleep(30)
+                continue
+
+            if (not last_regime_update or
+                    (now - last_regime_update).total_seconds() > 1800):
+                update_market_regime()
+                last_regime_update = now
+
+            if now.hour == 13 and now.minute >= 50:
+                close_all_positions_eod()
+                print("EOD close done.")
+                time.sleep(600)
+                continue
+
+            state = {
+                "tickers": {}, "account": {},
+                "market_status": "open", "regime": market_regime
+            }
+
+            for ticker in list(active_tickers):
+                try:
+                    bar   = api.get_latest_bar(ticker)
+                    price = float(bar.c)
+                    vol   = float(bar.v)
+                    price_history.setdefault(ticker,  []).append(price)
+                    volume_history.setdefault(ticker, []).append(vol)
+                    if len(price_history[ticker])  > 200: price_history[ticker].pop(0)
+                    if len(volume_history[ticker]) > 200: volume_history[ticker].pop(0)
+                    check_stops(ticker, price)
+                    sigs  = get_signals(ticker, price)
+                    buys  = sum(1 for s in sigs if s["action"] == "buy")
+                    sells = sum(1 for s in sigs if s["action"] == "sell")
+                    action = "buy" if buys >= THRESHOLD else "sell" if sells >= THRESHOLD else "hold"
+                    if action != "hold":
+                        execute(ticker, action, price)
+                    pos = open_positions.get(ticker)
+                    cd  = cooldown_remaining(ticker)
+                    state["tickers"][ticker] = {
+                        "price":    round(price, 2), "signals": sigs,
+                        "action":   action, "buys": buys, "sells": sells,
+                        "stop":     pos["stop"]   if pos else None,
+                        "target":   pos["target"] if pos else None,
+                        "cooldown": cd,
+                        "grade":    ticker_grades.get(ticker, "—"),
+                    }
+                    print(f"  {ticker}: ${price:.2f} | {action} | "
+                          f"buys={buys} sells={sells} | regime:{market_regime}"
+                          + (f" | cd:{cd}s" if cd else ""))
+                except Exception as e:
+                    print(f"  {ticker} error: {e}")
+
+            state["account"] = get_account_state()
+            state["trades"]  = trade_log[:40]
+            socketio.emit("state", state)
+
+        except Exception as e:
+            print(f"Loop error: {e}")
+
+        time.sleep(INTERVAL)
+
+# ── Flask routes ──────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template("dashboard.html")
+
+@app.route("/scanner")
+def scanner_page():
+    return render_template("scanner.html")
+
+@app.route("/predictions")
+def predictions_page():
+    return render_template("predictions.html")
+
+@app.route("/state")
+def state_json():
+    return jsonify({"trades": trade_log[:20]})
+
+@app.route("/scan")
+def scan_json():
+    return jsonify(scan_results)
+
+@app.route("/ping")
+def ping():
+    return "pong", 200
+
+# ── Startup ───────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("Starting — detecting market regime...")
+    update_market_regime_with_retry()
+
+    print("Validating fallback tickers...")
+    validate_fallback_tickers()
+
+    threading.Thread(target=bot_loop,     daemon=True).start()
+    threading.Thread(target=scanner_loop, daemon=True).start()
+
+    port = int(os.environ.get("PORT", 10000))
+    print(f"Starting server on port {port}...")
+    socketio.run(app, host="0.0.0.0", port=port)
