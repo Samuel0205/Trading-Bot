@@ -291,9 +291,11 @@ def update_market_regime():
         bars  = api.get_bars("SPY", "1Day",
                     start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    limit=10).df
+                    limit=10,
+                    feed="iex").df  # use IEX — free tier compatible
         if bars.empty or len(bars) < 5:
             print("Regime: not enough SPY data")
+            market_regime = "ranging"
             return
         if hasattr(bars.index, 'levels'):
             if "SPY" in bars.index.get_level_values(0):
@@ -308,6 +310,7 @@ def update_market_regime():
         print(f"Regime: {market_regime} (SPY ${latest:.2f})")
     except Exception as e:
         print(f"Regime error: {e}")
+        market_regime = "ranging"  # safe fallback on any error
 
 def update_market_regime_with_retry(attempts=5, delay=10):
     global market_regime
@@ -406,7 +409,7 @@ def validate_fallback_tickers():
     valid     = []
     for ticker in FALLBACK_TICKERS:
         try:
-            bar   = api.get_latest_bar(ticker)
+            bar   = api.get_latest_bar(ticker, feed="iex")
             price = float(bar.c)
             if floor <= price <= ceiling:
                 valid.append(ticker)
@@ -487,7 +490,7 @@ def on_connect():
         if market_open:
             for ticker in list(active_tickers):
                 try:
-                    bar   = api.get_latest_bar(ticker)
+                    bar   = api.get_latest_bar(ticker, feed="iex")
                     price = float(bar.c)
                     price_history.setdefault(ticker,  []).append(price)
                     volume_history.setdefault(ticker, []).append(float(bar.v))
@@ -558,7 +561,7 @@ def bot_loop():
 
             for ticker in list(active_tickers):
                 try:
-                    bar   = api.get_latest_bar(ticker)
+                    bar   = api.get_latest_bar(ticker, feed="iex")
                     price = float(bar.c)
                     vol   = float(bar.v)
                     price_history.setdefault(ticker,  []).append(price)
