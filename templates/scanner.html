@@ -8,16 +8,20 @@
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f1117; color: #e8e8e8; padding: 12px; font-size: 14px; }
-.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
 .header h1 { font-size: 18px; font-weight: 600; }
 .back { font-size: 12px; color: #4a9eff; text-decoration: none; background: #4a9eff11; padding: 5px 10px; border-radius: 8px; }
-.nav { display: flex; gap: 8px; margin-bottom: 14px; }
+.nav { display: flex; gap: 8px; margin-bottom: 12px; }
 .nav a { padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 500; text-decoration: none; background: #1a1d27; color: #888; cursor: pointer; }
 .nav a.active { background: #4a9eff22; color: #4a9eff; }
-.scan-meta { background: #1a1d27; border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.scan-time { font-size: 11px; color: #444; }
+.scan-btn { font-size: 12px; font-weight: 500; padding: 7px 16px; border-radius: 8px; border: 1px solid #4a9eff44; background: #4a9eff11; color: #4a9eff; cursor: pointer; transition: opacity .2s; }
+.scan-btn:disabled { opacity: .4; cursor: default; }
+.meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; background: #1a1d27; border-radius: 10px; padding: 12px 14px; }
 .meta-item .lbl { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 3px; }
 .meta-item .val { font-size: 14px; font-weight: 600; color: #4a9eff; }
-.predictions-btn { font-size: 11px; color: #E9A84C; text-decoration: none; background: #E9A84C11; padding: 4px 10px; border-radius: 8px; display: inline-block; margin-bottom: 14px; }
+.predictions-btn { display: inline-block; font-size: 11px; color: #E9A84C; text-decoration: none; background: #E9A84C11; padding: 4px 10px; border-radius: 8px; margin-bottom: 14px; }
 .stock-card { background: #1a1d27; border-radius: 12px; padding: 14px; margin-bottom: 10px; }
 .card-top { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .rank { font-size: 22px; font-weight: 700; min-width: 28px; text-align: center; }
@@ -29,18 +33,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
 .ticker-row { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; flex-wrap: wrap; }
 .ticker  { font-size: 17px; font-weight: 700; }
 .price   { font-size: 14px; color: #888; }
-.change  { font-size: 12px; font-weight: 600; padding: 2px 7px; border-radius: 4px; }
+.chg     { font-size: 12px; font-weight: 600; padding: 2px 7px; border-radius: 4px; }
 .up      { background: #1D9E7522; color: #1D9E75; }
 .down    { background: #D85A3022; color: #D85A30; }
 .grade   { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 4px; }
-.grade-A { background: #1D9E7522; color: #1D9E75; }
-.grade-B { background: #4a9eff22; color: #4a9eff; }
-.grade-C { background: #E9A84C22; color: #E9A84C; }
-.grade-D { background: #D85A3022; color: #D85A30; }
-.grade-F { background: #44444422; color: #888; }
+.gA,.gB  { background: #1D9E7522; color: #1D9E75; }
+.gB      { background: #4a9eff22; color: #4a9eff; }
+.gC      { background: #E9A84C22; color: #E9A84C; }
+.gD,.gF  { background: #D85A3022; color: #D85A30; }
 .score-circle { width: 44px; height: 44px; border-radius: 50%; background: #4a9eff15; border: 1.5px solid #4a9eff33; display: flex; flex-direction: column; align-items: center; justify-content: center; flex-shrink: 0; }
-.score-num   { font-size: 12px; font-weight: 700; color: #4a9eff; line-height: 1; }
-.score-lbl   { font-size: 8px; color: #555; margin-top: 1px; }
+.score-num { font-size: 12px; font-weight: 700; color: #4a9eff; line-height: 1; }
+.score-lbl { font-size: 8px; color: #555; margin-top: 1px; }
 .bars { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
 .bar-row { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #555; }
 .bar-row .lbl { min-width: 72px; }
@@ -49,14 +52,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
 .bar-val { min-width: 36px; text-align: right; font-size: 10px; color: #666; }
 .pills { display: flex; gap: 5px; flex-wrap: wrap; }
 .pill { font-size: 10px; padding: 2px 8px; border-radius: 10px; }
-.pill-vol      { background: #4a9eff22; color: #4a9eff; }
-.pill-news     { background: #E9A84C22; color: #E9A84C; }
-.pill-sent-pos { background: #1D9E7522; color: #1D9E75; }
-.pill-sent-neg { background: #D85A3022; color: #D85A30; }
-.pill-rs       { background: #C45C8A22; color: #C45C8A; }
-.pill-method   { background: #2a2d3a; color: #666; }
-.pill-range    { background: #7B68EE22; color: #7B68EE; }
-.empty   { color: #444; font-size: 13px; text-align: center; padding: 40px 16px; line-height: 1.8; }
+.p-vol  { background: #4a9eff22; color: #4a9eff; }
+.p-news { background: #E9A84C22; color: #E9A84C; }
+.p-sp   { background: #1D9E7522; color: #1D9E75; }
+.p-sn   { background: #D85A3022; color: #D85A30; }
+.p-rs   { background: #C45C8A22; color: #C45C8A; }
+.p-rng  { background: #7B68EE22; color: #7B68EE; }
+.p-met  { background: #2a2d3a; color: #666; }
+.empty  { color: #444; font-size: 13px; text-align: center; padding: 40px 16px; line-height: 1.8; }
 .loading { display: flex; align-items: center; gap: 10px; color: #555; font-size: 13px; padding: 32px 0; justify-content: center; }
 .spinner { width: 16px; height: 16px; border: 2px solid #2a2d3a; border-top-color: #4a9eff; border-radius: 50%; animation: spin .8s linear infinite; flex-shrink: 0; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -74,20 +77,25 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
   <a id="tab-yesterday" onclick="showTab('yesterday')">Yesterday's movers</a>
 </div>
 
-<div class="scan-meta" id="scanMeta" style="display:none;">
-  <div class="meta-item"><div class="lbl">Last scan</div><div class="val" id="metaTime">—</div></div>
-  <div class="meta-item"><div class="lbl">Account size</div><div class="val" id="metaAccount">—</div></div>
+<div class="toolbar">
+  <span id="scanTime" class="scan-time">Loading...</span>
+  <button id="scanBtn" class="scan-btn" onclick="triggerManualScan()">Run scan now</button>
+</div>
+
+<div class="meta-grid" id="metaGrid" style="display:none;">
+  <div class="meta-item"><div class="lbl">Account</div><div class="val" id="metaAcct">—</div></div>
   <div class="meta-item"><div class="lbl">Price range</div><div class="val" id="metaRange">—</div></div>
-  <div class="meta-item"><div class="lbl">Universe size</div><div class="val" id="metaUniverse">—</div></div>
+  <div class="meta-item"><div class="lbl">Universe</div><div class="val" id="metaUni">—</div></div>
+  <div class="meta-item"><div class="lbl">Scanned at</div><div class="val" id="metaTime">—</div></div>
 </div>
 
 <a href="/predictions" class="predictions-btn">Predictions page →</a>
 
 <div id="today-section">
-  <div class="loading"><div class="spinner"></div>Scanning market...</div>
+  <div class="empty">No scan data yet.<br>Tap "Run scan now" or wait for 9 AM, 11 AM, or 1 PM ET.<br>Only stocks you can afford will appear here.</div>
 </div>
 <div id="yesterday-section" style="display:none;">
-  <div class="loading"><div class="spinner"></div>Loading yesterday...</div>
+  <div class="empty">No scan data yet.</div>
 </div>
 
 <script>
@@ -101,43 +109,35 @@ function showTab(tab) {
   document.getElementById('tab-yesterday').className = tab==='yesterday' ? 'active' : '';
 }
 
-function rankClass(i) {
-  return ['gold','silver','bronze','other','other'][i] || 'other';
-}
-
-function gradeClass(g) {
-  return 'grade grade-' + (g || 'F');
-}
+function rankClass(i) { return ['gold','silver','bronze','other','other'][i]||'other'; }
+function gradeClass(g) { return 'grade g'+(g||'F'); }
 
 function renderMeta(data) {
-  if (!data.scanned_at) return;
-  document.getElementById('scanMeta').style.display   = 'grid';
-  document.getElementById('metaTime').textContent     = data.scanned_at || '—';
-  document.getElementById('metaAccount').textContent  = data.account_size ? '$' + data.account_size.toFixed(2) : '—';
-  document.getElementById('metaRange').textContent    = data.price_range  || '—';
-  document.getElementById('metaUniverse').textContent = data.universe_size ? data.universe_size + ' stocks' : '—';
+  document.getElementById('metaGrid').style.display = 'grid';
+  document.getElementById('metaAcct').textContent   = data.account_size  ? '$'+data.account_size.toFixed(2) : '—';
+  document.getElementById('metaRange').textContent  = data.price_range   || '—';
+  document.getElementById('metaUni').textContent    = data.universe_size ? data.universe_size+' stocks' : '—';
+  document.getElementById('metaTime').textContent   = data.scanned_at    || '—';
 }
 
 function renderList(stocks, containerId) {
   const el = document.getElementById(containerId);
   if (!stocks || !stocks.length) {
-    el.innerHTML = '<div class="empty">No data yet.<br>Scanner runs at 9 AM, 11 AM, and 1 PM ET on trading days.<br>Only stocks you can afford will appear here.</div>';
+    el.innerHTML = '<div class="empty">No affordable stocks found in this scan.<br>Try running a manual scan.</div>';
     return;
   }
-
   el.innerHTML = stocks.map((s, i) => {
-    const chgClass  = s.change_pct >= 0 ? 'up' : 'down';
-    const chgSign   = s.change_pct >= 0 ? '+' : '';
-    const sentPos   = s.sentiment >= 0;
-    const sentClass = sentPos ? 'pill-sent-pos' : 'pill-sent-neg';
-    const rsSign    = s.rs_5d >= 0 ? '+' : '';
-    const method    = s.sent_method === 'finbert' ? 'FinBERT AI' : 'keyword';
+    const chgCls  = s.change_pct >= 0 ? 'up' : 'down';
+    const chgSign = s.change_pct >= 0 ? '+' : '';
+    const sentPos = s.sentiment  >= 0;
+    const rsSign  = s.rs_5d >= 0 ? '+' : '';
+    const method  = s.sent_method === 'finbert' ? 'FinBERT AI' : 'keyword';
 
-    const volPct   = Math.min(100, (s.vol_ratio / 5)  * 100);
-    const sentPct  = Math.min(100, Math.abs(typeof s.sentiment === 'number' ? s.sentiment * 15 : 0));
-    const rsPct    = Math.min(100, Math.abs(s.rs_5d)   * 5);
-    const rangePct = Math.min(100, (s.avg_range || 0)  * 10);
-    const scorePct = Math.min(100, (s.score / 100)     * 100);
+    const volPct   = Math.min(100, (s.vol_ratio / 5) * 100);
+    const sentPct  = Math.min(100, Math.abs(typeof s.sentiment==='number' ? s.sentiment*15 : 0));
+    const rsPct    = Math.min(100, Math.abs(s.rs_5d) * 5);
+    const rangePct = Math.min(100, (s.avg_range||0) * 10);
+    const scorePct = Math.min(100, (s.score / 100) * 100);
 
     return `
     <div class="stock-card">
@@ -147,12 +147,12 @@ function renderList(stocks, containerId) {
           <div class="ticker-row">
             <span class="ticker">${s.ticker}</span>
             <span class="price">$${s.price}</span>
-            <span class="change ${chgClass}">${chgSign}${s.change_pct}%</span>
-            <span class="${gradeClass(s.grade)}">${s.grade || '?'}</span>
+            <span class="chg ${chgCls}">${chgSign}${s.change_pct}%</span>
+            <span class="${gradeClass(s.grade)}">${s.grade||'?'}</span>
           </div>
           <div style="font-size:10px;color:#555;">
             5d RS: <span style="color:${s.rs_5d>=0?'#1D9E75':'#D85A30'}">${rsSign}${s.rs_5d}%</span>
-            &nbsp;·&nbsp; Daily range: <span style="color:#7B68EE">${s.avg_range||0}%</span>
+            &nbsp;·&nbsp; Range: <span style="color:#7B68EE">${s.avg_range||0}%</span>
           </div>
         </div>
         <div class="score-circle">
@@ -160,64 +160,90 @@ function renderList(stocks, containerId) {
           <div class="score-lbl">score</div>
         </div>
       </div>
-
       <div class="bars">
-        <div class="bar-row">
-          <span class="lbl">Volume surge</span>
-          <div class="bar-bg"><div class="bar-fill" style="width:${volPct}%;background:#4a9eff;"></div></div>
-          <span class="bar-val">${s.vol_ratio}x</span>
-        </div>
-        <div class="bar-row">
-          <span class="lbl">Sentiment</span>
-          <div class="bar-bg"><div class="bar-fill" style="width:${sentPct}%;background:${sentPos?'#1D9E75':'#D85A30'};"></div></div>
-          <span class="bar-val">${sentPos?'+':''}${typeof s.sentiment==='number'?s.sentiment.toFixed(1):s.sentiment}</span>
-        </div>
-        <div class="bar-row">
-          <span class="lbl">Rel. strength</span>
-          <div class="bar-bg"><div class="bar-fill" style="width:${rsPct}%;background:#C45C8A;"></div></div>
-          <span class="bar-val">${rsSign}${s.rs_5d}%</span>
-        </div>
-        <div class="bar-row">
-          <span class="lbl">Daily range</span>
-          <div class="bar-bg"><div class="bar-fill" style="width:${rangePct}%;background:#7B68EE;"></div></div>
-          <span class="bar-val">${s.avg_range||0}%</span>
-        </div>
-        <div class="bar-row">
-          <span class="lbl">Total score</span>
-          <div class="bar-bg"><div class="bar-fill" style="width:${scorePct}%;background:#E9A84C;"></div></div>
-          <span class="bar-val">${s.score}</span>
-        </div>
+        <div class="bar-row"><span class="lbl">Volume surge</span><div class="bar-bg"><div class="bar-fill" style="width:${volPct}%;background:#4a9eff;"></div></div><span class="bar-val">${s.vol_ratio}x</span></div>
+        <div class="bar-row"><span class="lbl">Sentiment</span><div class="bar-bg"><div class="bar-fill" style="width:${sentPct}%;background:${sentPos?'#1D9E75':'#D85A30'};"></div></div><span class="bar-val">${sentPos?'+':''}${typeof s.sentiment==='number'?s.sentiment.toFixed(1):s.sentiment}</span></div>
+        <div class="bar-row"><span class="lbl">Rel. strength</span><div class="bar-bg"><div class="bar-fill" style="width:${rsPct}%;background:#C45C8A;"></div></div><span class="bar-val">${rsSign}${s.rs_5d}%</span></div>
+        <div class="bar-row"><span class="lbl">Daily range</span><div class="bar-bg"><div class="bar-fill" style="width:${rangePct}%;background:#7B68EE;"></div></div><span class="bar-val">${s.avg_range||0}%</span></div>
+        <div class="bar-row"><span class="lbl">Total score</span><div class="bar-bg"><div class="bar-fill" style="width:${scorePct}%;background:#E9A84C;"></div></div><span class="bar-val">${s.score}</span></div>
       </div>
-
       <div class="pills">
-        <span class="pill pill-vol">${s.vol_ratio}x vol</span>
-        <span class="pill pill-news">${s.news_count} articles</span>
-        <span class="pill ${sentClass}">${sentPos?'+':''}${typeof s.sentiment==='number'?s.sentiment.toFixed(2):s.sentiment} sentiment</span>
-        <span class="pill pill-rs">${rsSign}${s.rs_5d}% 5d</span>
-        <span class="pill pill-range">${s.avg_range||0}% range</span>
-        <span class="pill pill-method">${method}</span>
+        <span class="pill p-vol">${s.vol_ratio}x vol</span>
+        <span class="pill p-news">${s.news_count} articles</span>
+        <span class="pill ${sentPos?'p-sp':'p-sn'}">${sentPos?'+':''}${typeof s.sentiment==='number'?s.sentiment.toFixed(2):s.sentiment} sent</span>
+        <span class="pill p-rs">${rsSign}${s.rs_5d}% 5d</span>
+        <span class="pill p-rng">${s.avg_range||0}% range</span>
+        <span class="pill p-met">${method}</span>
       </div>
     </div>`;
   }).join('');
 }
 
 function handleData(data) {
+  const btn = document.getElementById('scanBtn');
+
   if (!data || !data.scanned_at) {
-    document.getElementById('today-section').innerHTML =
-      '<div class="empty">No scan yet.<br>Scanner runs at 9 AM, 11 AM, and 1 PM ET.<br>Only affordable stocks will show here.</div>';
-    document.getElementById('yesterday-section').innerHTML =
-      '<div class="empty">No scan yet.</div>';
+    document.getElementById('scanTime').textContent = 'No scan yet — tap "Run scan now"';
+    btn.textContent = 'Run scan now';
+    btn.disabled    = false;
     return;
   }
+
   renderMeta(data);
+  document.getElementById('scanTime').textContent = 'Last scan: ' + (data.scanned_at||'—');
   renderList(data.today,     'today-section');
   renderList(data.yesterday, 'yesterday-section');
+
+  // Re-enable button and show completion
+  if (data.manual) {
+    btn.textContent = 'Scan complete ✓';
+    btn.disabled    = false;
+    setTimeout(() => { btn.textContent = 'Run scan now'; }, 3000);
+  } else {
+    btn.textContent = 'Run scan now';
+    btn.disabled    = false;
+  }
 }
 
-fetch('/scan').then(r => r.json()).then(handleData).catch(e => console.log('Fetch error:', e));
+function triggerManualScan() {
+  const btn = document.getElementById('scanBtn');
+  btn.textContent = 'Scanning...';
+  btn.disabled    = true;
+  document.getElementById('scanTime').textContent = 'Scan running — takes ~30 seconds...';
 
+  // Show spinner in active tab
+  document.getElementById(activeTab+'-section').innerHTML =
+    '<div class="loading"><div class="spinner"></div>Scanning universe...</div>';
+
+  fetch('/scan/manual', { method: 'POST' })
+    .catch(e => {
+      console.error('Manual scan request error:', e);
+      btn.textContent = 'Run scan now';
+      btn.disabled    = false;
+    });
+
+  // Safety re-enable after 90s if socket never fires
+  setTimeout(() => {
+    if (btn.disabled) {
+      btn.textContent = 'Run scan now';
+      btn.disabled    = false;
+    }
+  }, 90000);
+}
+
+// Load existing data on page open
+fetch('/scan')
+  .then(r => r.json())
+  .then(handleData)
+  .catch(() => {
+    document.getElementById('scanTime').textContent = 'Could not load scan data';
+  });
+
+// Live updates
 const socket = io();
 socket.on('scan', handleData);
+socket.on('connect',    () => console.log('Scanner socket connected'));
+socket.on('disconnect', () => console.log('Scanner socket disconnected'));
 </script>
 </body>
 </html>
