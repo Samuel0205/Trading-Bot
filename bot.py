@@ -264,29 +264,81 @@ def get_signals(ticker, price):
 # ── Market regime ─────────────────────────────────────────────
 
 def update_market_regime():
+    """
+    Detects market regime using historical daily bars.
+    Uses end date 20 min in past to avoid SIP restriction.
+    Tries multiple tickers — whichever returns data first wins.
+    Falls back to calculating from active tickers if all fail.
+    """
     global market_regime
+    # Tickers to try for regime detection — ordered by IEX reliability
+    REGIME_TICKERS = ["SIRI","TELL","NIO","MARA","SOFI","AMC","BB","NOK"]
+
     try:
-        end   = datetime.now(pytz.utc)
-        start = end - timedelta(days=12)
-        bars  = api.get_bars("SPY","1Day",
-                    start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    limit=10, feed="iex").df
-        if bars is None or bars.empty or len(bars) < 5:
-            print("Regime: no SPY data — defaulting to ranging")
-            market_regime = "ranging"
-            return
-        if hasattr(bars.index,'levels'):
-            if "SPY" in bars.index.get_level_values(0):
-                bars = bars.loc["SPY"]
-        closes = list(bars["close"])
-        ma5    = calc_ma(closes, 5)
-        ma10   = calc_ma(closes, min(10, len(closes)))
+        # Use end = 20 min ago to avoid "recent SIP data" restriction
+        end   = datetime.now(pytz.utc) - timedelta(minutes=20)
+        start = end - timedelta(days=15)
+        start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_str   = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        closes = None
+
+        # Try each regime ticker until one returns data
+        for ticker in REGIME_TICKERS:
+            try:
+                bars = api.get_bars(
+                    ticker, "1Day",
+                    start=start_str,
+                    end=end_str,
+                    limit=12,
+                    feed="iex"
+                ).df
+
+                if bars is None or bars.empty:
+                    continue
+
+                # Handle MultiIndex
+                if hasattr(bars.index, 'levels'):
+                    if ticker in bars.index.get_level_values(0):
+                        bars = bars.loc[ticker]
+                    else:
+                        continue
+
+                if len(bars) >= 5:
+                    closes = list(bars["close"])
+                    print(f"Regime using {ticker} ({len(closes)} days)")
+                    break
+            except Exception as e:
+                print(f"  Regime ticker {ticker} failed: {e}")
+                continue
+
+        # If no ticker worked, derive regime from active ticker price histories
+        if closes is None:
+            print("  All regime tickers failed — deriving from active ticker history")
+            all_prices = []
+            for t in active_tickers:
+                hist = price_history.get(t, [])
+                if len(hist) >= 5:
+                    all_prices.extend(hist[-10:])
+            if len(all_prices) >= 5:
+                # Use average of last 5 vs average of 5 before that
+                closes = all_prices
+            else:
+                print("  Not enough price history — defaulting to ranging")
+                market_regime = "ranging"
+                return
+
+        # Calculate regime from closes
+        ma5  = calc_ma(closes, min(5,  len(closes)))
+        ma10 = calc_ma(closes, min(10, len(closes)))
         latest = closes[-1]
-        if   ma5 > ma10*1.005 and latest > ma5: market_regime = "trending_up"
-        elif ma5 < ma10*0.995 and latest < ma5: market_regime = "trending_down"
-        else:                                    market_regime = "ranging"
-        print(f"Regime: {market_regime} (SPY ${latest:.2f})")
+
+        if   ma5 > ma10 * 1.005 and latest > ma5: market_regime = "trending_up"
+        elif ma5 < ma10 * 0.995 and latest < ma5: market_regime = "trending_down"
+        else:                                      market_regime = "ranging"
+
+        print(f"Regime: {market_regime} (latest={latest:.2f}, ma5={ma5:.2f}, ma10={ma10:.2f})")
+
     except Exception as e:
         print(f"Regime error: {e}")
         market_regime = "ranging"
