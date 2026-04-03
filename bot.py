@@ -531,7 +531,8 @@ def prediction_loop():
                         }
                         for t,r in results.items()
                     })
-                    print(f"Predictions complete: {[(t, f'{r.get(\"score\",0):+.0f}') for t,r in results.items()]}")
+                    summary = [(t, f"{r.get('score',0):+.0f}") for t,r in results.items()]
+                    print(f"Predictions complete: {summary}")
                 except Exception as e:
                     print(f"Prediction loop error: {e}")
 
