@@ -109,9 +109,15 @@ def get_min_volume(account_size=None):
 # ── Window helpers ────────────────────────────────────────────
 
 def in_trading_window():
-    now = datetime.now(NY)
-    if now.weekday() >= 5: return False
-    return TRADING_START <= (now.hour, now.minute) < TRADING_END
+    now     = datetime.now(NY)
+    if now.weekday() >= 5:
+        return False
+    mins = now.hour * 60 + now.minute
+    start_mins = TRADING_START[0] * 60 + TRADING_START[1]  # 8*60+45 = 525
+    end_mins   = TRADING_END[0]   * 60 + TRADING_END[1]    # 14*60+0 = 840
+    result = start_mins <= mins < end_mins
+    print(f"Trading window check: {now.strftime('%H:%M')} ET | mins={mins} | window={start_mins}-{end_mins} | open={result}")
+    return result
 
 def is_market_open():
     try:
