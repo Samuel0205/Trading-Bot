@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Predictions</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f1117; color: #e8e8e8; padding: 12px; font-size: 14px; }
+.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.back { font-size: 12px; color: #4a9eff; text-decoration: none; background: #4a9eff11; padding: 5px 10px; border-radius: 8px; }
+.toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.update-time { font-size: 11px; color: #444; }
+.run-btn { font-size: 12px; font-weight: 500; padding: 7px 16px; border-radius: 8px; border: 1px solid #4a9eff44; background: #4a9eff11; color: #4a9eff; cursor: pointer; }
+.run-btn:disabled { opacity: .4; cursor: default; }
+.pred-card { background: #1a1d27; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+.card-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.ticker-name { font-size: 18px; font-weight: 700; }
+.score-dial { width: 52px; height: 52px; border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; flex-shrink: 0; border: 2px solid; }
+.score-val { font-size: 14px; font-weight: 700; line-height: 1; }
+.score-lbl { font-size: 8px; margin-top: 2px; }
+.label-badge { display: inline-block; padding: 3px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; margin-bottom: 4px; }
+.conf-row { font-size: 10px; color: #555; }
+.section-title { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: .06em; margin: 12px 0 6px; }
+.component-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.comp-card { background: #12151e; border-radius: 8px; padding: 10px 12px; }
+.comp-name { font-size: 10px; color: #555; margin-bottom: 4px; }
+.comp-val { font-size: 15px; font-weight: 600; }
+.comp-sub { font-size: 10px; color: #666; margin-top: 2px; }
+.bar-bg { height: 4px; background: #2a2d3a; border-radius: 2px; margin-top: 6px; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 2px; }
+.signals-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.signal-item { font-size: 11px; color: #888; padding: 4px 8px; background: #12151e; border-radius: 6px; }
+.signal-item::before { content: "→ "; color: #4a9eff; }
+.empty { color: #444; font-size: 13px; text-align: center; padding: 48px 16px; line-height: 1.8; }
+.loading { display: flex; align-items: center; gap: 10px; color: #555; font-size: 13px; padding: 40px 0; justify-content: center; }
+.spinner { width: 16px; height: 16px; border: 2px solid #2a2d3a; border-top-color: #4a9eff; border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.strong-buy   { color: #1D9E75; border-color: #1D9E75; }
+.bullish      { color: #4a9eff; border-color: #4a9eff; }
+.mildly_bullish { color: #7B9FFF; border-color: #7B9FFF; }
+.neutral      { color: #888;    border-color: #444; }
+.mildly_bearish { color: #E9A84C; border-color: #E9A84C; }
+.bearish      { color: #D85A30; border-color: #D85A30; }
+.strong_avoid { color: #E24B4A; border-color: #E24B4A; }
+.badge-strong-buy   { background: #1D9E7522; color: #1D9E75; }
+.badge-bullish      { background: #4a9eff22; color: #4a9eff; }
+.badge-mildly_bullish { background: #7B9FFF22; color: #7B9FFF; }
+.badge-neutral      { background: #44444422; color: #888; }
+.badge-mildly_bearish { background: #E9A84C22; color: #E9A84C; }
+.badge-bearish      { background: #D85A3022; color: #D85A30; }
+.badge-strong_avoid { background: #E24B4A22; color: #E24B4A; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Predictions</h1>
+  <a href="/" class="back">← Dashboard</a>
+</div>
+
+<div class="toolbar">
+  <span id="updateTime" class="update-time">Loading...</span>
+  <button id="runBtn" class="run-btn" onclick="runPredictions()">Run predictions</button>
+</div>
+
+<div id="content">
+  <div class="loading"><div class="spinner"></div>Loading predictions...</div>
+</div>
+
+<script>
+const LABEL_MAP = {
+  strong_buy:    "Strong buy",
+  bullish:       "Bullish",
+  mildly_bullish:"Mildly bullish",
+  neutral:       "Neutral",
+  mildly_bearish:"Mildly bearish",
+  bearish:       "Bearish",
+  strong_avoid:  "Avoid",
+};
+
+function scoreColor(score) {
+  if      (score >  50) return "#1D9E75";
+  else if (score >  25) return "#4a9eff";
+  else if (score >   0) return "#7B9FFF";
+  else if (score > -25) return "#E9A84C";
+  else if (score > -50) return "#D85A30";
+  else                  return "#E24B4A";
+}
+
+function renderComponent(name, comp) {
+  if (!comp) return '';
+  let val = '', sub = '', barPct = 50, barColor = '#888';
+
+  switch(name) {
+    case 'sentiment_trend':
+      val      = (comp.score >= 0 ? '+' : '') + (comp.score || 0).toFixed(1);
+      sub      = comp.direction || '—';
+      barPct   = Math.min(100, 50 + (comp.score || 0) * 2);
+      barColor = comp.score >= 0 ? '#1D9E75' : '#D85A30';
+      break;
+    case 'price_direction':
+      val      = (comp.score >= 0 ? '+' : '') + (comp.score || 0).toFixed(1);
+      sub      = comp.confidence || '—';
+      barPct   = Math.min(100, 50 + (comp.score || 0) * 1.5);
+      barColor = comp.score >= 0 ? '#4a9eff' : '#D85A30';
+      break;
+    case 'volatility':
+      val      = comp.state || '—';
+      sub      = comp.details ? `ATR ${comp.details.atr_pct || 0}%` : '';
+      barPct   = Math.min(100, (comp.details?.expansion || 1) * 50);
+      barColor = comp.state === 'expanding' ? '#E9A84C' : comp.state === 'contracting' ? '#7B68EE' : '#888';
+      break;
+    case 'pattern':
+      val      = (comp.name || 'none').replace(/_/g,' ');
+      sub      = comp.description || '';
+      barPct   = Math.min(100, 50 + (comp.score || 0) * 2);
+      barColor = comp.score >= 0 ? '#1D9E75' : '#D85A30';
+      break;
+    case 'earnings_risk':
+      val      = comp.level || '—';
+      sub      = comp.adjustment ? `adj ${comp.adjustment}` : '';
+      barPct   = comp.level === 'high' ? 90 : comp.level === 'medium' ? 50 : 10;
+      barColor = comp.level === 'high' ? '#E24B4A' : comp.level === 'medium' ? '#E9A84C' : '#1D9E75';
+      break;
+    case 'market_condition':
+      val      = (comp.condition || 'neutral').replace(/_/g,' ');
+      sub      = comp.vix_move != null ? `VIX proxy ${comp.vix_move > 0 ? '+' : ''}${comp.vix_move}%` : '';
+      barPct   = Math.min(100, 50 + (comp.score || 0) * 3);
+      barColor = comp.score >= 0 ? '#1D9E75' : '#D85A30';
+      break;
+  }
+
+  const displayName = {
+    sentiment_trend:   'Sentiment trend',
+    price_direction:   'Price direction',
+    volatility:        'Volatility',
+    pattern:           'Pattern',
+    earnings_risk:     'Earnings risk',
+    market_condition:  'Market condition',
+  }[name] || name;
+
+  return `
+  <div class="comp-card">
+    <div class="comp-name">${displayName}</div>
+    <div class="comp-val">${val}</div>
+    <div class="comp-sub">${sub}</div>
+    <div class="bar-bg"><div class="bar-fill" style="width:${Math.max(2,barPct)}%;background:${barColor};"></div></div>
+  </div>`;
+}
+
+function renderPredictions(data) {
+  const tickers = Object.keys(data);
+  if (!tickers.length) {
+    document.getElementById('content').innerHTML =
+      '<div class="empty">No predictions yet.<br>Tap "Run predictions" to analyze current watchlist.<br>Predictions run automatically at 9 AM, 10 AM, and 12 PM ET.</div>';
+    return;
+  }
+
+  // Sort by score descending
+  tickers.sort((a,b) => (data[b].score||0) - (data[a].score||0));
+
+  document.getElementById('content').innerHTML = tickers.map(ticker => {
+    const d     = data[ticker];
+    const score = d.score || 0;
+    const label = d.label || 'neutral';
+    const conf  = d.confidence || 'low';
+    const comps = d.components || {};
+    const sigs  = d.signals   || [];
+    const color = scoreColor(score);
+    const lbl   = LABEL_MAP[label] || label;
+
+    const compOrder = ['sentiment_trend','price_direction','volatility','pattern','earnings_risk','market_condition'];
+
+    return `
+    <div class="pred-card">
+      <div class="card-header">
+        <div class="score-dial ${label}" style="border-color:${color};">
+          <div class="score-val" style="color:${color};">${score > 0 ? '+' : ''}${score}</div>
+          <div class="score-lbl" style="color:${color};">score</div>
+        </div>
+        <div style="flex:1;">
+          <div class="ticker-name">${ticker}</div>
+          <span class="label-badge badge-${label}">${lbl}</span>
+          <div class="conf-row">Confidence: ${conf}</div>
+        </div>
+      </div>
+
+      <div class="section-title">Components</div>
+      <div class="component-grid">
+        ${compOrder.map(k => renderComponent(k, comps[k])).join('')}
+      </div>
+
+      ${sigs.length ? `
+      <div class="section-title">Price signals</div>
+      <div class="signals-list">
+        ${sigs.map(s => `<div class="signal-item">${s}</div>`).join('')}
+      </div>` : ''}
+    </div>`;
+  }).join('');
+
+  document.getElementById('updateTime').textContent =
+    'Updated ' + new Date().toLocaleTimeString();
+}
+
+function runPredictions() {
+  const btn = document.getElementById('runBtn');
+  btn.textContent = 'Running...';
+  btn.disabled    = true;
+  document.getElementById('content').innerHTML =
+    '<div class="loading"><div class="spinner"></div>Analyzing stocks — takes ~30 seconds...</div>';
+  document.getElementById('updateTime').textContent = 'Running prediction engine...';
+
+  fetch('/predictions/manual', { method: 'POST' })
+    .catch(e => {
+      console.error(e);
+      btn.textContent = 'Run predictions';
+      btn.disabled    = false;
+    });
+
+  setTimeout(() => {
+    if (btn.disabled) {
+      btn.textContent = 'Run predictions';
+      btn.disabled    = false;
+    }
+  }, 90000);
+}
+
+// Load on page open
+fetch('/predictions/data')
+  .then(r => r.json())
+  .then(data => {
+    if (data && Object.keys(data).length) {
+      renderPredictions(data);
+    } else {
+      document.getElementById('content').innerHTML =
+        '<div class="empty">No predictions yet.<br>Tap "Run predictions" to start.<br>Auto-runs at 9 AM, 10 AM, and 12 PM ET on trading days.</div>';
+      document.getElementById('updateTime').textContent = 'No data yet';
+    }
+  })
+  .catch(() => {
+    document.getElementById('content').innerHTML =
+      '<div class="empty">Could not load predictions.</div>';
+  });
+
+// Live updates via socket
+const socket = io();
+socket.on('predictions', data => {
+  const btn = document.getElementById('runBtn');
+  btn.textContent = 'Run predictions';
+  btn.disabled    = false;
+  renderPredictions(data);
+});
+</script>
+</body>
+</html>
