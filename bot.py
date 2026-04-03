@@ -37,7 +37,7 @@ TRADING_START    = (8, 45)
 TRADING_END      = (14, 0)
 SCAN_HOURS       = [9, 11, 13]
 PRED_HOURS       = [9, 10, 12]  # prediction refresh times
-FALLBACK_TICKERS = ["SIRI","TELL","CLOV","NKLA","MVIS"]
+FALLBACK_TICKERS = ["SIRI","TELL","AMC","BB","NOK","MVIS","CLOV","NIO","MARA","SOFI"]
 
 # ── State ─────────────────────────────────────────────────────
 price_history    = {}
@@ -115,8 +115,11 @@ def in_trading_window():
 
 def is_market_open():
     try:
-        return api.get_clock().is_open
-    except:
+        clock = api.get_clock()
+        print(f"Market clock: is_open={clock.is_open}")
+        return clock.is_open
+    except Exception as e:
+        print(f"is_market_open error: {e}")
         return False
 
 # ── Cooldown helpers ──────────────────────────────────────────
@@ -478,7 +481,14 @@ def validate_fallback_tickers():
                 print(f"  Fallback {ticker} out of range @ ${price:.2f}")
         except Exception as e:
             print(f"  Fallback check error {ticker}: {e}")
-    active_tickers = valid if valid else list(FALLBACK_TICKERS)
+
+    if valid:
+        active_tickers = valid
+    else:
+        # All fallbacks out of range — use known affordable stocks directly
+        print("  All fallbacks out of range — using affordable seed tickers")
+        active_tickers = ["SIRI","TELL","AMC","BB","NOK"]
+
     print(f"Validated fallback tickers: {active_tickers}")
 
 # ── Prediction loop ───────────────────────────────────────────
