@@ -844,15 +844,19 @@ def ping():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    print(f"Starting on port {port}...")
+    print(f"=== BOT STARTING v4 | port {port} ===")
+    print(f"=== FALLBACK_TICKERS: {FALLBACK_TICKERS} ===")
+    print(f"=== MAX_ACCOUNT: ${MAX_ACCOUNT} ===")
+    print(f"=== TRADING_WINDOW: {TRADING_START_H}:{TRADING_START_M:02d}–{TRADING_END_H}:{TRADING_END_M:02d} ET ===")
 
     def startup():
-        time.sleep(3)  # let server bind first
-        print("Startup: regime detection...")
+        time.sleep(3)
+        print("=== STARTUP: regime detection ===")
         update_market_regime()
-        print("Startup: validating fallback tickers...")
+        print(f"=== STARTUP: regime={market_regime} ===")
+        print("=== STARTUP: validating fallback tickers ===")
         validate_fallback_tickers()
-        print(f"Startup complete. Active tickers: {active_tickers} | Regime: {market_regime}")
+        print(f"=== STARTUP COMPLETE | active_tickers={active_tickers} | regime={market_regime} ===")
 
     threading.Thread(target=startup,         daemon=True).start()
     threading.Thread(target=bot_loop,        daemon=True).start()
