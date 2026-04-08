@@ -38,22 +38,27 @@ SCAN_HOURS       = [9, 11, 13]
 PRED_HOURS       = [9, 10, 12]
 
 # Signal weights — VWAP and RSI are most reliable intraday
-# MA Crossover needs more history so lower weight early in day
 SIGNAL_WEIGHTS = {
     "MA Crossover":   0.8,
     "RSI":            1.2,
     "Bollinger":      1.0,
-    "VWAP":           1.5,   # most reliable intraday signal
+    "VWAP":           1.5,
     "MACD":           1.0,
     "Mean Reversion": 0.8,
 }
 
 # Prediction thresholds
-PRED_STRONG_BUY  =  40   # boost size to 65%
-PRED_NORMAL_BUY  =   0   # normal size 50%
-PRED_REDUCE      = -15   # reduce size to 30%
-PRED_SKIP        = -35   # skip trade entirely
-PRED_NEED_CONF   = -10   # need 3 weighted votes instead of 2
+PRED_STRONG_BUY  =  40
+PRED_NORMAL_BUY  =   0
+PRED_REDUCE      = -15
+PRED_SKIP        = -35
+PRED_NEED_CONF   = -10
+
+# Vote thresholds — lowered slightly so bot is more active
+# VWAP + RSI alone = 2.7 which triggers a buy
+# Previously needed 3+ which almost never happened
+BASE_BUY_THRESHOLD  = 1.8
+BASE_SELL_THRESHOLD = 1.8
 
 # Trade performance tracking (in-memory, for self-adjustment)
 trade_stats = {
@@ -459,22 +464,20 @@ def make_decision(ticker, signals, price):
     tf_bias = pred.get("tf_bias", 0)
 
     # Dynamic threshold based on prediction quality
-    # Strong prediction = lower threshold needed
-    # Weak/no prediction = higher threshold needed
     if pscore >= 40:
-        buy_threshold  = 1.5   # very confident — lower bar
-        sell_threshold = 1.5
+        buy_threshold  = 1.2   # very confident — VWAP alone triggers
+        sell_threshold = 1.2
     elif pscore >= 20:
-        buy_threshold  = 2.0
-        sell_threshold = 2.0
+        buy_threshold  = 1.5
+        sell_threshold = 1.5
     elif pscore <= PRED_SKIP:
         return "hold", f"pred_skip({pscore})", buy_w, sell_w
     elif pscore < PRED_NEED_CONF:
-        buy_threshold  = 3.0   # need more signal confirmation
-        sell_threshold = 2.5
-    else:
-        buy_threshold  = 2.0   # default
+        buy_threshold  = 2.5
         sell_threshold = 2.0
+    else:
+        buy_threshold  = BASE_BUY_THRESHOLD
+        sell_threshold = BASE_SELL_THRESHOLD
 
     # Multi-timeframe gate:
     # If daily trend is down, require much stronger signal to buy
@@ -777,9 +780,12 @@ def bot_loop():
                         "pred_conf":pred.get("confidence","—"),
                         "tf_bias":pred.get("tf_bias",0),
                     }
+                    # Count actual buy/sell signals for the log
+                    n_buys  = sum(1 for s in sigs if s["action"]=="buy")
+                    n_sells = sum(1 for s in sigs if s["action"]=="sell")
                     print(f"  {ticker}: ${price:.2f} | {action} | "
-                          f"b={buy_w:.1f} s={sell_w:.1f} | {market_regime} | "
-                          f"pred={pred.get('score',0):+.0f} tf={pred.get('tf_bias',0):+d}"
+                          f"votes={n_buys}b/{n_sells}s weights={buy_w:.1f}b/{sell_w:.1f}s | "
+                          f"{market_regime} | pred={pred.get('score',0):+.0f} tf={pred.get('tf_bias',0):+d}"
                           +(f" | cd:{cd}s" if cd else ""))
                 except Exception as e:
                     print(f"  {ticker} error: {e}")
