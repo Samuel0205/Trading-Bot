@@ -21,24 +21,37 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # ── Config ────────────────────────────────────────────────────
 MAX_ACCOUNT      = 20.00
 MAX_TRADE_PCT    = 0.50
-STOP_LOSS_PCT    = 0.05       # fallback only
-TAKE_PROFIT_PCT  = 0.10       # fallback only
+STOP_LOSS_PCT    = 0.05
+TAKE_PROFIT_PCT  = 0.10
 INTERVAL         = 15
 MIN_PRICE        = 0.50
 MIN_VOLUME       = 100_000
 MIN_GRADE        = ["A","B","C","D"]
-COOLDOWN_STOP    = 600
-COOLDOWN_PROFIT  = 180
-COOLDOWN_SIGNAL  = 300
+COOLDOWN_STOP    = 900              # 15 min after stop loss
+COOLDOWN_PROFIT  = 600              # 10 min after take profit (was 3 min — too short)
+COOLDOWN_SIGNAL  = 300              # 5 min after signal exit
+MIN_PROFIT_PCT   = 0.03             # minimum 3% expected profit before entering
+MAX_DAILY_TRADES = 20               # hard limit — prevent churning
 TRADING_START_H  = 8
 TRADING_START_M  = 45
 TRADING_END_H    = 14
 TRADING_END_M    = 0
 SCAN_HOURS       = [9, 11, 13]
 PRED_HOURS       = [9, 10, 12]
+REL_VOL_HOURS    = [9, 10, 11, 12, 13]   # relative volume refresh
 
-# Signal weights — VWAP and RSI are most reliable intraday
-SIGNAL_WEIGHTS = {
+# Gap scanner config
+GAP_MIN_PCT      = 2.0    # minimum gap % to qualify
+GAP_MAX_PCT      = 15.0   # above this = too risky (earnings gap)
+GAP_MIN_RVOL     = 1.5    # gap must have elevated relative volume
+
+# Relative volume threshold — stock must be trading above this
+# to be considered "in play" for trading
+RVOL_THRESHOLD   = 1.3
+
+# Signal weights — tuned by win rate feedback
+# Base weights, adjusted dynamically by performance
+BASE_SIGNAL_WEIGHTS = {
     "MA Crossover":   0.8,
     "RSI":            1.2,
     "Bollinger":      1.0,
@@ -47,27 +60,14 @@ SIGNAL_WEIGHTS = {
     "Mean Reversion": 0.8,
 }
 
-# Prediction thresholds
 PRED_STRONG_BUY  =  40
 PRED_NORMAL_BUY  =   0
 PRED_REDUCE      = -15
 PRED_SKIP        = -35
 PRED_NEED_CONF   = -10
+BASE_BUY_THRESHOLD  = 2.2   # raised from 1.8 — needs stronger agreement
+BASE_SELL_THRESHOLD = 2.2
 
-# Vote thresholds — lowered slightly so bot is more active
-# VWAP + RSI alone = 2.7 which triggers a buy
-# Previously needed 3+ which almost never happened
-BASE_BUY_THRESHOLD  = 1.8
-BASE_SELL_THRESHOLD = 1.8
-
-# Trade performance tracking (in-memory, for self-adjustment)
-trade_stats = {
-    "wins": 0, "losses": 0, "total": 0,
-    "signal_wins": {k: 0 for k in SIGNAL_WEIGHTS},
-    "signal_total": {k: 0 for k in SIGNAL_WEIGHTS},
-}
-
-# Affordable fallback tickers
 FALLBACK_TICKERS = ["SIRI","TELL","AMC","BB","NOK","MVIS","NIO","MARA","SOFI","CLOV"]
 
 # ── State ─────────────────────────────────────────────────────
@@ -81,8 +81,69 @@ open_positions   = {}
 market_regime    = "ranging"
 cooldowns        = {}
 ticker_grades    = {}
+gap_candidates   = {}   # { ticker: gap_data } — pre-market gap picks
+rvol_cache       = {}   # { ticker: rvol } — real-time relative volume
 
-NY = pytz.timezone("America/New_York")
+# ── Win rate tracking — per signal ────────────────────────────
+# Tracks which signals were active on winning vs losing trades
+# Used to dynamically adjust SIGNAL_WEIGHTS
+signal_performance = {
+    name: {"wins": 0, "losses": 0} for name in BASE_SIGNAL_WEIGHTS
+}
+trade_stats = {
+    "wins": 0, "losses": 0, "total": 0,
+    "total_pnl": 0.0,
+    "best_trade": 0.0,
+    "worst_trade": 0.0,
+}
+
+# Dynamic weights — start at base, evolve with performance
+signal_weights = dict(BASE_SIGNAL_WEIGHTS)
+
+daily_trade_count = 0
+daily_trade_date  = None
+
+# ── Win rate feedback — weight adjustment ─────────────────────
+
+def update_signal_weights():
+    """
+    After enough trades, adjust signal weights based on win rate.
+    Signals with >60% win rate get boosted. <40% get reduced.
+    Only adjusts after 10+ trades to avoid noise.
+    """
+    global signal_weights
+    total = trade_stats["total"]
+    if total < 10:
+        return  # not enough data yet
+
+    new_weights = {}
+    for name, perf in signal_performance.items():
+        sig_total = perf["wins"] + perf["losses"]
+        if sig_total < 5:
+            new_weights[name] = BASE_SIGNAL_WEIGHTS[name]
+            continue
+        win_rate = perf["wins"] / sig_total
+        base     = BASE_SIGNAL_WEIGHTS[name]
+        if   win_rate > 0.65: adj = min(base * 1.3, base + 0.5)   # boost up to 30%
+        elif win_rate > 0.55: adj = min(base * 1.1, base + 0.2)   # small boost
+        elif win_rate < 0.35: adj = max(base * 0.7, base - 0.4)   # reduce up to 30%
+        elif win_rate < 0.45: adj = max(base * 0.9, base - 0.2)   # small reduce
+        else:                 adj = base                            # neutral
+        new_weights[name] = round(adj, 2)
+
+    if new_weights != signal_weights:
+        print(f"Signal weights updated: {new_weights}")
+        signal_weights = new_weights
+
+def record_trade_signals(ticker, was_win, active_signals):
+    """Record which signals were active on this trade for feedback."""
+    for sig_name in active_signals:
+        if sig_name in signal_performance:
+            if was_win:
+                signal_performance[sig_name]["wins"] += 1
+            else:
+                signal_performance[sig_name]["losses"] += 1
+    update_signal_weights()
 
 # ── Account helpers ───────────────────────────────────────────
 
@@ -140,12 +201,10 @@ def get_min_volume(account_size=None):
 # ── Window + market helpers ───────────────────────────────────
 
 def in_trading_window():
-    now        = datetime.now(NY)
+    now = datetime.now(NY)
     if now.weekday() >= 5: return False
-    now_mins   = now.hour * 60 + now.minute
-    start_mins = TRADING_START_H * 60 + TRADING_START_M
-    end_mins   = TRADING_END_H   * 60 + TRADING_END_M
-    return start_mins <= now_mins < end_mins
+    mins = now.hour * 60 + now.minute
+    return (TRADING_START_H*60+TRADING_START_M) <= mins < (TRADING_END_H*60+TRADING_END_M)
 
 def is_market_open():
     try:
@@ -153,6 +212,13 @@ def is_market_open():
     except Exception as e:
         print(f"is_market_open error: {e}")
         return False
+
+def is_pre_market():
+    """Returns True between 8:00–9:30 AM ET on weekdays."""
+    now  = datetime.now(NY)
+    if now.weekday() >= 5: return False
+    mins = now.hour * 60 + now.minute
+    return (8*60) <= mins < (9*60+30)
 
 # ── Cooldown helpers ──────────────────────────────────────────
 
@@ -170,6 +236,131 @@ def cooldown_remaining(ticker):
     if not cd: return 0
     return max(0, int(cd["until"] - time.time()))
 
+# ── Pre-market gap scanner ────────────────────────────────────
+
+def run_gap_scan():
+    """
+    Runs at 8:45 AM before market open.
+    Finds stocks gapping 2-15% with elevated relative volume.
+    These are the highest-probability intraday momentum setups.
+    """
+    global gap_candidates, active_tickers
+    print("=== Pre-market gap scan starting ===")
+    acct_size = get_account_size()
+    floor     = get_price_floor(acct_size)
+    ceiling   = get_price_ceiling(acct_size)
+    candidates = {}
+
+    # Check our known universe for gaps
+    from scanner import SEED_UNIVERSE
+    check_list = list(set(SEED_UNIVERSE + list(active_tickers)))
+
+    for ticker in check_list:
+        try:
+            # Get yesterday's close
+            end   = datetime.now(pytz.utc) - timedelta(minutes=20)
+            start = end - timedelta(days=5)
+            bars  = api.get_bars(ticker, "1Day",
+                        start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        limit=5, feed="iex").df
+
+            if bars is None or bars.empty or len(bars) < 2:
+                continue
+            if hasattr(bars.index, 'levels'):
+                if ticker in bars.index.get_level_values(0):
+                    bars = bars.loc[ticker]
+                else:
+                    continue
+
+            prev_close = float(bars.iloc[-1]["close"])
+            avg_vol    = float(bars["volume"].mean())
+
+            # Get pre-market / latest bar
+            latest = api.get_latest_bar(ticker, feed="iex")
+            cur_price = float(latest.c)
+            cur_vol   = float(latest.v)
+
+            if not (floor <= cur_price <= ceiling):
+                continue
+
+            gap_pct  = (cur_price - prev_close) / prev_close * 100
+            rvol     = cur_vol / (avg_vol / 390) if avg_vol > 0 else 1  # vs avg min volume
+
+            # Must gap within our range AND have volume
+            if GAP_MIN_PCT <= abs(gap_pct) <= GAP_MAX_PCT and rvol >= GAP_MIN_RVOL:
+                candidates[ticker] = {
+                    "ticker":     ticker,
+                    "price":      round(cur_price, 2),
+                    "prev_close": round(prev_close, 2),
+                    "gap_pct":    round(gap_pct, 2),
+                    "rvol":       round(rvol, 2),
+                    "direction":  "up" if gap_pct > 0 else "down",
+                }
+                print(f"  GAP: {ticker} ${prev_close}→${cur_price} "
+                      f"({gap_pct:+.1f}%) rvol={rvol:.1f}x")
+            time.sleep(0.2)
+        except Exception as e:
+            continue
+
+    gap_candidates = candidates
+    print(f"=== Gap scan complete: {len(candidates)} candidates ===")
+
+    # Merge gap candidates into active tickers
+    if candidates:
+        # Prioritize gap stocks — add to front of active list
+        gap_tickers    = [t for t in candidates if candidates[t]["direction"] == "up"][:3]
+        current        = [t for t in active_tickers if t not in gap_tickers]
+        active_tickers = (gap_tickers + current)[:5]
+        for t in gap_tickers:
+            price_history.setdefault(t,  [])
+            volume_history.setdefault(t, [])
+        print(f"Active tickers with gaps: {active_tickers}")
+
+    socketio.emit("gaps", {
+        "candidates": list(candidates.values()),
+        "scanned_at": datetime.now(NY).strftime("%I:%M %p ET"),
+    })
+
+# ── Real-time relative volume ─────────────────────────────────
+
+def update_rvol():
+    """
+    Every 15 minutes during market hours, check if active tickers
+    are trading above their average volume pace.
+    A stock trading 2x normal volume is "in play" — better signals.
+    """
+    global rvol_cache
+    print("Updating relative volume...")
+    for ticker in list(active_tickers):
+        try:
+            end   = datetime.now(pytz.utc) - timedelta(minutes=20)
+            start = end - timedelta(days=10)
+            bars  = api.get_bars(ticker, "1Day",
+                        start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        limit=10, feed="iex").df
+            if bars is None or bars.empty: continue
+            if hasattr(bars.index, 'levels'):
+                if ticker in bars.index.get_level_values(0):
+                    bars = bars.loc[ticker]
+                else: continue
+
+            avg_vol   = float(bars["volume"].mean())
+            latest    = api.get_latest_bar(ticker, feed="iex")
+            today_vol = float(latest.v)
+
+            # Adjust for time of day — normalize to full day equivalent
+            now       = datetime.now(NY)
+            mins_open = max(1, (now.hour - 9) * 60 + now.minute - 30)
+            projected = today_vol * (390 / mins_open) if mins_open < 390 else today_vol
+            rvol      = projected / avg_vol if avg_vol > 0 else 1.0
+            rvol_cache[ticker] = round(rvol, 2)
+            print(f"  RVOL {ticker}: {rvol:.2f}x (proj={int(projected):,} avg={int(avg_vol):,})")
+            time.sleep(0.2)
+        except Exception as e:
+            print(f"  RVOL error {ticker}: {e}")
+
 # ── Filters ───────────────────────────────────────────────────
 
 def passes_filters(ticker, price, account_size=None):
@@ -184,65 +375,53 @@ def passes_filters(ticker, price, account_size=None):
     if grade and grade not in MIN_GRADE:
         print(f"  {ticker} filtered — grade {grade}")
         return False
+    # Relative volume check — skip stocks with no activity
+    rvol = rvol_cache.get(ticker)
+    if rvol is not None and rvol < RVOL_THRESHOLD:
+        print(f"  {ticker} filtered — low rvol {rvol:.2f}x")
+        return False
     try:
         end   = datetime.now(pytz.utc) - timedelta(minutes=20)
         start = end - timedelta(days=5)
-        bars  = api.get_bars(ticker,"1Day",
+        bars  = api.get_bars(ticker, "1Day",
                     start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     limit=5, feed="iex").df
         if bars is None or bars.empty: return False
-        if hasattr(bars.index,'levels'):
+        if hasattr(bars.index, 'levels'):
             if ticker in bars.index.get_level_values(0): bars=bars.loc[ticker]
             else: return False
         if float(bars["volume"].mean()) < min_vol:
-            print(f"  {ticker} low volume")
+            print(f"  {ticker} low avg volume")
             return False
         return True
     except Exception as e:
         print(f"  Filter error {ticker}: {e}")
         return False
 
-# ── Weighted signal voting ────────────────────────────────────
+# ── Position sizing ───────────────────────────────────────────
 
-def weighted_vote(signals):
+def position_size(price, account_size=None, pred_score=0, rvol=1.0):
     """
-    Instead of simple vote count, sum weights of agreeing signals.
-    VWAP = 1.5x, RSI = 1.2x, others = 0.8-1.0x.
-    Returns: buy_weight, sell_weight, hold_weight
-    """
-    buy_w = sell_w = hold_w = 0.0
-    for sig in signals:
-        name   = sig.get("name", "")
-        action = sig.get("action", "hold")
-        weight = SIGNAL_WEIGHTS.get(name, 1.0)
-        if   action == "buy":  buy_w  += weight
-        elif action == "sell": sell_w += weight
-        else:                  hold_w += weight
-    return round(buy_w, 2), round(sell_w, 2), round(hold_w, 2)
-
-# ── Position sizing — prediction + spread aware ───────────────
-
-def position_size(price, account_size=None, pred_score=0):
-    """
-    Sizes position based on prediction confidence.
-    Also accounts for spread cost on cheap stocks.
+    Sizes based on prediction AND relative volume.
+    High rvol = stock is in play = larger position allowed.
     """
     try:
         if account_size is None: account_size = get_account_size()
         usable = min(get_available_cash(), MAX_ACCOUNT)
 
-        # Prediction-based trade percentage
         if   pred_score >= PRED_STRONG_BUY: trade_pct = 0.65
         elif pred_score >= PRED_NORMAL_BUY: trade_pct = MAX_TRADE_PCT
         elif pred_score >= PRED_REDUCE:     trade_pct = 0.40
         else:                               trade_pct = 0.30
 
-        # Spread penalty for very cheap stocks (spread eats more % of price)
-        if price < 1.00:
-            trade_pct *= 0.80   # reduce by 20% for sub-$1 stocks
-        elif price < 2.00:
-            trade_pct *= 0.90
+        # Boost size if stock is running hot (high rvol)
+        if rvol >= 3.0:   trade_pct = min(trade_pct * 1.2, 0.70)
+        elif rvol >= 2.0: trade_pct = min(trade_pct * 1.1, 0.65)
+
+        # Spread penalty for very cheap stocks
+        if   price < 1.00: trade_pct *= 0.80
+        elif price < 2.00: trade_pct *= 0.90
 
         max_per_trade = usable * trade_pct
         if max_per_trade < price:
@@ -259,14 +438,14 @@ def calc_rsi(prices, period=14):
     if len(prices) < period+1: return 50
     gains=losses=0
     for i in range(-period, 0):
-        d = prices[i]-prices[i-1]
+        d=prices[i]-prices[i-1]
         if d>0: gains+=d
         else:   losses+=abs(d)
     if losses==0: return 100
     return 100-(100/(1+gains/losses))
 
 def calc_ma(prices, n):
-    s = prices[-n:] if len(prices)>=n else prices
+    s=prices[-n:] if len(prices)>=n else prices
     return sum(s)/len(s)
 
 def calc_bollinger(prices, n=20):
@@ -292,66 +471,69 @@ def calc_macd(prices):
 def get_signals(ticker, price):
     hist=price_history.get(ticker,[])
     vols=volume_history.get(ticker,[])
-    hist_len = len(hist)
-
+    hist_len=len(hist)
     if hist_len < 5:
-        return [{"name":n,"action":"hold","signal":50}
-                for n in SIGNAL_WEIGHTS]
+        return [{"name":n,"action":"hold","signal":50} for n in signal_weights]
 
-    rsi            = calc_rsi(hist)
-    ma50           = calc_ma(hist, min(50, hist_len))
-    ma200          = calc_ma(hist, min(200, hist_len))
+    rsi              = calc_rsi(hist)
+    ma50             = calc_ma(hist, min(50, hist_len))
+    ma200            = calc_ma(hist, min(200, hist_len))
     mean,upper,lower = calc_bollinger(hist)
-    vwap           = calc_vwap(hist[-78:], vols[-78:])
-    macd_line      = calc_macd(hist)
-    z_score        = (price-mean)/max((upper-mean),0.01)
-    ok_buy         = market_regime in ("trending_up","ranging")
-    ok_sell        = market_regime in ("trending_down","ranging")
-
-    # MA Crossover needs enough history to be meaningful
-    # Reduce confidence if we have fewer than 20 bars
-    ma_confidence = min(1.0, hist_len / 20)
+    vwap             = calc_vwap(hist[-78:], vols[-78:])
+    macd_line        = calc_macd(hist)
+    z_score          = (price-mean)/max((upper-mean),0.01)
+    ok_buy           = market_regime in ("trending_up","ranging")
+    ok_sell          = market_regime in ("trending_down","ranging")
+    ma_conf          = min(1.0, hist_len/20)
 
     def act(bc, sc):
         if bc and ok_buy:  return "buy"
         if sc and ok_sell: return "sell"
         return "hold"
 
-    signals = [
+    return [
         {"name":"MA Crossover",
-         "action": act(ma50>ma200*1.005, ma200>ma50*1.005) if ma_confidence > 0.5 else "hold",
-         "signal": min(95,50+(ma50-ma200)/max(ma200,1)*600),
-         "confidence": round(ma_confidence, 2)},
+         "action":act(ma50>ma200*1.005, ma200>ma50*1.005) if ma_conf>0.5 else "hold",
+         "signal":min(95,50+(ma50-ma200)/max(ma200,1)*600)},
         {"name":"RSI",
-         "action": act(rsi<35, rsi>65),
-         "signal": 100-rsi},
+         "action":act(rsi<35, rsi>65),
+         "signal":100-rsi},
         {"name":"Bollinger",
-         "action": act(price<lower*0.99, price>upper*1.01),
-         "signal": max(5,min(95,50-z_score*40))},
+         "action":act(price<lower*0.99, price>upper*1.01),
+         "signal":max(5,min(95,50-z_score*40))},
         {"name":"VWAP",
-         "action": act(price>vwap*1.001, price<vwap*0.999),
-         "signal": min(95,max(5,50+(price-vwap)/max(vwap,1)*500))},
+         "action":act(price>vwap*1.001, price<vwap*0.999),
+         "signal":min(95,max(5,50+(price-vwap)/max(vwap,1)*500))},
         {"name":"MACD",
-         "action": act(macd_line>0, macd_line<0),
-         "signal": min(95,max(5,50+macd_line*10))},
+         "action":act(macd_line>0, macd_line<0),
+         "signal":min(95,max(5,50+macd_line*10))},
         {"name":"Mean Reversion",
-         "action": act(price<mean*0.96, price>mean*1.04),
-         "signal": min(92,max(8,50+(mean-price)/max(mean,1)*250))},
+         "action":act(price<mean*0.96, price>mean*1.04),
+         "signal":min(92,max(8,50+(mean-price)/max(mean,1)*250))},
     ]
-    return signals
+
+# ── Weighted voting ───────────────────────────────────────────
+
+def weighted_vote(signals):
+    buy_w=sell_w=hold_w=0.0
+    for sig in signals:
+        w=signal_weights.get(sig.get("name",""),1.0)
+        if   sig.get("action")=="buy":  buy_w  += w
+        elif sig.get("action")=="sell": sell_w += w
+        else:                           hold_w += w
+    return round(buy_w,2), round(sell_w,2), round(hold_w,2)
 
 # ── Market regime ─────────────────────────────────────────────
 
 def update_market_regime():
     global market_regime
-    REGIME_TICKERS = ["SIRI","TELL","NIO","MARA","SOFI","AMC","BB","NOK"]
+    REGIME_TICKERS=["SIRI","TELL","NIO","MARA","SOFI","AMC","BB","NOK"]
     try:
         end=datetime.now(pytz.utc)-timedelta(minutes=20)
         start=end-timedelta(days=15)
         ss=start.strftime("%Y-%m-%dT%H:%M:%SZ")
         es=end.strftime("%Y-%m-%dT%H:%M:%SZ")
         closes=None
-
         for ticker in REGIME_TICKERS:
             try:
                 bars=api.get_bars(ticker,"1Day",start=ss,end=es,limit=12,feed="iex").df
@@ -361,30 +543,24 @@ def update_market_regime():
                     else: continue
                 if len(bars)>=5:
                     closes=list(bars["close"])
-                    print(f"Regime using {ticker} ({len(closes)} days)")
+                    print(f"Regime using {ticker}")
                     break
-            except Exception as e:
-                print(f"  Regime {ticker}: {e}")
-                continue
-
+            except: continue
         if closes is None:
-            all_prices=[]
+            all_p=[]
             for t in active_tickers:
                 h=price_history.get(t,[])
-                if len(h)>=5: all_prices.extend(h[-10:])
-            closes=all_prices if len(all_prices)>=5 else None
-
+                if len(h)>=5: all_p.extend(h[-10:])
+            closes=all_p if len(all_p)>=5 else None
         if closes is None:
-            print("Regime: no data — keeping:", market_regime)
-            return
-
+            print("Regime: no data — keeping:", market_regime); return
         ma5=calc_ma(closes,min(5,len(closes)))
         ma10=calc_ma(closes,min(10,len(closes)))
         latest=closes[-1]
         if   ma5>ma10*1.005 and latest>ma5: market_regime="trending_up"
         elif ma5<ma10*0.995 and latest<ma5: market_regime="trending_down"
         else:                               market_regime="ranging"
-        print(f"Regime: {market_regime} (latest={latest:.2f})")
+        print(f"Regime: {market_regime}")
     except Exception as e:
         print(f"Regime error: {e}")
 
@@ -392,8 +568,7 @@ def update_market_regime_with_retry(attempts=5, delay=8):
     global market_regime
     for i in range(attempts):
         update_market_regime()
-        if market_regime != "unknown": return
-        print(f"  Regime retry {i+1}/{attempts}...")
+        if market_regime!="unknown": return
         time.sleep(delay)
 
 # ── Stops ─────────────────────────────────────────────────────
@@ -401,11 +576,17 @@ def update_market_regime_with_retry(attempts=5, delay=8):
 def check_stops(ticker, price):
     pos=open_positions.get(ticker)
     if not pos: return
-    if price<=pos["stop"]:
-        print(f"STOP-LOSS: {ticker} @ ${price:.2f} (stop=${pos['stop']})")
+    # Trailing stop — move stop up as price rises
+    if price > pos["entry"] * 1.05:   # once up 5%, trail stop to breakeven+1%
+        new_stop = max(pos["stop"], pos["entry"] * 1.01)
+        if new_stop > pos["stop"]:
+            open_positions[ticker]["stop"] = round(new_stop, 3)
+            print(f"  Trailing stop moved: {ticker} stop → ${new_stop:.3f}")
+    if price <= pos["stop"]:
+        print(f"STOP-LOSS: {ticker} @ ${price:.2f}")
         force_sell(ticker, price, reason="stop_loss")
-    elif price>=pos["target"]:
-        print(f"TAKE-PROFIT: {ticker} @ ${price:.2f} (target=${pos['target']})")
+    elif price >= pos["target"]:
+        print(f"TAKE-PROFIT: {ticker} @ ${price:.2f}")
         force_sell(ticker, price, reason="take_profit")
 
 def force_sell(ticker, price, reason="stop_loss"):
@@ -413,12 +594,18 @@ def force_sell(ticker, price, reason="stop_loss"):
         pos=api.get_position(ticker)
         qty=int(pos.qty)
         if qty<=0:
-            open_positions.pop(ticker,None)
-            return
+            open_positions.pop(ticker,None); return
         entry=float(pos.avg_entry_price)
         pnl=round((price-entry)*qty,2)
         api.submit_order(symbol=ticker,qty=qty,side="sell",
                          type="market",time_in_force="day")
+
+        # Record which signals were active for feedback
+        was_win = pnl > 0
+        pos_data = open_positions.get(ticker, {})
+        active_sigs = pos_data.get("active_signals", [])
+        record_trade_signals(ticker, was_win, active_sigs)
+
         trade_log.insert(0,{
             "type":"SELL","ticker":ticker,"qty":qty,
             "price":round(price,2),"pnl":pnl,"reason":reason,
@@ -427,15 +614,17 @@ def force_sell(ticker, price, reason="stop_loss"):
         open_positions.pop(ticker,None)
         set_cooldown(ticker,reason)
 
-        # Track win/loss for self-learning
-        trade_stats["total"] += 1
-        if pnl > 0:
-            trade_stats["wins"] += 1
+        trade_stats["total"]    += 1
+        trade_stats["total_pnl"] = round(trade_stats["total_pnl"]+pnl, 2)
+        if pnl>0:
+            trade_stats["wins"]+=1
+            trade_stats["best_trade"]=max(trade_stats["best_trade"],pnl)
         else:
-            trade_stats["losses"] += 1
+            trade_stats["losses"]+=1
+            trade_stats["worst_trade"]=min(trade_stats["worst_trade"],pnl)
 
-        win_rate = trade_stats["wins"]/max(trade_stats["total"],1)*100
-        print(f"SELL {qty}x {ticker} @ ${price:.2f} | {reason} | PnL ${pnl:+.2f} | WinRate {win_rate:.0f}%")
+        wr=trade_stats["wins"]/max(trade_stats["total"],1)*100
+        print(f"SELL {qty}x {ticker} @ ${price:.2f} | {reason} | PnL ${pnl:+.2f} | WR:{wr:.0f}%")
     except Exception as e:
         print(f"Force sell error {ticker}: {e}")
 
@@ -450,28 +639,22 @@ def close_all_positions_eod():
 # ── Decision engine ───────────────────────────────────────────
 
 def make_decision(ticker, signals, price):
-    """
-    Full decision pipeline:
-    1. Weighted signal voting
-    2. Prediction gate (skip/reduce/boost)
-    3. Multi-timeframe confirmation
-    4. Minimum vote threshold (adjusts with prediction)
-    Returns: action, reason, buy_weight, sell_weight
-    """
-    buy_w, sell_w, _ = weighted_vote(signals)
-    pred   = prediction_cache.get(ticker, {})
-    pscore = pred.get("score", 0)
-    tf_bias = pred.get("tf_bias", 0)
+    buy_w,sell_w,_ = weighted_vote(signals)
+    pred    = prediction_cache.get(ticker,{})
+    pscore  = pred.get("score",0)
+    tf_bias = pred.get("tf_bias",0)
+    rvol    = rvol_cache.get(ticker,1.0)
+    is_gap  = ticker in gap_candidates
 
-    # Dynamic threshold based on prediction quality
-    if pscore >= 40:
-        buy_threshold  = 1.2   # very confident — VWAP alone triggers
-        sell_threshold = 1.2
-    elif pscore >= 20:
-        buy_threshold  = 1.5
-        sell_threshold = 1.5
-    elif pscore <= PRED_SKIP:
+    # Skip if prediction strongly bearish
+    if pscore <= PRED_SKIP:
         return "hold", f"pred_skip({pscore})", buy_w, sell_w
+
+    # Dynamic threshold based on prediction + gap + rvol
+    if pscore >= 40:
+        buy_threshold = sell_threshold = 1.2
+    elif pscore >= 20:
+        buy_threshold = sell_threshold = 1.5
     elif pscore < PRED_NEED_CONF:
         buy_threshold  = 2.5
         sell_threshold = 2.0
@@ -479,69 +662,72 @@ def make_decision(ticker, signals, price):
         buy_threshold  = BASE_BUY_THRESHOLD
         sell_threshold = BASE_SELL_THRESHOLD
 
-    # Multi-timeframe gate:
-    # If daily trend is down, require much stronger signal to buy
-    if tf_bias == -1 and buy_w >= buy_threshold:
+    # Gap stock bonus — lower threshold since momentum is confirmed
+    if is_gap and gap_candidates[ticker]["direction"]=="up":
+        buy_threshold  = max(1.0, buy_threshold - 0.4)
+        print(f"  {ticker} gap bonus — buy threshold → {buy_threshold:.1f}")
+
+    # High rvol bonus — stock is active, signals are more reliable
+    if rvol >= 2.0:
+        buy_threshold  = max(1.0, buy_threshold - 0.2)
+        sell_threshold = max(1.0, sell_threshold - 0.2)
+
+    # Daily downtrend raises buy bar
+    if tf_bias==-1 and buy_w>=buy_threshold:
         buy_threshold += 1.0
-        print(f"  {ticker} daily downtrend — raising buy threshold to {buy_threshold}")
 
-    # If daily trend is up, slight reduction in threshold to sell
-    if tf_bias == 1 and sell_w >= sell_threshold:
-        sell_threshold += 0.5
+    if   buy_w  >= buy_threshold:  action="buy"
+    elif sell_w >= sell_threshold: action="sell"
+    else:                          action="hold"
 
-    # Determine action
-    if   buy_w  >= buy_threshold:  action = "buy"
-    elif sell_w >= sell_threshold: action = "sell"
-    else:                          action = "hold"
-
-    reason = (f"buy_w={buy_w:.1f}>={buy_threshold:.1f}" if action=="buy"
-              else f"sell_w={sell_w:.1f}>={sell_threshold:.1f}" if action=="sell"
-              else f"hold(b={buy_w:.1f},s={sell_w:.1f})")
-
+    reason=(f"buy_w={buy_w:.1f}>={buy_threshold:.1f}"  if action=="buy"
+            else f"sell_w={sell_w:.1f}>={sell_threshold:.1f}" if action=="sell"
+            else f"hold(b={buy_w:.1f},s={sell_w:.1f})")
     return action, reason, buy_w, sell_w
 
 # ── Trade execution ───────────────────────────────────────────
 
 def execute(ticker, action, price, signals, reason="signal"):
     try:
-        if action == "buy" and ticker not in open_positions:
+        if action=="buy" and ticker not in open_positions:
             if is_on_cooldown(ticker):
-                print(f"  {ticker} cooldown {cooldown_remaining(ticker)}s")
-                return
-            acct_size  = get_account_size()
-            if not passes_filters(ticker, price, acct_size):
-                return
-            pred_score = prediction_cache.get(ticker,{}).get("score",0)
-            qty        = position_size(price, acct_size, pred_score)
-            if qty == 0:
-                print(f"  Skipping {ticker} — qty 0")
-                return
-
-            # ATR-based stops from predictions module
-            stop, target, atr = calculate_stops(api, ticker, price,
-                                                STOP_LOSS_PCT, TAKE_PROFIT_PCT)
-
+                print(f"  {ticker} cooldown {cooldown_remaining(ticker)}s"); return
+            acct_size=get_account_size()
+            if not passes_filters(ticker,price,acct_size): return
+            pred_score=prediction_cache.get(ticker,{}).get("score",0)
+            rvol=rvol_cache.get(ticker,1.0)
+            qty=position_size(price,acct_size,pred_score,rvol)
+            if qty==0:
+                print(f"  Skipping {ticker} — qty 0"); return
+            stop,target,atr=calculate_stops(api,ticker,price,
+                                            STOP_LOSS_PCT,TAKE_PROFIT_PCT)
             api.submit_order(symbol=ticker,qty=qty,side="buy",
                              type="market",time_in_force="day")
-            open_positions[ticker] = {
-                "entry":price,"stop":stop,"target":target,"qty":qty,"atr":atr
+            # Store which signals were active for feedback later
+            active_sigs=[s["name"] for s in signals if s["action"]=="buy"]
+            open_positions[ticker]={
+                "entry":price,"stop":stop,"target":target,"qty":qty,
+                "atr":atr,"active_signals":active_sigs
             }
+            rr=round((target-price)/(price-stop),2) if price>stop else "?"
+            is_gap=ticker in gap_candidates
             trade_log.insert(0,{
                 "type":"BUY","ticker":ticker,"qty":qty,
                 "price":round(price,2),"pnl":None,
-                "stop":stop,"target":target,"atr":atr,
-                "pred_score":pred_score,"reason":reason,
+                "stop":stop,"target":target,
+                "pred_score":pred_score,"rvol":rvol,
+                "gap":is_gap,"reason":reason,
                 "ts":int(time.time()*1000)
             })
-            rr = round((target-price)/(price-stop),2) if price>stop else "?"
-            print(f"BUY {qty}x {ticker} @ ${price:.2f} | SL${stop} TP${target} | R:R={rr} | pred={pred_score:+.0f}")
-
-        elif action == "sell" and ticker in open_positions:
-            force_sell(ticker, price, reason=reason or "signal")
+            print(f"BUY {qty}x {ticker} @ ${price:.2f} | SL${stop} TP${target} "
+                  f"| R:R={rr} | pred={pred_score:+.0f} | rvol={rvol:.1f}x"
+                  +(" | GAP PLAY" if is_gap else ""))
+        elif action=="sell" and ticker in open_positions:
+            force_sell(ticker,price,reason=reason or "signal")
     except Exception as e:
         print(f"Order error {ticker}: {e}")
 
-# ── Apply scan results ────────────────────────────────────────
+# ── Apply scan + validate fallbacks ──────────────────────────
 
 def apply_scan_results(results_today, acct_size=None):
     global active_tickers
@@ -563,8 +749,6 @@ def apply_scan_results(results_today, acct_size=None):
     else:
         print("No affordable scan results — keeping current tickers")
 
-# ── Validate fallback tickers ─────────────────────────────────
-
 def validate_fallback_tickers():
     global active_tickers
     acct_size=get_account_size()
@@ -585,6 +769,54 @@ def validate_fallback_tickers():
     active_tickers=valid if valid else ["SIRI","TELL","AMC","BB","NOK"]
     print(f"Active tickers set to: {active_tickers}")
 
+# ── Pre-market + RVOL loop ────────────────────────────────────
+
+def premarket_loop():
+    """
+    Handles pre-market gap scan (8:45 AM) and
+    intraday relative volume updates (every 15 min).
+    """
+    gap_scanned_today   = None
+    rvol_updated_hours  = set()
+    last_rvol_day       = None
+
+    while True:
+        try:
+            now = datetime.now(NY)
+            day = now.date()
+
+            # Reset daily trackers
+            if day != last_rvol_day:
+                rvol_updated_hours.clear()
+                last_rvol_day = day
+
+            # Pre-market gap scan at 8:45 AM
+            if (now.weekday() < 5
+                    and now.hour == 8 and now.minute >= 45
+                    and gap_scanned_today != day):
+                gap_scanned_today = day
+                try:
+                    run_gap_scan()
+                except Exception as e:
+                    print(f"Gap scan error: {e}")
+
+            # Relative volume update every 15 minutes during trading window
+            if (now.weekday() < 5
+                    and in_trading_window()
+                    and is_market_open()):
+                bucket = now.hour * 4 + now.minute // 15  # unique 15-min bucket
+                if bucket not in rvol_updated_hours:
+                    rvol_updated_hours.add(bucket)
+                    try:
+                        update_rvol()
+                        socketio.emit("rvol", rvol_cache)
+                    except Exception as e:
+                        print(f"RVOL update error: {e}")
+
+        except Exception as e:
+            print(f"Premarket loop error: {e}")
+        time.sleep(60)
+
 # ── Prediction loop ───────────────────────────────────────────
 
 def prediction_loop():
@@ -596,11 +828,9 @@ def prediction_loop():
             if day!=last_pred_day:
                 predicted_hours.clear(); last_pred_day=day
             tickers_changed=set(active_tickers)!=set(last_tickers)
-            should_run=(
-                now.weekday()<5 and in_trading_window() and
-                ((hour in PRED_HOURS and hour not in predicted_hours)
-                 or tickers_changed)
-            )
+            should_run=(now.weekday()<5 and in_trading_window() and
+                        ((hour in PRED_HOURS and hour not in predicted_hours)
+                         or tickers_changed))
             if should_run:
                 predicted_hours.add(hour)
                 last_tickers=list(active_tickers)
@@ -689,12 +919,13 @@ def on_connect():
                         "pred_score":pred.get("score",None),
                         "pred_label":pred.get("label","—"),
                         "tf_bias":pred.get("tf_bias",0),
+                        "rvol":rvol_cache.get(ticker,None),
+                        "is_gap":ticker in gap_candidates,
                     }
                 except Exception as e:
                     print(f"on_connect {ticker}: {e}")
         socketio.emit("state",state)
-        if scan_results.get("scanned_at"):
-            socketio.emit("scan",scan_results)
+        if scan_results.get("scanned_at"): socketio.emit("scan",scan_results)
         if prediction_cache:
             socketio.emit("predictions",{
                 t:{"score":r.get("score",0),"label":r.get("label","neutral"),
@@ -703,6 +934,12 @@ def on_connect():
                    "tf_bias":r.get("tf_bias",0),"tf_detail":r.get("tf_detail","")}
                 for t,r in prediction_cache.items()
             })
+        if gap_candidates:
+            socketio.emit("gaps",{
+                "candidates":list(gap_candidates.values()),
+                "scanned_at":datetime.now(NY).strftime("%I:%M %p ET"),
+            })
+        if rvol_cache: socketio.emit("rvol",rvol_cache)
     except Exception as e:
         print(f"on_connect error: {e}")
 
@@ -767,6 +1004,9 @@ def bot_loop():
                     pos=open_positions.get(ticker)
                     pred=prediction_cache.get(ticker,{})
                     cd=cooldown_remaining(ticker)
+                    rvol=rvol_cache.get(ticker,None)
+                    n_buys=sum(1 for s in sigs if s["action"]=="buy")
+                    n_sells=sum(1 for s in sigs if s["action"]=="sell")
 
                     state["tickers"][ticker]={
                         "price":round(price,2),"signals":sigs,
@@ -779,13 +1019,14 @@ def bot_loop():
                         "pred_label":pred.get("label","—"),
                         "pred_conf":pred.get("confidence","—"),
                         "tf_bias":pred.get("tf_bias",0),
+                        "rvol":rvol,
+                        "is_gap":ticker in gap_candidates,
                     }
-                    # Count actual buy/sell signals for the log
-                    n_buys  = sum(1 for s in sigs if s["action"]=="buy")
-                    n_sells = sum(1 for s in sigs if s["action"]=="sell")
                     print(f"  {ticker}: ${price:.2f} | {action} | "
-                          f"votes={n_buys}b/{n_sells}s weights={buy_w:.1f}b/{sell_w:.1f}s | "
-                          f"{market_regime} | pred={pred.get('score',0):+.0f} tf={pred.get('tf_bias',0):+d}"
+                          f"votes={n_buys}b/{n_sells}s w={buy_w:.1f}b/{sell_w:.1f}s | "
+                          f"{market_regime} | pred={pred.get('score',0):+.0f}"
+                          +(f" | rvol={rvol:.1f}x" if rvol else "")
+                          +(f" | GAP" if ticker in gap_candidates else "")
                           +(f" | cd:{cd}s" if cd else ""))
                 except Exception as e:
                     print(f"  {ticker} error: {e}")
@@ -801,38 +1042,40 @@ def bot_loop():
 # ── Flask routes ──────────────────────────────────────────────
 
 @app.route("/")
-def index():
-    return render_template("dashboard.html")
+def index(): return render_template("dashboard.html")
 
 @app.route("/scanner")
-def scanner_page():
-    return render_template("scanner.html")
+def scanner_page(): return render_template("scanner.html")
 
 @app.route("/predictions")
-def predictions_page():
-    return render_template("predictions.html")
+def predictions_page(): return render_template("predictions.html")
 
 @app.route("/state")
-def state_json():
-    return jsonify({"trades":trade_log[:20]})
+def state_json(): return jsonify({"trades":trade_log[:20]})
 
 @app.route("/scan")
-def scan_json():
-    return jsonify(scan_results)
+def scan_json(): return jsonify(scan_results)
 
 @app.route("/predictions/data")
-def predictions_json():
-    return jsonify(prediction_cache)
+def predictions_json(): return jsonify(prediction_cache)
+
+@app.route("/gaps")
+def gaps_json(): return jsonify({
+    "candidates":list(gap_candidates.values()),
+    "scanned_at":datetime.now(NY).strftime("%I:%M %p ET") if gap_candidates else None
+})
 
 @app.route("/stats")
 def stats_json():
     total=max(trade_stats["total"],1)
     return jsonify({
         **trade_stats,
-        "win_rate": round(trade_stats["wins"]/total*100,1)
+        "win_rate": round(trade_stats["wins"]/total*100,1),
+        "signal_weights": signal_weights,
+        "signal_performance": signal_performance,
     })
 
-@app.route("/scan/manual", methods=["POST"])
+@app.route("/scan/manual",methods=["POST"])
 def manual_scan():
     def run():
         global scan_results,active_tickers,market_regime
@@ -845,8 +1088,8 @@ def manual_scan():
                 seen={s["ticker"] for s in incoming}
                 kept=[s for s in existing if s["ticker"] not in seen]
                 return (incoming+kept)[:10]
-            scan_results["today"]        =merge(scan_results.get("today",[]),     new_scan["today"])
-            scan_results["yesterday"]    =merge(scan_results.get("yesterday",[]), new_scan["yesterday"])
+            scan_results["today"]        =merge(scan_results.get("today",[]),new_scan["today"])
+            scan_results["yesterday"]    =merge(scan_results.get("yesterday",[]),new_scan["yesterday"])
             scan_results["scanned_at"]   =new_scan["scanned_at"]
             scan_results["account_size"] =new_scan.get("account_size",acct_size)
             scan_results["price_range"]  =new_scan.get("price_range","—")
@@ -864,12 +1107,11 @@ def manual_scan():
 def manual_predictions():
     def run():
         tickers=list(active_tickers)
-        print(f"Manual prediction for {tickers}...")
         try:
             results=run_predictions(api,tickers,market_regime)
             prediction_cache.update(results)
             summary=[(t,f"{r.get('score',0):+.0f}") for t,r in results.items()]
-            print(f"Manual predictions complete: {summary}")
+            print(f"Manual predictions: {summary}")
             socketio.emit("predictions",{
                 t:{"score":r.get("score",0),"label":r.get("label","neutral"),
                    "confidence":r.get("confidence","low"),
@@ -883,29 +1125,27 @@ def manual_predictions():
     return jsonify({"status":"started"}),202
 
 @app.route("/ping")
-def ping():
-    return "pong",200
+def ping(): return "pong",200
 
 # ── Startup ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
-    print(f"=== BOT STARTING v5 | port {port} ===")
+    print(f"=== BOT STARTING v6 | port {port} ===")
     print(f"=== FALLBACK_TICKERS: {FALLBACK_TICKERS} ===")
-    print(f"=== MAX_ACCOUNT: ${MAX_ACCOUNT} | WINDOW: {TRADING_START_H}:{TRADING_START_M:02d}–{TRADING_END_H}:{TRADING_END_M:02d} ET ===")
 
     def startup():
         time.sleep(3)
         print("=== STARTUP: regime detection ===")
         update_market_regime()
-        print(f"=== STARTUP: regime={market_regime} ===")
         print("=== STARTUP: validating tickers ===")
         validate_fallback_tickers()
-        print(f"=== STARTUP COMPLETE | tickers={active_tickers} ===")
+        print(f"=== STARTUP COMPLETE | tickers={active_tickers} | regime={market_regime} ===")
 
-    threading.Thread(target=startup,        daemon=True).start()
-    threading.Thread(target=bot_loop,       daemon=True).start()
-    threading.Thread(target=scanner_loop,   daemon=True).start()
-    threading.Thread(target=prediction_loop,daemon=True).start()
+    threading.Thread(target=startup,         daemon=True).start()
+    threading.Thread(target=bot_loop,        daemon=True).start()
+    threading.Thread(target=scanner_loop,    daemon=True).start()
+    threading.Thread(target=prediction_loop, daemon=True).start()
+    threading.Thread(target=premarket_loop,  daemon=True).start()
 
     socketio.run(app,host="0.0.0.0",port=port)
