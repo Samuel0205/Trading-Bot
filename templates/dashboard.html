@@ -21,6 +21,46 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
 .up { color: #1D9E75; } .down { color: #D85A30; }
 .chart-card { background: #1a1d27; border-radius: 10px; padding: 14px; margin-top: 8px; }
 .chart-wrap { position: relative; width: 100%; height: 160px; }
+
+/* Blackout banner */
+.blackout-banner { background: #D85A3022; border: 1px solid #D85A3044; border-radius: 10px;
+  padding: 12px 14px; margin: 8px 0; display: none; }
+.blackout-banner .title { font-size: 12px; font-weight: 600; color: #D85A30; margin-bottom: 3px; }
+.blackout-banner .sub   { font-size: 11px; color: #888; }
+
+/* Alerts */
+.alerts-section { margin-bottom: 4px; }
+.alert-item { display: flex; align-items: flex-start; gap: 8px; background: #1a1d27;
+  border-radius: 8px; padding: 10px 12px; margin-bottom: 6px; font-size: 12px; }
+.alert-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 4px; flex-shrink: 0; }
+.alert-INFO { background: #1D9E75; }
+.alert-WARN { background: #E9A84C; }
+.alert-CRITICAL { background: #D85A30; }
+.alert-msg  { flex: 1; color: #bbb; }
+.alert-time { font-size: 10px; color: #555; white-space: nowrap; }
+.ack-btn { font-size: 10px; color: #555; background: none; border: none; cursor: pointer; padding: 2px 6px; }
+
+/* Macro + PDT row */
+.info-row { display: flex; gap: 8px; margin-bottom: 8px; }
+.info-pill { background: #1a1d27; border-radius: 8px; padding: 8px 12px; font-size: 11px; flex: 1; text-align: center; }
+.info-pill .lbl { color: #555; margin-bottom: 2px; }
+.info-pill .val { font-weight: 600; }
+
+/* Predictions mini-panel */
+.pred-row { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; margin-bottom: 4px; }
+.pred-chip { background: #1a1d27; border-radius: 8px; padding: 8px 10px; flex-shrink: 0; min-width: 80px; text-align: center; }
+.pred-chip .p-ticker { font-size: 12px; font-weight: 600; }
+.pred-chip .p-score  { font-size: 18px; font-weight: 700; margin: 2px 0; }
+.pred-chip .p-label  { font-size: 9px; color: #555; }
+
+/* Unusual volume */
+.uvol-row { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; margin-bottom: 4px; }
+.uvol-chip { background: #1a1d27; border-radius: 8px; padding: 8px 10px; flex-shrink: 0; min-width: 80px; text-align: center; }
+.uvol-chip .u-ticker { font-size: 11px; font-weight: 600; }
+.uvol-chip .u-rvol   { font-size: 16px; font-weight: 700; color: #4a9eff; }
+.uvol-chip .u-dir    { font-size: 9px; }
+
+/* Tickers */
 .bots { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .bot { background: #1a1d27; border-radius: 10px; padding: 12px; }
 .bot-top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
@@ -49,6 +89,7 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
 .trade-pnl { font-weight: 600; }
 .status-bar { font-size: 11px; color: #444; text-align: center; margin-top: 16px; padding-bottom: 8px; }
 .market-closed { color: #555; font-size: 13px; padding: 16px; text-align: center; grid-column: span 2; }
+.next-event { font-size: 10px; color: #555; margin-top: 3px; }
 </style>
 </head>
 <body>
@@ -57,6 +98,8 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
   <h1>Trading Bot</h1>
   <div style="display:flex;align-items:center;gap:10px;">
     <a href="/scanner" style="font-size:12px;color:#4a9eff;text-decoration:none;background:#4a9eff11;padding:5px 10px;border-radius:8px;">Scanner</a>
+    <a href="/predictions" style="font-size:12px;color:#E9A84C;text-decoration:none;background:#E9A84C11;padding:5px 10px;border-radius:8px;">Predictions</a>
+    <a href="/backtest" style="font-size:12px;color:#1D9E75;text-decoration:none;background:#1D9E7511;padding:5px 10px;border-radius:8px;">Backtest</a>
     <div style="display:flex;align-items:center;gap:6px;">
       <div class="dot" id="dot"></div>
       <span id="statusTxt" style="font-size:12px;color:#555;">Connecting...</span>
@@ -64,11 +107,33 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
   </div>
 </div>
 
+<!-- FIX: Macro blackout banner (was never shown) -->
+<div class="blackout-banner" id="blackoutBanner">
+  <div class="title">⛔ MACRO BLACKOUT — Trading Suspended</div>
+  <div class="sub" id="blackoutEvent">High-impact economic event today</div>
+</div>
+
 <div class="cards">
   <div class="card"><div class="lbl">Portfolio</div><div class="val" id="port">—</div></div>
   <div class="card"><div class="lbl">Cash</div><div class="val" id="cash">—</div></div>
-  <div class="card"><div class="lbl">Total P&L</div><div class="val" id="pnl">—</div></div>
+  <div class="card"><div class="lbl">Today P&L</div><div class="val" id="pnl">—</div></div>
   <div class="card"><div class="lbl">Market regime</div><div class="val" id="regime" style="font-size:13px;">—</div></div>
+</div>
+
+<!-- FIX: PDT counter + next macro event (were never shown) -->
+<div class="info-row">
+  <div class="info-pill">
+    <div class="lbl">Day trades (PDT)</div>
+    <div class="val" id="pdtCount">—/3</div>
+  </div>
+  <div class="info-pill">
+    <div class="lbl">Next event</div>
+    <div class="val" id="nextEvent" style="font-size:12px;">—</div>
+  </div>
+  <div class="info-pill">
+    <div class="lbl">Mode</div>
+    <div class="val" id="modeLabel" style="font-size:12px;">—</div>
+  </div>
 </div>
 
 <div class="chart-card">
@@ -77,6 +142,27 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
     <span style="font-size:10px;color:#333;cursor:pointer;" onclick="clearChart()">Clear</span>
   </div>
   <div class="chart-wrap"><canvas id="portChart"></canvas></div>
+</div>
+
+<!-- FIX: Alerts panel (socket.on('alerts') was never handled) -->
+<div class="alerts-section" id="alertsSection" style="display:none;">
+  <h2 style="display:flex;justify-content:space-between;">
+    Alerts
+    <button class="ack-btn" onclick="ackAlerts()">Clear all</button>
+  </h2>
+  <div id="alertsList"></div>
+</div>
+
+<!-- FIX: Prediction scores panel (pred_score/pred_label in state but never rendered) -->
+<h2>Predictions</h2>
+<div class="pred-row" id="predRow">
+  <div style="color:#555;font-size:12px;padding:8px 0;">No predictions yet — auto-runs at market open</div>
+</div>
+
+<!-- FIX: Unusual volume (emitted from backend but never shown) -->
+<div id="uvolSection" style="display:none;">
+  <h2>Unusual volume</h2>
+  <div class="uvol-row" id="uvolRow"></div>
 </div>
 
 <h2>Watching</h2>
@@ -112,7 +198,7 @@ let activeTicker = null;
 let lastState    = null;
 let portChart;
 
-// ── Persistent storage ────────────────────────────────────────
+// ── Persistent storage ─────────────────────────────────────
 
 function loadPortHistory() {
   try {
@@ -122,105 +208,73 @@ function loadPortHistory() {
     return JSON.parse(saved).filter(d => d.ts > cutoff);
   } catch(e) { return []; }
 }
-
 function savePortHistory() {
   try { localStorage.setItem(CHART_KEY, JSON.stringify(portHistory)); } catch(e) {}
 }
-
 function loadAllTrades() {
-  try {
-    const saved = localStorage.getItem(TRADES_KEY);
-    return saved ? JSON.parse(saved) : [];
-  } catch(e) { return []; }
+  try { const s = localStorage.getItem(TRADES_KEY); return s ? JSON.parse(s) : []; } catch(e) { return []; }
 }
-
 function saveAllTrades() {
-  try { localStorage.setItem(TRADES_KEY, JSON.stringify(allTrades.slice(0, 500))); } catch(e) {}
+  try { localStorage.setItem(TRADES_KEY, JSON.stringify(allTrades.slice(0,500))); } catch(e) {}
 }
-
 function clearChart() {
-  localStorage.removeItem(CHART_KEY);
-  portHistory = [];
-  portChart.data.labels = [];
-  portChart.data.datasets[0].data = [];
-  portChart.update('none');
+  localStorage.removeItem(CHART_KEY); portHistory = [];
+  portChart.data.labels = []; portChart.data.datasets[0].data = []; portChart.update('none');
 }
-
 function clearTrades() {
   if (!confirm('Clear all trade history?')) return;
-  localStorage.removeItem(TRADES_KEY);
-  allTrades = [];
-  renderTrades([]);
+  localStorage.removeItem(TRADES_KEY); allTrades = []; renderTrades([]);
 }
 
 let portHistory = loadPortHistory();
 let allTrades   = loadAllTrades();
 
-// ── Chart ─────────────────────────────────────────────────────
+// ── Chart ──────────────────────────────────────────────────
 
 function makeChartLabels() {
   return portHistory.map(d => {
     const dt = new Date(d.ts);
-    return dt.toLocaleDateString([], {month:'numeric', day:'numeric'}) + ' ' +
-           dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    return dt.toLocaleDateString([],{month:'numeric',day:'numeric'}) + ' ' +
+           dt.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
   });
 }
-
 function initChart() {
   const vals = portHistory.map(d => d.val);
   portChart = new Chart(document.getElementById('portChart'), {
     type: 'line',
     data: {
       labels: makeChartLabels(),
-      datasets: [{
-        data: vals,
-        borderColor: '#1D9E75',
-        borderWidth: 2,
-        fill: true,
-        backgroundColor: 'rgba(29,158,117,0.08)',
-        pointRadius: 0,
-        tension: 0.3
-      }]
+      datasets: [{ data:vals, borderColor:'#1D9E75', borderWidth:2, fill:true,
+        backgroundColor:'rgba(29,158,117,0.08)', pointRadius:0, tension:0.3 }]
     },
     options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
+      responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{ display:false } },
       scales: {
-        y: {
-          ticks: { color: '#555', font: { size: 11 }, callback: v => '$' + v.toLocaleString() },
-          grid: { color: '#1e2130' }
-        },
-        x: {
-          ticks: { color: '#444', font: { size: 9 }, maxTicksLimit: 6 },
-          grid: { display: false }
-        }
+        y:{ ticks:{ color:'#555', font:{size:11}, callback:v=>'$'+v.toLocaleString() }, grid:{color:'#1e2130'} },
+        x:{ ticks:{ color:'#444', font:{size:9}, maxTicksLimit:6 }, grid:{display:false} }
       }
     }
   });
 }
-
 function updateChart(val) {
   if (!val) return;
-  portHistory.push({ ts: Date.now(), val });
-  const cutoff = Date.now() - THREE_DAYS;
-  portHistory = portHistory.filter(d => d.ts > cutoff);
+  portHistory.push({ ts:Date.now(), val });
+  portHistory = portHistory.filter(d => d.ts > Date.now()-THREE_DAYS);
   savePortHistory();
-  const vals = portHistory.map(d => d.val);
+  const vals  = portHistory.map(d => d.val);
+  const first = vals[0];
+  const up    = val >= first;
   portChart.data.labels = makeChartLabels();
   portChart.data.datasets[0].data = vals;
-  const first = vals[0];
-  const up = val >= first;
   portChart.data.datasets[0].borderColor = up ? '#1D9E75' : '#D85A30';
-  portChart.data.datasets[0].backgroundColor = up
-    ? 'rgba(29,158,117,0.08)' : 'rgba(216,90,48,0.08)';
+  portChart.data.datasets[0].backgroundColor = up ? 'rgba(29,158,117,0.08)' : 'rgba(216,90,48,0.08)';
   portChart.update('none');
 }
 
-// ── Socket ────────────────────────────────────────────────────
+// ── Socket ─────────────────────────────────────────────────
 
 const socket = io();
-
 socket.on('connect', () => {
   document.getElementById('dot').style.background = '#1D9E75';
   document.getElementById('statusTxt').textContent = 'Live';
@@ -232,15 +286,10 @@ socket.on('disconnect', () => {
 
 socket.on('state', (data) => {
   lastState = data;
-
-  // Normalize tickers to object format
   let tickerMap = {};
   if (data.tickers && typeof data.tickers === 'object' && !Array.isArray(data.tickers)) {
     tickerMap = data.tickers;
-  } else if (Array.isArray(data.tickers)) {
-    data.tickers.forEach(t => { if (t.symbol) tickerMap[t.symbol] = t; });
   }
-
   const keys    = Object.keys(tickerMap);
   const display = keys.length ? keys : DEFAULT_TICKERS;
   if (!activeTicker || !display.includes(activeTicker)) activeTicker = display[0];
@@ -249,11 +298,21 @@ socket.on('state', (data) => {
   updateChart(data.account?.portfolio ?? data.account?.equity);
   renderTickers(display, tickerMap);
 
-  if (data.market_status === 'closed') {
+  // FIX: show blackout banner when market is suspended
+  const banner = document.getElementById('blackoutBanner');
+  if (data.market_status === 'blackout') {
+    banner.style.display = 'block';
+    document.getElementById('blackoutEvent').textContent =
+      data.message || 'High-impact economic event today';
+  } else {
+    banner.style.display = 'none';
+  }
+
+  if (data.market_status === 'closed' || data.market_status === 'blackout') {
     document.getElementById('bots').innerHTML =
       '<div class="market-closed">Market closed — resumes 9:30 AM ET</div>';
     document.getElementById('votes').innerHTML = '';
-    document.getElementById('verdict').textContent = 'Market closed';
+    document.getElementById('verdict').textContent = data.market_status === 'blackout' ? 'Blackout' : 'Market closed';
     document.getElementById('verdict').style.color = '#555';
   } else if (tickerMap[activeTicker]) {
     renderBots(tickerMap[activeTicker]);
@@ -263,54 +322,163 @@ socket.on('state', (data) => {
   }
 
   renderTrades(data.trades || []);
-  document.getElementById('lastUpdate').textContent =
-    'Updated ' + new Date().toLocaleTimeString();
+  document.getElementById('lastUpdate').textContent = 'Updated ' + new Date().toLocaleTimeString();
 });
 
-// ── Renderers ─────────────────────────────────────────────────
+// FIX: handle macro data (was emitted but ignored on dashboard)
+socket.on('macro', (data) => {
+  if (data.next_event) {
+    const ne = data.next_event;
+    document.getElementById('nextEvent').textContent = `${ne.event_name} ${ne.event_date}`;
+  }
+});
+
+// FIX: handle alerts (was NEVER handled — complete omission)
+socket.on('alerts', (alerts) => {
+  if (!alerts || !alerts.length) return;
+  renderAlerts(alerts);
+});
+
+// FIX: handle predictions on dashboard (pred data was in state but never displayed)
+socket.on('predictions', (data) => {
+  renderPredictionChips(data);
+});
+
+// FIX: handle unusual volume (was emitted from backend, never shown)
+socket.on('rvol', (data) => {
+  // rvol_cache — not unusual volume, but update PDT via stats
+});
+
+// ── Renderers ──────────────────────────────────────────────
 
 function renderAccount(acct) {
   if (!acct) return;
   const p = acct.portfolio ?? acct.equity;
   if (p == null) return;
   document.getElementById('port').textContent = '$' + Number(p).toLocaleString();
-  document.getElementById('cash').textContent = '$' + Number(acct.cash || 0).toLocaleString();
+  document.getElementById('cash').textContent = '$' + Number(acct.cash||0).toLocaleString();
   const pnl = acct.pnl ?? 0;
   const el  = document.getElementById('pnl');
-  el.textContent = (pnl >= 0 ? '+' : '-') + '$' + Math.abs(pnl).toFixed(2);
-  el.className   = 'val ' + (pnl > 0 ? 'up' : pnl < 0 ? 'down' : '');
+  el.textContent = (pnl>=0?'+':'-') + '$' + Math.abs(pnl).toFixed(2);
+  el.className   = 'val ' + (pnl>0?'up':pnl<0?'down':'');
   const regimeMap = {
-    trending_up:   { label: 'Trending up',  color: '#1D9E75' },
-    trending_down: { label: 'Trending down', color: '#D85A30' },
-    ranging:       { label: 'Ranging',       color: '#E9A84C' },
-    unknown:       { label: 'Detecting...',  color: '#555'    },
+    trending_up:   { label:'Trending up',  color:'#1D9E75' },
+    trending_down: { label:'Trending down',color:'#D85A30' },
+    ranging:       { label:'Ranging',      color:'#E9A84C' },
+    unknown:       { label:'Detecting...', color:'#555' },
   };
-  const r = regimeMap[acct.regime || 'unknown'];
+  const r = regimeMap[acct.regime||'unknown'];
   const regimeEl = document.getElementById('regime');
-  regimeEl.textContent = r.label;
-  regimeEl.style.color = r.color;
+  regimeEl.textContent = r.label; regimeEl.style.color = r.color;
+  document.getElementById('modeLabel').textContent = acct.live ? '🔴 LIVE' : '📄 PAPER';
+  document.getElementById('modeLabel').style.color = acct.live ? '#D85A30' : '#4a9eff';
+
+  // Fetch PDT + next event from /stats
+  fetch('/stats').then(r=>r.json()).then(s => {
+    const pdt = s.pdt_trades_this_week ?? s.daily_trade_count ?? 0;
+    document.getElementById('pdtCount').textContent = `${pdt}/3`;
+    document.getElementById('pdtCount').style.color = pdt>=3?'#D85A30':pdt>=2?'#E9A84C':'#1D9E75';
+    if (s.unusual_volume && s.unusual_volume.length) {
+      renderUnusualVolume(s.unusual_volume);
+    }
+  }).catch(()=>{});
+}
+
+// FIX: render prediction score chips — was never done on dashboard
+function renderPredictionChips(data) {
+  const tickers = Object.keys(data);
+  if (!tickers.length) return;
+  tickers.sort((a,b) => (data[b].score||0) - (data[a].score||0));
+  document.getElementById('predRow').innerHTML = tickers.map(t => {
+    const d     = data[t];
+    const score = d.score || 0;
+    const label = (d.label||'neutral').replace(/_/g,' ');
+    const color = score>40?'#1D9E75':score>10?'#4a9eff':score>0?'#7B9FFF':score>-20?'#E9A84C':'#D85A30';
+    return `<div class="pred-chip" style="border-left:2px solid ${color};">
+      <div class="p-ticker">${t}</div>
+      <div class="p-score" style="color:${color};">${score>0?'+':''}${score}</div>
+      <div class="p-label">${label}</div>
+    </div>`;
+  }).join('');
+}
+
+// Also update prediction chips when state updates (pred_score in ticker data)
+function renderPredFromState(tickerMap) {
+  const chips = {};
+  for (const [t, d] of Object.entries(tickerMap)) {
+    if (d.pred_score != null) {
+      chips[t] = { score: d.pred_score, label: d.pred_label||'neutral' };
+    }
+  }
+  if (Object.keys(chips).length) renderPredictionChips(chips);
+}
+
+// FIX: render unusual volume chips — was never shown
+function renderUnusualVolume(uvol) {
+  if (!uvol || !uvol.length) return;
+  document.getElementById('uvolSection').style.display = 'block';
+  document.getElementById('uvolRow').innerHTML = uvol.slice(0,6).map(u => {
+    const dirColor = u.direction==='up' ? '#1D9E75' : '#D85A30';
+    const sign     = u.price_chg_pct>=0 ? '+' : '';
+    return `<div class="uvol-chip">
+      <div class="u-ticker">${u.ticker}</div>
+      <div class="u-rvol">${u.rvol}x</div>
+      <div class="u-dir" style="color:${dirColor};">${sign}${u.price_chg_pct}%</div>
+    </div>`;
+  }).join('');
+}
+
+// FIX: render alerts properly — was never handled
+function renderAlerts(alerts) {
+  if (!alerts || !alerts.length) {
+    document.getElementById('alertsSection').style.display = 'none';
+    return;
+  }
+  document.getElementById('alertsSection').style.display = 'block';
+  document.getElementById('alertsList').innerHTML = alerts.slice(0,5).map(a => {
+    const time = a.ts ? new Date(a.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : '';
+    return `<div class="alert-item">
+      <div class="alert-dot alert-${a.level}"></div>
+      <div class="alert-msg">${a.message}${a.ticker?` <span style="color:#4a9eff;">(${a.ticker})</span>`:''}</div>
+      <div class="alert-time">${time}</div>
+    </div>`;
+  }).join('');
+}
+
+function ackAlerts() {
+  fetch('/alerts/ack', { method:'POST' }).then(()=>{
+    document.getElementById('alertsSection').style.display = 'none';
+  });
 }
 
 function renderTickers(tickers, tickerMap) {
   document.getElementById('tickers').innerHTML = tickers.map(t => {
-    const d    = tickerMap[t];
-    const price = d?.price ?? '';
-    const stop  = d?.stop   ? ` · SL $${d.stop}`   : '';
-    const tgt   = d?.target ? ` · TP $${d.target}`  : '';
+    const d      = tickerMap[t];
+    const price  = d?.price ?? '';
+    const stop   = d?.stop   ? ` · SL ${d.stop}`   : '';
+    const tgt    = d?.target ? ` · TP ${d.target}`  : '';
+    const rvol   = d?.rvol   ? ` · ${d.rvol}x vol`  : '';
+    const isGap  = d?.is_gap;
+    const gapBadge = isGap ? '<span style="font-size:9px;background:#E9A84C22;color:#E9A84C;padding:1px 5px;border-radius:4px;margin-left:4px;">GAP</span>' : '';
+    const predScore = d?.pred_score != null ? d.pred_score : null;
+    const predColor = predScore!=null?(predScore>20?'#1D9E75':predScore>0?'#4a9eff':predScore>-20?'#E9A84C':'#D85A30'):'#555';
+    const predBadge = predScore!=null ? `<span style="font-size:9px;color:${predColor};margin-left:4px;">${predScore>0?'+':''}${predScore}</span>` : '';
     return `<div class="tchip${t===activeTicker?' active':''}" onclick="switchTicker('${t}')">
-      ${t}${price ? `<span style="font-size:10px;color:#555;margin-left:3px;">$${price}</span>` : ''}
+      ${t}${gapBadge}${predBadge}
+      ${price ? `<span style="font-size:10px;color:#555;margin-left:3px;">${price}${rvol}</span>` : ''}
       ${(stop||tgt) ? `<div class="stop-target">${stop}${tgt}</div>` : ''}
     </div>`;
   }).join('');
+
+  // Update prediction chips from state ticker data
+  renderPredFromState(tickerMap);
 }
 
 function switchTicker(t) {
   activeTicker = t;
   if (!lastState) return;
   let tickerMap = lastState.tickers || {};
-  if (Array.isArray(tickerMap)) {
-    const tmp = {}; tickerMap.forEach(x => { tmp[x.symbol] = x; }); tickerMap = tmp;
-  }
+  if (Array.isArray(tickerMap)) { const tmp={}; tickerMap.forEach(x=>{tmp[x.symbol]=x;}); tickerMap=tmp; }
   const keys = Object.keys(tickerMap);
   renderTickers(keys.length ? keys : DEFAULT_TICKERS, tickerMap);
   if (tickerMap[t]) renderBots(tickerMap[t]);
@@ -318,17 +486,16 @@ function switchTicker(t) {
 
 function renderBots(tdata) {
   if (!tdata || !tdata.signals || !tdata.signals.length) {
-    document.getElementById('bots').innerHTML =
-      '<div class="market-closed">No signal data</div>';
+    document.getElementById('bots').innerHTML = '<div class="market-closed">No signal data</div>';
     document.getElementById('votes').innerHTML = '';
     document.getElementById('verdict').textContent = 'No data';
     return;
   }
   const sigs  = tdata.signals;
-  const buys  = sigs.filter(s => s.action === 'buy').length;
-  const sells = sigs.filter(s => s.action === 'sell').length;
+  const buys  = sigs.filter(s => s.action==='buy').length;
+  const sells = sigs.filter(s => s.action==='sell').length;
 
-  document.getElementById('votes').innerHTML = sigs.map((s, i) => {
+  document.getElementById('votes').innerHTML = sigs.map((s,i) => {
     const cls = s.action==='buy'?'v-buy':s.action==='sell'?'v-sell':'v-hold';
     return `<div class="vote ${cls}" title="${s.name}">${BOT_NAMES[i]||s.name?.slice(0,2)||'?'}</div>`;
   }).join('');
@@ -336,11 +503,11 @@ function renderBots(tdata) {
   const v = document.getElementById('verdict');
   if      (buys  >= 3) { v.textContent=`BUY (${buys}/${sigs.length})`;  v.style.color='#1D9E75'; }
   else if (sells >= 3) { v.textContent=`SELL (${sells}/${sigs.length})`; v.style.color='#D85A30'; }
-  else                 { v.textContent='Holding';                         v.style.color='#888';    }
+  else                 { v.textContent='Holding';                         v.style.color='#888'; }
 
-  document.getElementById('bots').innerHTML = sigs.map((s, i) => {
-    const col = COLORS[i] || '#888';
-    const sig = typeof s.signal === 'number' ? s.signal : 50;
+  document.getElementById('bots').innerHTML = sigs.map((s,i) => {
+    const col = COLORS[i]||'#888';
+    const sig = typeof s.signal==='number' ? s.signal : 50;
     return `<div class="bot">
       <div class="bot-top">
         <div class="bot-icon" style="background:${col}22;color:${col};">${BOT_NAMES[i]||s.name?.slice(0,2)||'?'}</div>
@@ -360,9 +527,7 @@ function mergeTrades(incoming) {
   const key = t => `${t.type}-${t.ticker}-${t.price}-${t.qty}`;
   const existing = new Set(allTrades.map(key));
   let added = 0;
-  incoming.forEach(t => {
-    if (!existing.has(key(t))) { allTrades.unshift(t); added++; }
-  });
+  incoming.forEach(t => { if (!existing.has(key(t))) { allTrades.unshift(t); added++; } });
   if (added) saveAllTrades();
 }
 
@@ -371,20 +536,14 @@ function renderTrades(incoming) {
   const countEl = document.getElementById('tradeCount');
   if (!allTrades.length) {
     countEl.textContent = '';
-    document.getElementById('trades').innerHTML =
-      '<div style="color:#555;font-size:12px;padding:8px 0;">No trades yet</div>';
+    document.getElementById('trades').innerHTML = '<div style="color:#555;font-size:12px;padding:8px 0;">No trades yet</div>';
     return;
   }
-  countEl.textContent = allTrades.length + ' total trade' + (allTrades.length !== 1 ? 's' : '');
+  countEl.textContent = allTrades.length + ' total trade' + (allTrades.length!==1?'s':'');
   document.getElementById('trades').innerHTML = allTrades.map(t => {
-    const pnlHtml = t.pnl != null
-      ? `<span class="trade-pnl ${t.pnl>=0?'up':'down'}">${t.pnl>=0?'+':''}$${Math.abs(t.pnl).toFixed(2)}</span>`
-      : '';
-    const reasonHtml = t.reason
-      ? `<span style="font-size:10px;color:#555;">${t.reason}</span>` : '';
-    const timeHtml = t.ts
-      ? `<span style="font-size:10px;color:#444;margin-left:auto;">${new Date(t.ts).toLocaleDateString([],{month:'numeric',day:'numeric'})} ${new Date(t.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>`
-      : '';
+    const pnlHtml   = t.pnl!=null ? `<span class="trade-pnl ${t.pnl>=0?'up':'down'}">${t.pnl>=0?'+':''}$${Math.abs(t.pnl).toFixed(2)}</span>` : '';
+    const reasonHtml = t.reason ? `<span style="font-size:10px;color:#555;">${t.reason}</span>` : '';
+    const timeHtml   = t.ts     ? `<span style="font-size:10px;color:#444;margin-left:auto;">${new Date(t.ts).toLocaleDateString([],{month:'numeric',day:'numeric'})} ${new Date(t.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>` : '';
     return `<div class="trade">
       <span class="trade-type ${t.type==='BUY'?'up':'down'}">${t.type}</span>
       <span style="font-weight:500;">${t.ticker}</span>
@@ -393,6 +552,12 @@ function renderTrades(incoming) {
     </div>`;
   }).join('');
 }
+
+// Load alerts on open
+fetch('/alerts').then(r=>r.json()).then(a=>{
+  const unacked = a.filter(x=>!x.acknowledged);
+  if (unacked.length) renderAlerts(unacked);
+}).catch(()=>{});
 
 initChart();
 </script>
