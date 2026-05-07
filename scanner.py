@@ -1,370 +1,222 @@
-"""
-scanner.py — Stock scanner + universe builder
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Stock Scanner</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f1117; color: #e8e8e8; padding: 12px; font-size: 14px; }
+.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.back { font-size: 12px; color: #4a9eff; text-decoration: none; background: #4a9eff11; padding: 5px 10px; border-radius: 8px; }
+.nav { display: flex; gap: 8px; margin-bottom: 12px; }
+.nav a { padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 500; text-decoration: none; background: #1a1d27; color: #888; cursor: pointer; }
+.nav a.active { background: #4a9eff22; color: #4a9eff; }
+.toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.scan-time { font-size: 11px; color: #444; }
+.scan-btn { font-size: 12px; font-weight: 500; padding: 7px 16px; border-radius: 8px; border: 1px solid #4a9eff44; background: #4a9eff11; color: #4a9eff; cursor: pointer; transition: opacity .2s; }
+.scan-btn:disabled { opacity: .4; cursor: default; }
+.meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; background: #1a1d27; border-radius: 10px; padding: 12px 14px; }
+.meta-item .lbl { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 3px; }
+.meta-item .val { font-size: 14px; font-weight: 600; color: #4a9eff; }
+.predictions-btn { display: inline-block; font-size: 11px; color: #E9A84C; text-decoration: none; background: #E9A84C11; padding: 4px 10px; border-radius: 8px; margin-bottom: 14px; }
+.stock-card { background: #1a1d27; border-radius: 12px; padding: 14px; margin-bottom: 10px; }
+.card-top { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.rank { font-size: 22px; font-weight: 700; min-width: 28px; text-align: center; }
+.rank.gold   { color: #E9A84C; }
+.rank.silver { color: #aaa; }
+.rank.bronze { color: #CD7F32; }
+.rank.other  { color: #2a2d3a; }
+.ticker-block { flex: 1; }
+.ticker-row { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; flex-wrap: wrap; }
+.ticker  { font-size: 17px; font-weight: 700; }
+.price   { font-size: 14px; color: #888; }
+.chg     { font-size: 12px; font-weight: 600; padding: 2px 7px; border-radius: 4px; }
+.up      { background: #1D9E7522; color: #1D9E75; }
+.down    { background: #D85A3022; color: #D85A30; }
+.grade   { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 4px; }
+.gA,.gB  { background: #1D9E7522; color: #1D9E75; }
+.gB      { background: #4a9eff22; color: #4a9eff; }
+.gC      { background: #E9A84C22; color: #E9A84C; }
+.gD,.gF  { background: #D85A3022; color: #D85A30; }
+.score-circle { width: 44px; height: 44px; border-radius: 50%; background: #4a9eff15; border: 1.5px solid #4a9eff33; display: flex; flex-direction: column; align-items: center; justify-content: center; flex-shrink: 0; }
+.score-num { font-size: 12px; font-weight: 700; color: #4a9eff; line-height: 1; }
+.score-lbl { font-size: 8px; color: #555; margin-top: 1px; }
+.bars { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.bar-row { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #555; }
+.bar-row .lbl { min-width: 72px; }
+.bar-bg  { flex: 1; height: 4px; background: #2a2d3a; border-radius: 2px; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 2px; transition: width .8s ease; }
+.bar-val { min-width: 36px; text-align: right; font-size: 10px; color: #666; }
+.pills { display: flex; gap: 5px; flex-wrap: wrap; }
+.pill { font-size: 10px; padding: 2px 8px; border-radius: 10px; }
+.p-vol  { background: #4a9eff22; color: #4a9eff; }
+.p-news { background: #E9A84C22; color: #E9A84C; }
+.p-sp   { background: #1D9E7522; color: #1D9E75; }
+.p-sn   { background: #D85A3022; color: #D85A30; }
+.p-rs   { background: #C45C8A22; color: #C45C8A; }
+.p-rng  { background: #7B68EE22; color: #7B68EE; }
+.p-met  { background: #2a2d3a; color: #666; }
+.empty  { color: #444; font-size: 13px; text-align: center; padding: 40px 16px; line-height: 1.8; }
+.loading { display: flex; align-items: center; gap: 10px; color: #555; font-size: 13px; padding: 32px 0; justify-content: center; }
+.spinner { width: 16px; height: 16px; border: 2px solid #2a2d3a; border-top-color: #4a9eff; border-radius: 50%; animation: spin .8s linear infinite; flex-shrink: 0; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
 
-Builds a dynamic universe of affordable, liquid stocks each scan cycle.
-Uses IEX feed (free Alpaca tier). No circular imports.
+<div class="header">
+  <h1>Stock Scanner</h1>
+  <a href="/" class="back">← Dashboard</a>
+</div>
 
-Exports required by app.py:
-  - SEED_UNIVERSE  (list of ticker strings)
-  - run_full_scan(api)  → dict with today/yesterday/meta
+<div class="nav">
+  <a id="tab-today" class="active" onclick="showTab('today')">Today's picks</a>
+  <a id="tab-yesterday" onclick="showTab('yesterday')">Yesterday's movers</a>
+</div>
 
-Account sizing parameters are passed INTO run_full_scan rather than
-imported from app.py, which would cause a circular import.
-"""
+<div class="toolbar">
+  <span id="scanTime" class="scan-time">Loading...</span>
+  <button id="scanBtn" class="scan-btn" onclick="triggerManualScan()">Run scan now</button>
+</div>
 
-import time, os, requests as req
-from datetime import datetime, timedelta
-import pytz
+<div class="meta-grid" id="metaGrid" style="display:none;">
+  <div class="meta-item"><div class="lbl">Account</div><div class="val" id="metaAcct">—</div></div>
+  <div class="meta-item"><div class="lbl">Price range</div><div class="val" id="metaRange">—</div></div>
+  <div class="meta-item"><div class="lbl">Universe</div><div class="val" id="metaUni">—</div></div>
+  <div class="meta-item"><div class="lbl">Scanned at</div><div class="val" id="metaTime">—</div></div>
+</div>
 
-HF_TOKEN   = os.environ.get("HUGGINGFACE_TOKEN")
-HF_URL     = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
-HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+<a href="/predictions" class="predictions-btn">Predictions page →</a>
 
-NY          = pytz.timezone("America/New_York")
-MAX_ACCOUNT = float(os.environ.get("MAX_ACCOUNT", "30.00"))
+<div id="today-section">
+  <div class="empty">No scan data yet.<br>Tap "Run scan now" or wait for 10 AM or 12 PM ET.<br>Only stocks you can afford will appear here.</div>
+</div>
+<div id="yesterday-section" style="display:none;">
+  <div class="empty">No scan data yet.</div>
+</div>
 
-# ── Sentiment ─────────────────────────────────────────────────
+<script>
+let activeTab = 'today';
 
-POSITIVE_WORDS = [
-    "surge","soar","rally","beat","record","upgrade","buy","bullish","growth",
-    "profit","revenue","partnership","launch","breakthrough","strong","exceed",
-    "outperform","raise","acquire","expansion","dividend","momentum","breakout"
-]
-NEGATIVE_WORDS = [
-    "crash","plunge","drop","miss","downgrade","sell","bearish","loss","decline",
-    "lawsuit","recall","layoff","cut","weak","disappoint","probe","fraud",
-    "bankruptcy","debt","warning","risk","halt","delisted","investigation"
-]
+function showTab(tab) {
+  activeTab = tab;
+  document.getElementById('today-section').style.display     = tab==='today'     ? 'block' : 'none';
+  document.getElementById('yesterday-section').style.display = tab==='yesterday' ? 'block' : 'none';
+  document.getElementById('tab-today').className     = tab==='today'     ? 'active' : '';
+  document.getElementById('tab-yesterday').className = tab==='yesterday' ? 'active' : '';
+}
 
-def keyword_score(text):
-    t = text.lower()
-    return (sum(1 for w in POSITIVE_WORDS if w in t) -
-            sum(1 for w in NEGATIVE_WORDS if w in t))
+function rankClass(i) { return ['gold','silver','bronze','other','other'][i]||'other'; }
+function gradeClass(g) { return 'grade g'+(g||'F'); }
 
-def finbert_score(headlines):
-    if not headlines:
-        return 0, "no_news"
-    if not HF_TOKEN:
-        return sum(keyword_score(h) for h in headlines), "keyword"
-    try:
-        payload = {"inputs": headlines[:5], "options": {"wait_for_model": True}}
-        resp    = req.post(HF_URL, headers=HF_HEADERS, json=payload, timeout=15)
-        if resp.status_code != 200:
-            return sum(keyword_score(h) for h in headlines), "keyword_fallback"
-        total = 0
-        for result in resp.json():
-            sm     = {r["label"]: r["score"] for r in result}
-            total += sm.get("positive", 0) - sm.get("negative", 0)
-        return round(total, 3), "finbert"
-    except Exception as e:
-        print(f"  FinBERT error: {e}")
-        return sum(keyword_score(h) for h in headlines), "keyword_fallback"
+function renderMeta(data) {
+  document.getElementById('metaGrid').style.display = 'grid';
+  document.getElementById('metaAcct').textContent   = data.account_size  ? '$'+data.account_size.toFixed(2) : '—';
+  document.getElementById('metaRange').textContent  = data.price_range   || '—';
+  document.getElementById('metaUni').textContent    = data.universe_size ? data.universe_size+' stocks' : '—';
+  document.getElementById('metaTime').textContent   = data.scanned_at    || '—';
+}
 
-def get_headlines(api, ticker, days_back=1):
-    try:
-        end   = datetime.now(pytz.utc)
-        start = end - timedelta(days=days_back)
-        news  = api.get_news(ticker,
-                    start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    limit=10)
-        return [n.headline for n in news] if news else []
-    except:
-        return []
+function renderList(stocks, containerId) {
+  const el = document.getElementById(containerId);
+  if (!stocks || !stocks.length) {
+    el.innerHTML = '<div class="empty">No affordable stocks found in this scan.<br>Try running a manual scan.</div>';
+    return;
+  }
+  el.innerHTML = stocks.map((s, i) => {
+    const chgCls  = s.change_pct >= 0 ? 'up' : 'down';
+    const chgSign = s.change_pct >= 0 ? '+' : '';
+    const sentPos = s.sentiment  >= 0;
+    const rsSign  = s.rs_5d >= 0 ? '+' : '';
+    const method  = s.sent_method === 'finbert' ? 'FinBERT AI' : 'keyword';
 
-# ── Seed universe ─────────────────────────────────────────────
+    const volPct   = Math.min(100, (s.vol_ratio / 5) * 100);
+    const sentPct  = Math.min(100, Math.abs(typeof s.sentiment==='number' ? s.sentiment*15 : 0));
+    const rsPct    = Math.min(100, Math.abs(s.rs_5d) * 5);
+    const rangePct = Math.min(100, (s.avg_range||0) * 10);
+    const scorePct = Math.min(100, (s.score / 100) * 100);
 
-SEED_UNIVERSE = [
-    "SIRI","TELL","CLOV","NKLA","MVIS","SOFI","HOOD","NIO","MARA","RIOT",
-    "PLTR","RIVN","LCID","BITI","HBAN","KEY","VALE","ITUB","PBR","GOLD",
-    "KGC","HL","CDE","AG","EGO","BTG","NGD","PAAS","SILV","GPL",
-    "AFRM","OPEN","DKNG","CHPT","WKHS","GOEV","FSR","HYLN","SNDL","ACB",
-    "CGC","TLRY","CRON","OGI","VFF","HEXO","CWEB","SPCE","MAXN","ARRY",
-    "STEM","NOVA","SHLS","SUNW","IDEX","GNUS","EXPR","AMC","BB","NOK",
-    "XELA","MARA","MVIS","TELL","SIRI","OCGN","TIGR","XPEV","LI",
-    "F","BAC","AAL","CCL","SNAP","WISH","NAKD","KOSS",
-]
-SEED_UNIVERSE = list(dict.fromkeys(SEED_UNIVERSE))  # deduplicate, preserve order
+    return `
+    <div class="stock-card">
+      <div class="card-top">
+        <div class="rank ${rankClass(i)}">${i+1}</div>
+        <div class="ticker-block">
+          <div class="ticker-row">
+            <span class="ticker">${s.ticker}</span>
+            <span class="price">$${s.price}</span>
+            <span class="chg ${chgCls}">${chgSign}${s.change_pct}%</span>
+            <span class="${gradeClass(s.grade)}">${s.grade||'?'}</span>
+          </div>
+          <div style="font-size:10px;color:#555;">
+            5d RS: <span style="color:${s.rs_5d>=0?'#1D9E75':'#D85A30'}">${rsSign}${s.rs_5d}%</span>
+            &nbsp;·&nbsp; Range: <span style="color:#7B68EE">${s.avg_range||0}%</span>
+          </div>
+        </div>
+        <div class="score-circle">
+          <div class="score-num">${s.score}</div>
+          <div class="score-lbl">score</div>
+        </div>
+      </div>
+      <div class="bars">
+        <div class="bar-row"><span class="lbl">Volume surge</span><div class="bar-bg"><div class="bar-fill" style="width:${volPct}%;background:#4a9eff;"></div></div><span class="bar-val">${s.vol_ratio}x</span></div>
+        <div class="bar-row"><span class="lbl">Sentiment</span><div class="bar-bg"><div class="bar-fill" style="width:${sentPct}%;background:${sentPos?'#1D9E75':'#D85A30'};"></div></div><span class="bar-val">${sentPos?'+':''}${typeof s.sentiment==='number'?s.sentiment.toFixed(1):s.sentiment}</span></div>
+        <div class="bar-row"><span class="lbl">Rel. strength</span><div class="bar-bg"><div class="bar-fill" style="width:${rsPct}%;background:#C45C8A;"></div></div><span class="bar-val">${rsSign}${s.rs_5d}%</span></div>
+        <div class="bar-row"><span class="lbl">Daily range</span><div class="bar-bg"><div class="bar-fill" style="width:${rangePct}%;background:#7B68EE;"></div></div><span class="bar-val">${s.avg_range||0}%</span></div>
+        <div class="bar-row"><span class="lbl">Total score</span><div class="bar-bg"><div class="bar-fill" style="width:${scorePct}%;background:#E9A84C;"></div></div><span class="bar-val">${s.score}</span></div>
+      </div>
+      <div class="pills">
+        <span class="pill p-vol">${s.vol_ratio}x vol</span>
+        <span class="pill p-news">${s.news_count} articles</span>
+        <span class="pill ${sentPos?'p-sp':'p-sn'}">${sentPos?'+':''}${typeof s.sentiment==='number'?s.sentiment.toFixed(2):s.sentiment} sent</span>
+        <span class="pill p-rs">${rsSign}${s.rs_5d}% 5d</span>
+        <span class="pill p-rng">${s.avg_range||0}% range</span>
+        <span class="pill p-met">${method}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
 
-# ── Account sizing (no import from app — avoids circular import) ──
+function handleData(data) {
+  const btn = document.getElementById('scanBtn');
+  if (!data || !data.scanned_at) {
+    document.getElementById('scanTime').textContent = 'No scan yet — tap "Run scan now"';
+    btn.textContent = 'Run scan now'; btn.disabled = false;
+    return;
+  }
+  renderMeta(data);
+  document.getElementById('scanTime').textContent = 'Last scan: ' + (data.scanned_at||'—');
+  renderList(data.today,     'today-section');
+  renderList(data.yesterday, 'yesterday-section');
+  if (data.manual) {
+    btn.textContent = 'Scan complete ✓'; btn.disabled = false;
+    setTimeout(() => { btn.textContent = 'Run scan now'; }, 3000);
+  } else {
+    btn.textContent = 'Run scan now'; btn.disabled = false;
+  }
+}
 
-def _get_account_size(api):
-    """Local account size — does NOT import from app.py."""
-    try:
-        acct = api.get_account()
-        return min(float(acct.equity), MAX_ACCOUNT)
-    except:
-        return MAX_ACCOUNT
+function triggerManualScan() {
+  const btn = document.getElementById('scanBtn');
+  btn.textContent = 'Scanning...'; btn.disabled = true;
+  document.getElementById('scanTime').textContent = 'Scan running — takes ~30 seconds...';
+  document.getElementById(activeTab+'-section').innerHTML =
+    '<div class="loading"><div class="spinner"></div>Scanning universe...</div>';
+  fetch('/scan/manual', { method: 'POST' })
+    .catch(e => { console.error(e); btn.textContent = 'Run scan now'; btn.disabled = false; });
+  setTimeout(() => { if (btn.disabled) { btn.textContent = 'Run scan now'; btn.disabled = false; } }, 90000);
+}
 
-def _price_floor(account_size):
-    if account_size > 2000: return 5.00
-    if account_size > 500:  return 2.00
-    if account_size > 100:  return 1.00
-    return 0.50
+fetch('/scan').then(r => r.json()).then(handleData).catch(() => {
+  document.getElementById('scanTime').textContent = 'Could not load scan data';
+});
 
-def _price_ceiling(account_size):
-    return max(min(account_size * 0.45, 10.00), 0.60)
-
-def _min_volume(account_size):
-    if account_size > 5000: return 1_000_000
-    if account_size > 1000: return 500_000
-    if account_size > 200:  return 250_000
-    return 100_000
-
-# ── Bar fetching helpers ──────────────────────────────────────
-
-def safe_get_bars(api, symbols, timeframe="1Day", days_back=5, limit=5):
-    """Always uses feed=iex — required for free Alpaca accounts."""
-    try:
-        end   = datetime.now(pytz.utc)
-        start = end - timedelta(days=days_back + 2)
-        bars  = api.get_bars(
-            symbols, timeframe,
-            start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            limit=limit, feed="iex"
-        ).df
-        return bars if not bars.empty else None
-    except Exception as e:
-        print(f"  get_bars error: {e}")
-        return None
-
-def extract_sym(bars_df, sym):
-    """Safely extract a single symbol from a potentially MultiIndex DataFrame."""
-    try:
-        if bars_df is None:
-            return None
-        if hasattr(bars_df.index, 'levels'):
-            if sym not in bars_df.index.get_level_values(0):
-                return None
-            return bars_df.loc[sym]
-        return bars_df
-    except:
-        return None
-
-# ── Universe builder ──────────────────────────────────────────
-
-def build_universe(api, max_price, min_price=0.50, min_volume=100_000):
-    """
-    Checks seed list first (fast). Expands with asset list if < 15 found.
-    Returns list of {symbol, price, volume} dicts.
-    """
-    print(f"  Building universe: ${min_price}–${max_price:.2f}, vol>{min_volume:,}")
-    universe   = []
-    seen       = set()
-    batch_size = 50
-
-    # Step 1 — seed universe (fast path)
-    for i in range(0, len(SEED_UNIVERSE), batch_size):
-        batch = SEED_UNIVERSE[i:i+batch_size]
-        bars  = safe_get_bars(api, batch)
-        if bars is None:
-            continue
-        for sym in batch:
-            if sym in seen:
-                continue
-            sym_bars = extract_sym(bars, sym)
-            if sym_bars is None or len(sym_bars) < 2:
-                continue
-            try:
-                price   = float(sym_bars.iloc[-1]["close"])
-                avg_vol = float(sym_bars["volume"].mean())
-                if min_price <= price <= max_price and avg_vol >= min_volume:
-                    universe.append({"symbol": sym, "price": round(price, 2), "volume": int(avg_vol)})
-                    seen.add(sym)
-            except:
-                continue
-        time.sleep(0.3)
-
-    print(f"  Seed scan: {len(universe)} stocks")
-
-    # Step 2 — expand if needed
-    if len(universe) < 15:
-        print("  Expanding with asset list (up to 300)...")
-        try:
-            assets    = api.list_assets(status="active", asset_class="us_equity")
-            tradeable = [
-                a.symbol for a in assets
-                if a.tradable
-                and a.exchange in ("NYSE", "NASDAQ", "ARCA")
-                and not a.symbol.endswith(("W", "R", "P", "Q"))
-                and len(a.symbol) <= 5
-                and a.symbol not in seen
-            ][:300]
-
-            for i in range(0, len(tradeable), batch_size):
-                batch = tradeable[i:i+batch_size]
-                bars  = safe_get_bars(api, batch)
-                if bars is None:
-                    continue
-                for sym in batch:
-                    if sym in seen:
-                        continue
-                    sym_bars = extract_sym(bars, sym)
-                    if sym_bars is None or len(sym_bars) < 2:
-                        continue
-                    try:
-                        price   = float(sym_bars.iloc[-1]["close"])
-                        avg_vol = float(sym_bars["volume"].mean())
-                        if min_price <= price <= max_price and avg_vol >= min_volume:
-                            universe.append({"symbol": sym, "price": round(price, 2), "volume": int(avg_vol)})
-                            seen.add(sym)
-                    except:
-                        continue
-                time.sleep(0.3)
-        except Exception as e:
-            print(f"  Asset expand error: {e}")
-
-    print(f"  Universe built: {len(universe)} stocks total")
-    return universe
-
-# ── Price data fetcher ────────────────────────────────────────
-
-def get_price_data(api, ticker):
-    try:
-        bars = safe_get_bars(api, ticker, days_back=10, limit=10)
-        if bars is None:
-            return None
-        if hasattr(bars.index, 'levels'):
-            bars = extract_sym(bars, ticker)
-            if bars is None:
-                return None
-        if len(bars) < 2:
-            return None
-
-        latest     = bars.iloc[-1]
-        prev       = bars.iloc[-2]
-        price      = round(float(latest["close"]), 2)
-        prev_close = round(float(prev["close"]), 2)
-        if prev_close == 0:
-            return None
-        change_pct = round((price - prev_close) / prev_close * 100, 2)
-        avg_vol    = float(bars["volume"].mean())
-        vol_ratio  = round(float(latest["volume"]) / avg_vol, 2) if avg_vol > 0 else 1.0
-        five_day   = float(bars.iloc[max(0, len(bars)-5)]["close"])
-        rs_5d      = round((price - five_day) / five_day * 100, 2) if five_day > 0 else 0.0
-        avg_range  = float(((bars["high"] - bars["low"]) / bars["close"].replace(0, 1)).mean() * 100)
-
-        return {
-            "price":      price,
-            "prev_close": prev_close,
-            "change_pct": change_pct,
-            "vol_ratio":  vol_ratio,
-            "rs_5d":      rs_5d,
-            "avg_range":  round(avg_range, 2),
-        }
-    except Exception as e:
-        print(f"  price_data error {ticker}: {e}")
-        return None
-
-# ── Composite scoring ─────────────────────────────────────────
-
-def composite_score(pd, sentiment, news_count, account_size):
-    s  = abs(pd["change_pct"]) * 2.5
-    s += abs(pd["rs_5d"])      * 1.5
-    vr = pd["vol_ratio"]
-    if   vr > 5.0: s += 25
-    elif vr > 3.0: s += 18
-    elif vr > 2.0: s += 10
-    elif vr > 1.5: s +=  5
-    elif vr > 1.2: s +=  2
-    s += sentiment * 8
-    s += min(news_count * 2, 12)
-    if account_size < 100:
-        s += pd["avg_range"] * 2
-    elif account_size < 500:
-        s += pd["avg_range"] * 1
-    if account_size < 50:
-        if   pd["price"] < 2: s += 10
-        elif pd["price"] < 5: s +=  5
-    elif account_size < 200:
-        if   pd["price"] < 5: s +=  8
-        elif pd["price"] < 8: s +=  3
-    return round(s, 2)
-
-def risk_grade(pd):
-    score = 0
-    if pd["vol_ratio"]       < 3:  score += 2
-    if abs(pd["change_pct"]) < 5:  score += 2
-    if abs(pd["rs_5d"])      < 10: score += 2
-    if pd["avg_range"]       < 5:  score += 2
-    if pd["avg_range"]       < 3:  score += 1
-    return {9:"A",8:"A",7:"B",6:"B",5:"C",4:"C",3:"D"}.get(score, "F")
-
-# ── Per-day scan ──────────────────────────────────────────────
-
-def run_scan(api, universe, days_back=1, account_size=20):
-    label = "today" if days_back == 1 else "yesterday"
-    print(f"\n=== Scanning {len(universe)} stocks ({label}) | acct ${account_size:.2f} ===")
-    results = []
-
-    for stock in universe:
-        ticker = stock["symbol"]
-        try:
-            pd = get_price_data(api, ticker)
-            if not pd:
-                continue
-            if pd["price"] <= 0 or pd["price"] > (account_size * 0.6):
-                continue
-            headlines          = get_headlines(api, ticker, days_back=days_back)
-            sentiment, method  = finbert_score(headlines)
-            score              = composite_score(pd, sentiment, len(headlines), account_size)
-            grade              = risk_grade(pd)
-            results.append({
-                "ticker":      ticker,
-                "price":       pd["price"],
-                "change_pct":  pd["change_pct"],
-                "vol_ratio":   pd["vol_ratio"],
-                "rs_5d":       pd["rs_5d"],
-                "avg_range":   pd["avg_range"],
-                "sentiment":   sentiment,
-                "sent_method": method,
-                "news_count":  len(headlines),
-                "score":       score,
-                "grade":       grade,
-                "direction":   "up" if pd["change_pct"] > 0 else "down",
-            })
-            time.sleep(0.1)
-        except Exception as e:
-            print(f"  Scan error {ticker}: {e}")
-            continue
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-    top5 = results[:5]
-    print(f"=== Top 5 ({label}): {[(r['ticker'], r['grade'], r['score']) for r in top5]} ===")
-    return top5
-
-# ── Full scan entry point — called by app.py ─────────────────
-
-def run_full_scan(api):
-    """
-    Main entry point called by app.py scanner_loop and /scan/manual.
-    Does NOT import from app.py to avoid circular imports.
-    Derives account sizing independently.
-    """
-    account_size = _get_account_size(api)
-    max_price    = _price_ceiling(account_size)
-    min_price    = _price_floor(account_size)
-    min_vol      = _min_volume(account_size)
-
-    print(f"Full scan | account ${account_size:.2f} | range ${min_price}–${max_price:.2f}")
-
-    universe = build_universe(api, max_price, min_price, min_vol)
-
-    if not universe:
-        print("Universe empty — using fallback")
-        universe = [{"symbol": s, "price": 1.0, "volume": 500_000}
-                    for s in ["SIRI","TELL","CLOV","NKLA","MVIS",
-                               "SOFI","HOOD","NIO","MARA","RIOT"]]
-
-    today     = run_scan(api, universe, days_back=1, account_size=account_size)
-    yesterday = run_scan(api, universe, days_back=2, account_size=account_size)
-
-    return {
-        "today":         today,
-        "yesterday":     yesterday,
-        "scanned_at":    datetime.now(NY).strftime("%I:%M %p ET"),
-        "account_size":  round(account_size, 2),
-        "price_range":   f"${min_price}–${max_price:.2f}",
-        "universe_size": len(universe),
-    }
+const socket = io();
+socket.on('scan', handleData);
+socket.on('connect',    () => console.log('Scanner connected'));
+socket.on('disconnect', () => console.log('Scanner disconnected'));
+</script>
+</body>
+</html>
