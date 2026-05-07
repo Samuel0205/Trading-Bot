@@ -1,442 +1,287 @@
-"""
-backtest.py — Strategy backtester
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Backtest</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f1117; color: #e8e8e8; padding: 12px; font-size: 14px; }
+.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.back { font-size: 12px; color: #1D9E75; text-decoration: none; background: #1D9E7511; padding: 5px 10px; border-radius: 8px; }
+.toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.run-time { font-size: 11px; color: #444; }
+.run-btn { font-size: 12px; font-weight: 500; padding: 7px 16px; border-radius: 8px; border: 1px solid #1D9E7544; background: #1D9E7511; color: #1D9E75; cursor: pointer; }
+.run-btn:disabled { opacity: .4; cursor: default; }
+.status-msg { font-size: 11px; color: #E9A84C; margin-bottom: 8px; min-height: 16px; }
+.tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+.tab { padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 500; background: #1a1d27; color: #888; cursor: pointer; border: none; }
+.tab.active { background: #1D9E7522; color: #1D9E75; }
+.section { display: none; }
+.section.active { display: block; }
+.stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
+.stat-card { background: #1a1d27; border-radius: 10px; padding: 12px; }
+.stat-card .lbl { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 4px; }
+.stat-card .val { font-size: 20px; font-weight: 700; }
+.up { color: #1D9E75; } .down { color: #D85A30; }
+.chart-card { background: #1a1d27; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+.chart-wrap { position: relative; width: 100%; height: 160px; }
+.ticker-perf { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+.tp-row { background: #1a1d27; border-radius: 8px; padding: 10px 12px; display: flex; align-items: center; gap: 10px; }
+.tp-rank { font-size: 11px; color: #555; min-width: 20px; }
+.tp-sym { font-size: 13px; font-weight: 600; flex: 1; }
+.tp-pnl { font-size: 13px; font-weight: 600; min-width: 60px; text-align: right; }
+.tp-meta { font-size: 10px; color: #555; }
+.trade-list { display: flex; flex-direction: column; gap: 6px; max-height: 400px; overflow-y: auto; }
+.trade-row { background: #1a1d27; border-radius: 8px; padding: 10px 12px; font-size: 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.t-side { font-weight: 600; min-width: 32px; }
+.t-pnl  { font-weight: 600; margin-left: auto; }
+.t-reason { font-size: 10px; color: #555; }
+.config-card { background: #1a1d27; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+.config-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #2a2d3a; font-size: 12px; }
+.config-row:last-child { border-bottom: none; }
+.config-row .lbl { color: #555; }
+.config-row .val { color: #e8e8e8; font-weight: 500; }
+.compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+.compare-card { background: #1a1d27; border-radius: 10px; padding: 12px; }
+.compare-card .title { font-size: 11px; color: #555; margin-bottom: 8px; }
+.compare-stat { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 11px; }
+.compare-stat .lk { color: #666; }
+.compare-stat .vk { font-weight: 600; }
+.empty { color: #444; font-size: 13px; text-align: center; padding: 48px 16px; line-height: 1.8; }
+.loading { display: flex; align-items: center; gap: 10px; color: #555; font-size: 13px; padding: 40px 0; justify-content: center; }
+.spinner { width: 16px; height: 16px; border: 2px solid #2a2d3a; border-top-color: #1D9E75; border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
 
-Replays 3 months of daily bar data bar-by-bar through the exact
-same signal logic, weighted voting, ATR stops, trailing stops,
-and cooldowns used by the live bot.
+<div class="header">
+  <h1>Backtest</h1>
+  <a href="/" class="back">← Dashboard</a>
+</div>
 
-Limitations (honest):
-  - Daily bars only (minute bars need paid Alpaca tier)
-  - Sentiment approximated via keyword scoring
-  - 0.5% friction applied per trade to simulate spread
-  - Prediction scores set to neutral (0) since historical
-    FinBERT is too slow to run for 3 months of data
+<div class="toolbar">
+  <span id="runTime" class="run-time">Run a backtest to see results</span>
+  <button id="runBtn" class="run-btn" onclick="startBacktest()">Run backtest</button>
+</div>
+<div class="status-msg" id="statusMsg"></div>
 
-FIX vs original:
-  - Equity curve merge was mathematically wrong (added val - allocation
-    repeatedly, double-counting deltas). Now uses return-weighted merge:
-    each ticker's equity curve is converted to a return multiplier,
-    and the combined curve reflects the weighted portfolio return.
+<div class="tabs" id="tabs" style="display:none;">
+  <button class="tab active" onclick="showTab('overview')">Overview</button>
+  <button class="tab" onclick="showTab('tickers')">By ticker</button>
+  <button class="tab" onclick="showTab('trades')">Trades</button>
+  <button class="tab" onclick="showTab('compare')">Compare</button>
+  <button class="tab" onclick="showTab('config')">Config</button>
+</div>
 
-Output: full trade log + stats for each ticker universe,
-        plus a comparison between them.
-"""
+<div id="content">
+  <div class="empty">No backtest data yet.<br>Tap "Run backtest" to replay 3 months of daily data<br>through the exact same signals the live bot uses.</div>
+</div>
 
-import time
-from datetime import datetime, timedelta
-import pytz
+<script>
+let lastResult = null;
+let activeTabName = 'overview';
+let equityChart = null;
 
-# ── Config ────────────────────────────────────────────────────
-
-STARTING_CAPITAL  = 20.00
-MAX_TRADE_PCT     = 0.50
-STOP_LOSS_PCT     = 0.05
-TAKE_PROFIT_PCT   = 0.10
-FRICTION_PCT      = 0.005
-COOLDOWN_BARS     = 3
-MIN_PROFIT_PCT    = 0.03
-THRESHOLD         = 2.2
-MAX_TRADES_PER_TICKER = 30
-
-MONTHS_BACK = 3
-
-SIGNAL_WEIGHTS = {
-    "MA Crossover":   0.8,
-    "RSI":            1.2,
-    "Bollinger":      1.0,
-    "VWAP":           1.5,
-    "MACD":           1.0,
-    "Mean Reversion": 0.8,
+function showTab(name) {
+  activeTabName = name;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => { if(t.textContent.toLowerCase().includes(name.slice(0,3).toLowerCase())) t.classList.add('active'); });
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  const el = document.getElementById('sec-'+name);
+  if (el) el.classList.add('active');
+  // If clicking the compare tab, show comparison; otherwise show first universe by default
+  if (name === 'overview' || name === 'tickers' || name === 'trades') {
+    const names = Object.keys(lastResult?.results || {});
+    if (names.length) renderUniverse(names[0]);
+  }
 }
 
-CURRENT_TICKERS = ["AMC","BB","NOK","OCGN","SHLS","SIRI","TELL","MVIS","NIO","CLOV"]
+function pct(v) { return (v >= 0 ? '+' : '') + v + '%'; }
+function dollar(v) { return (v >= 0 ? '+' : '') + '$' + Math.abs(v).toFixed(2); }
+function colorClass(v) { return v >= 0 ? 'up' : 'down'; }
 
-BROAD_UNIVERSE = [
-    "SIRI","TELL","AMC","BB","NOK","MVIS","NIO","MARA","SOFI","CLOV",
-    "NKLA","OCGN","SHLS","IDEX","GNUS","NAKD","KOSS","XELA","EXPR",
-    "PLTR","RIVN","LCID","RIOT","ACB","CGC","TLRY","SNDL","SPCE","CHPT"
-]
+function renderUniverse(name) {
+  if (!lastResult || !lastResult.results[name]) return;
+  const u  = lastResult.results[name];
+  const s  = u.stats;
+  const ec = u.equity_curve || [];
 
-# ── Indicators (identical to live bot) ───────────────────────
+  // Stats grid
+  document.getElementById('stats-grid').innerHTML = [
+    { lbl:'Total return', val: dollar(s.total_return), cls: colorClass(s.total_return) },
+    { lbl:'Return %',     val: pct(s.return_pct),      cls: colorClass(s.return_pct) },
+    { lbl:'Win rate',     val: s.win_rate+'%',          cls: s.win_rate >= 50 ? 'up' : 'down' },
+    { lbl:'Total trades', val: s.total_trades,          cls: '' },
+    { lbl:'Sharpe ratio', val: s.sharpe,                cls: s.sharpe >= 1 ? 'up' : 'down' },
+    { lbl:'Max drawdown', val: dollar(-Math.abs(s.max_drawdown)), cls: 'down' },
+    { lbl:'Best trade',   val: dollar(s.best_trade),    cls: 'up' },
+    { lbl:'Worst trade',  val: dollar(s.worst_trade),   cls: 'down' },
+    { lbl:'Avg hold',     val: s.avg_hold_bars+' days', cls: '' },
+    { lbl:'Wins/Losses',  val: s.wins+' / '+s.losses,   cls: '' },
+  ].map(c => `<div class="stat-card"><div class="lbl">${c.lbl}</div><div class="val ${c.cls}">${c.val}</div></div>`).join('');
 
-def calc_rsi(prices, period=14):
-    if len(prices) < period + 1: return 50
-    gains = losses = 0
-    for i in range(-period, 0):
-        d = prices[i] - prices[i-1]
-        if d > 0: gains += d
-        else:     losses += abs(d)
-    if losses == 0: return 100
-    return 100 - (100 / (1 + gains / losses))
-
-def calc_ma(prices, n):
-    s = prices[-n:] if len(prices) >= n else prices
-    return sum(s) / len(s)
-
-def calc_bollinger(prices, n=20):
-    s    = prices[-n:] if len(prices) >= n else prices
-    mean = sum(s) / len(s)
-    std  = (sum((v - mean)**2 for v in s) / len(s)) ** 0.5
-    return mean, mean + 2*std, mean - 2*std
-
-def calc_vwap(prices, volumes):
-    if not prices or not volumes or sum(volumes) == 0:
-        return prices[-1] if prices else 0
-    return sum(p*v for p,v in zip(prices,volumes)) / sum(volumes)
-
-def calc_macd(prices):
-    def ema(data, period):
-        if len(data) < period: return data[-1] if data else 0
-        k = 2 / (period + 1)
-        val = sum(data[:period]) / period
-        for p in data[period:]: val = p*k + val*(1-k)
-        return val
-    if len(prices) < 26: return 0
-    return ema(prices, 12) - ema(prices, 26)
-
-def calc_atr(highs, lows, closes, period=10):
-    if len(closes) < 2: return closes[-1] * 0.02 if closes else 0
-    trs = []
-    for i in range(1, min(len(closes), period+1)):
-        trs.append(max(
-            highs[i] - lows[i],
-            abs(highs[i]  - closes[i-1]),
-            abs(lows[i]   - closes[i-1])
-        ))
-    return sum(trs) / len(trs) if trs else closes[-1] * 0.02
-
-def get_signals(hist_closes, hist_volumes, price):
-    if len(hist_closes) < 5:
-        return {n: "hold" for n in SIGNAL_WEIGHTS}
-
-    rsi              = calc_rsi(hist_closes)
-    ma50             = calc_ma(hist_closes, min(50, len(hist_closes)))
-    ma200            = calc_ma(hist_closes, min(200, len(hist_closes)))
-    mean, upper, lower = calc_bollinger(hist_closes)
-    vwap             = calc_vwap(hist_closes[-20:], hist_volumes[-20:])
-    macd_line        = calc_macd(hist_closes)
-    z_score          = (price - mean) / max((upper - mean), 0.01)
-    ma_conf          = min(1.0, len(hist_closes) / 20)
-
-    def act(bc, sc):
-        if bc: return "buy"
-        if sc: return "sell"
-        return "hold"
-
-    return {
-        "MA Crossover":   act(ma50>ma200*1.005, ma200>ma50*1.005) if ma_conf > 0.5 else "hold",
-        "RSI":            act(rsi<35, rsi>65),
-        "Bollinger":      act(price<lower*0.99, price>upper*1.01),
-        "VWAP":           act(price>vwap*1.001, price<vwap*0.999),
-        "MACD":           act(macd_line>0, macd_line<0),
-        "Mean Reversion": act(price<mean*0.96, price>mean*1.04),
+  // Equity curve
+  if (equityChart) { equityChart.destroy(); equityChart = null; }
+  const labels = ec.map((_, i) => 'D'+i);
+  const color  = ec.length && ec[ec.length-1] >= ec[0] ? '#1D9E75' : '#D85A30';
+  equityChart = new Chart(document.getElementById('equityChart'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{ data: ec, borderColor: color, borderWidth: 2, fill: true,
+        backgroundColor: color+'18', pointRadius: 0, tension: 0.3 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        y: { ticks: { color:'#555', font:{size:11}, callback: v=>'$'+v.toFixed(2) }, grid:{color:'#1e2130'} },
+        x: { ticks: { color:'#444', font:{size:9}, maxTicksLimit:8 }, grid:{display:false} }
+      }
     }
+  });
 
-def weighted_vote(signal_actions):
-    buy_w = sell_w = 0.0
-    for name, action in signal_actions.items():
-        w = SIGNAL_WEIGHTS.get(name, 1.0)
-        if   action == "buy":  buy_w  += w
-        elif action == "sell": sell_w += w
-    return round(buy_w, 2), round(sell_w, 2)
+  // Ticker performance
+  const tp = u.tickers_tested || [];
+  document.getElementById('ticker-perf').innerHTML = tp.map((t, i) => {
+    const sign = t.pnl >= 0 ? '+' : '';
+    return `<div class="tp-row">
+      <span class="tp-rank">${i+1}</span>
+      <span class="tp-sym">${t.ticker}</span>
+      <span class="tp-meta">${t.trades} trades · ${t.win_rate}% wr</span>
+      <span class="tp-pnl ${colorClass(t.pnl)}">${sign}$${Math.abs(t.pnl).toFixed(2)}</span>
+    </div>`;
+  }).join('') || '<div style="color:#555;font-size:12px;padding:8px;">No ticker data</div>';
 
-# ── Data fetcher ──────────────────────────────────────────────
+  // Trade list
+  const trades = u.trades || [];
+  document.getElementById('trade-list').innerHTML = trades.slice(0, 80).map(t => {
+    const pnlSign = t.pnl >= 0 ? '+' : '';
+    const entPct  = ((t.exit - t.entry) / t.entry * 100).toFixed(1);
+    return `<div class="trade-row">
+      <span class="t-side ${t.pnl>=0?'up':'down'}">${t.ticker}</span>
+      <span style="color:#555;font-size:10px;">${t.date_entry||''}</span>
+      <span style="color:#888;">$${t.entry} → $${t.exit}</span>
+      <span class="t-reason">${t.reason||''} · ${t.bars_held}d</span>
+      <span class="t-pnl ${colorClass(t.pnl)}">${pnlSign}$${Math.abs(t.pnl).toFixed(2)} (${entPct}%)</span>
+    </div>`;
+  }).join('') || '<div style="color:#555;font-size:12px;padding:8px;">No trades</div>';
+}
 
-def fetch_bars(api, ticker):
-    try:
-        end   = datetime.now(pytz.utc) - timedelta(days=1)
-        start = end - timedelta(days=MONTHS_BACK * 31)
-        bars  = api.get_bars(
-            ticker, "1Day",
-            start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            feed="iex"
-        ).df
+function renderCompare() {
+  if (!lastResult) return;
+  const names = Object.keys(lastResult.results);
+  document.getElementById('compare-grid').innerHTML = names.map(name => {
+    const s = lastResult.results[name].stats;
+    return `<div class="compare-card">
+      <div class="title">${name}</div>
+      <div class="compare-stat"><span class="lk">Return</span><span class="vk ${colorClass(s.total_return)}">${pct(s.return_pct)}</span></div>
+      <div class="compare-stat"><span class="lk">Win rate</span><span class="vk">${s.win_rate}%</span></div>
+      <div class="compare-stat"><span class="lk">Trades</span><span class="vk">${s.total_trades}</span></div>
+      <div class="compare-stat"><span class="lk">Sharpe</span><span class="vk ${s.sharpe>=1?'up':'down'}">${s.sharpe}</span></div>
+      <div class="compare-stat"><span class="lk">Max DD</span><span class="vk down">-$${Math.abs(s.max_drawdown).toFixed(2)}</span></div>
+      <div class="compare-stat"><span class="lk">Avg hold</span><span class="vk">${s.avg_hold_bars}d</span></div>
+    </div>`;
+  }).join('');
+}
 
-        if bars is None or bars.empty:
-            return None
+function renderResult(data) {
+  lastResult = data;
+  if (!data || !data.results || !Object.keys(data.results).length) return;
 
-        if hasattr(bars.index, 'levels'):
-            if ticker in bars.index.get_level_values(0):
-                bars = bars.loc[ticker]
-            else:
-                return None
+  document.getElementById('tabs').style.display = 'flex';
+  document.getElementById('runTime').textContent = 'Run at ' + (data.run_at || '—');
 
-        return bars if len(bars) >= 30 else None
-    except Exception as e:
-        print(f"  fetch_bars error {ticker}: {e}")
-        return None
+  const cfg = data.config || {};
+  document.getElementById('config-rows').innerHTML = [
+    { l:'Starting capital',  v:'$'+cfg.starting_capital },
+    { l:'Months back',       v:cfg.months_back+' months' },
+    { l:'Vote threshold',    v:cfg.threshold },
+    { l:'Stop loss',         v:(cfg.stop_loss_pct*100).toFixed(0)+'%' },
+    { l:'Take profit',       v:(cfg.take_profit_pct*100).toFixed(0)+'%' },
+    { l:'Friction per trade',v:(cfg.friction_pct*100).toFixed(1)+'%' },
+    { l:'Cooldown bars',     v:cfg.cooldown_bars+' days' },
+  ].map(r=>`<div class="config-row"><span class="lbl">${r.l}</span><span class="val">${r.v}</span></div>`).join('');
 
-# ── Single ticker backtest ────────────────────────────────────
+  document.getElementById('content').innerHTML = `
+    <div id="sec-overview" class="section active">
+      <div class="stats-grid" id="stats-grid"></div>
+      <div class="chart-card">
+        <div style="font-size:11px;color:#555;margin-bottom:10px;text-transform:uppercase;">Equity curve</div>
+        <div class="chart-wrap"><canvas id="equityChart"></canvas></div>
+      </div>
+    </div>
+    <div id="sec-tickers" class="section">
+      <div class="ticker-perf" id="ticker-perf"></div>
+    </div>
+    <div id="sec-trades" class="section">
+      <div class="trade-list" id="trade-list"></div>
+    </div>
+    <div id="sec-compare" class="section">
+      <div class="compare-grid" id="compare-grid"></div>
+    </div>
+    <div id="sec-config" class="section">
+      <div class="config-card" id="config-rows"></div>
+    </div>
+  `;
 
-def backtest_ticker(ticker, bars, starting_cash):
-    closes  = list(bars["close"])
-    highs   = list(bars["high"])
-    lows    = list(bars["low"])
-    volumes = list(bars["volume"])
-    dates   = list(bars.index)
+  const names = Object.keys(data.results);
+  if (names.length) renderUniverse(names[0]);
+  renderCompare();
+  document.getElementById('tabs').querySelectorAll('.tab').forEach((t,i)=>{
+    t.onclick = () => {
+      const tabNames = ['overview','tickers','trades','compare','config'];
+      showTab(tabNames[i]);
+    };
+  });
+}
 
-    cash         = starting_cash
-    position     = None
-    trades       = []
-    cooldown_bar = -1
-    trade_count  = 0
-    equity_curve = [starting_cash]
+function startBacktest() {
+  const btn = document.getElementById('runBtn');
+  btn.textContent = 'Running...'; btn.disabled = true;
+  document.getElementById('statusMsg').textContent = 'Fetching 3 months of bar data...';
+  document.getElementById('content').innerHTML =
+    '<div class="loading"><div class="spinner"></div>Running backtest — takes 1–2 minutes...</div>';
+  document.getElementById('tabs').style.display = 'none';
+  fetch('/backtest/run', { method: 'POST' })
+    .catch(e => {
+      console.error(e);
+      document.getElementById('statusMsg').textContent = 'Error starting backtest';
+      btn.textContent = 'Run backtest'; btn.disabled = false;
+    });
+  setTimeout(() => { if (btn.disabled) { btn.textContent = 'Run backtest'; btn.disabled = false; } }, 180000);
+}
 
-    hist_closes  = []
-    hist_volumes = []
+// Load existing results
+fetch('/backtest/data').then(r=>r.json()).then(data=>{
+  if (data && data.results && Object.keys(data.results).length) renderResult(data);
+}).catch(()=>{});
 
-    for i, (close, high, low, vol, date) in enumerate(
-            zip(closes, highs, lows, volumes, dates)):
-
-        hist_closes.append(close)
-        hist_volumes.append(vol)
-
-        pos_value = position["qty"] * close if position else 0
-        equity_curve.append(round(cash + pos_value, 4))
-
-        if position:
-            # Trailing stop
-            if close > position["entry"] * 1.05:
-                new_stop = max(position["stop"], position["entry"] * 1.01)
-                position["stop"] = new_stop
-
-            # Stop loss
-            if close <= position["stop"]:
-                proceeds = position["qty"] * close * (1 - FRICTION_PCT)
-                pnl      = round(proceeds - position["cost"], 4)
-                cash    += proceeds
-                trades.append({
-                    "ticker": ticker, "entry": position["entry"], "exit": close,
-                    "qty": position["qty"], "pnl": pnl, "reason": "stop_loss",
-                    "bars_held": i - position["entry_idx"],
-                    "date_exit": str(date)[:10], "date_entry": position["date_entry"],
-                })
-                position     = None
-                cooldown_bar = i + COOLDOWN_BARS
-                continue
-
-            # Take profit
-            if close >= position["target"]:
-                proceeds = position["qty"] * close * (1 - FRICTION_PCT)
-                pnl      = round(proceeds - position["cost"], 4)
-                cash    += proceeds
-                trades.append({
-                    "ticker": ticker, "entry": position["entry"], "exit": close,
-                    "qty": position["qty"], "pnl": pnl, "reason": "take_profit",
-                    "bars_held": i - position["entry_idx"],
-                    "date_exit": str(date)[:10], "date_entry": position["date_entry"],
-                })
-                position     = None
-                cooldown_bar = i + COOLDOWN_BARS
-                continue
-
-        if i <= cooldown_bar or trade_count >= MAX_TRADES_PER_TICKER:
-            continue
-        if len(hist_closes) < 10:
-            continue
-
-        sigs          = get_signals(hist_closes[:-1], hist_volumes[:-1], close)
-        buy_w, sell_w = weighted_vote(sigs)
-
-        if not position and buy_w >= THRESHOLD and cash >= close:
-            atr    = calc_atr(highs[max(0,i-10):i+1], lows[max(0,i-10):i+1], closes[max(0,i-10):i+1])
-            stop   = close - (atr * 1.5) if atr > 0 else close * (1 - STOP_LOSS_PCT)
-            target = close + (atr * 3.0) if atr > 0 else close * (1 + TAKE_PROFIT_PCT)
-            stop   = max(stop,   close * 0.90)
-            stop   = min(stop,   close * 0.98)
-            target = max(target, close * (1 + MIN_PROFIT_PCT))
-
-            if (target - close) / close < MIN_PROFIT_PCT:
-                continue
-
-            max_spend = cash * MAX_TRADE_PCT
-            qty       = max(0, int(max_spend / close))
-            if qty == 0: continue
-
-            cost  = qty * close * (1 + FRICTION_PCT)
-            if cost > cash: continue
-
-            cash -= cost
-            position = {
-                "entry":      close, "stop": stop, "target": target,
-                "qty":        qty,   "cost": cost, "entry_idx": i,
-                "date_entry": str(date)[:10],
-            }
-            trade_count += 1
-
-        elif position and sell_w >= THRESHOLD:
-            proceeds = position["qty"] * close * (1 - FRICTION_PCT)
-            pnl      = round(proceeds - position["cost"], 4)
-            cash    += proceeds
-            trades.append({
-                "ticker": ticker, "entry": position["entry"], "exit": close,
-                "qty": position["qty"], "pnl": pnl, "reason": "signal",
-                "bars_held": i - position["entry_idx"],
-                "date_exit": str(date)[:10], "date_entry": position["date_entry"],
-            })
-            position     = None
-            cooldown_bar = i + COOLDOWN_BARS
-
-    # Force close at end
-    if position and closes:
-        last_close = closes[-1]
-        proceeds   = position["qty"] * last_close * (1 - FRICTION_PCT)
-        pnl        = round(proceeds - position["cost"], 4)
-        cash      += proceeds
-        trades.append({
-            "ticker": ticker, "entry": position["entry"], "exit": last_close,
-            "qty": position["qty"], "pnl": pnl, "reason": "end_of_test",
-            "bars_held": len(closes) - position["entry_idx"],
-            "date_exit": str(dates[-1])[:10], "date_entry": position["date_entry"],
-        })
-
-    return trades, round(cash, 4), equity_curve
-
-# ── Stats calculator ──────────────────────────────────────────
-
-def calc_stats(trades, starting_capital, final_equity, equity_curve):
-    if not trades:
-        return {
-            "total_trades":0,"win_rate":0,"total_return":0,"return_pct":0,
-            "max_drawdown":0,"max_dd_pct":0,"sharpe":0,"avg_hold_bars":0,
-            "best_trade":0,"worst_trade":0,"wins":0,"losses":0,"avg_win":0,"avg_loss":0,
-        }
-
-    wins      = [t for t in trades if t["pnl"] > 0]
-    losses    = [t for t in trades if t["pnl"] <= 0]
-    pnls      = [t["pnl"] for t in trades]
-    total_ret = final_equity - starting_capital
-
-    peak   = starting_capital
-    max_dd = 0.0
-    for val in equity_curve:
-        if val > peak: peak = val
-        dd = peak - val
-        if dd > max_dd: max_dd = dd
-
-    if len(equity_curve) > 1:
-        daily_rets = [(equity_curve[i] - equity_curve[i-1]) / equity_curve[i-1]
-                      for i in range(1, len(equity_curve))
-                      if equity_curve[i-1] > 0]
-        if daily_rets:
-            avg_ret = sum(daily_rets) / len(daily_rets)
-            std_ret = (sum((r - avg_ret)**2 for r in daily_rets) / len(daily_rets)) ** 0.5
-            sharpe  = round((avg_ret / std_ret) * (252**0.5), 2) if std_ret > 0 else 0
-        else:
-            sharpe = 0
-    else:
-        sharpe = 0
-
-    avg_hold = round(sum(t["bars_held"] for t in trades) / len(trades), 1)
-
-    return {
-        "total_trades":  len(trades),
-        "win_rate":      round(len(wins) / len(trades) * 100, 1),
-        "total_return":  round(total_ret, 2),
-        "return_pct":    round(total_ret / starting_capital * 100, 1),
-        "max_drawdown":  round(max_dd, 2),
-        "max_dd_pct":    round(max_dd / starting_capital * 100, 1),
-        "sharpe":        sharpe,
-        "avg_hold_bars": avg_hold,
-        "best_trade":    round(max(pnls), 2),
-        "worst_trade":   round(min(pnls), 2),
-        "wins":          len(wins),
-        "losses":        len(losses),
-        "avg_win":       round(sum(t["pnl"] for t in wins)   / max(len(wins),   1), 2),
-        "avg_loss":      round(sum(t["pnl"] for t in losses) / max(len(losses), 1), 2),
-    }
-
-# ── Master backtest runner ────────────────────────────────────
-
-def run_backtest(api, universe_name="current"):
-    universes = {}
-    if universe_name in ("current", "both"):
-        universes["Current tickers"] = CURRENT_TICKERS
-    if universe_name in ("broad", "both"):
-        universes["Broad universe"] = BROAD_UNIVERSE
-
-    results = {}
-
-    for name, tickers in universes.items():
-        print(f"\n=== Backtesting {name} ({len(tickers)} tickers) ===")
-        all_trades     = []
-        tickers_tested = []
-
-        # Per-ticker allocation
-        allocation = STARTING_CAPITAL / len(tickers)
-
-        # Store each ticker's equity curve as return multipliers
-        # FIX: original merged curves by adding (val - allocation) which double-counted
-        # New approach: convert each curve to returns, sum weighted returns into portfolio curve
-        all_curves = []  # list of (allocation, equity_curve)
-
-        for ticker in tickers:
-            print(f"  Fetching {ticker}...")
-            bars = fetch_bars(api, ticker)
-            if bars is None:
-                print(f"  {ticker}: no data — skipping")
-                continue
-
-            t_trades, t_final, t_curve = backtest_ticker(ticker, bars, allocation)
-
-            all_trades.extend(t_trades)
-            all_curves.append((allocation, t_curve))
-            tickers_tested.append({
-                "ticker":   ticker,
-                "trades":   len(t_trades),
-                "pnl":      round(t_final - allocation, 2),
-                "final":    round(t_final, 2),
-                "win_rate": round(
-                    len([t for t in t_trades if t["pnl"]>0]) / max(len(t_trades), 1) * 100, 1
-                ),
-            })
-            time.sleep(0.3)
-
-        # FIX: build combined equity curve correctly
-        # Convert each ticker's curve to fractional returns from its start
-        # Then reconstruct portfolio curve: sum of (allocation * return_multiplier)
-        if all_curves:
-            max_len = max(len(c) for _, c in all_curves)
-            portfolio_curve = []
-            for i in range(max_len):
-                port_val = 0
-                for alloc, curve in all_curves:
-                    if i < len(curve):
-                        # Return relative to start of this ticker's allocation
-                        ret_mult  = curve[i] / curve[0] if curve[0] > 0 else 1.0
-                        port_val += alloc * ret_mult
-                    else:
-                        # Use final value if curve ended early
-                        ret_mult  = curve[-1] / curve[0] if curve[0] > 0 else 1.0
-                        port_val += alloc * ret_mult
-                portfolio_curve.append(round(port_val, 2))
-        else:
-            portfolio_curve = [STARTING_CAPITAL]
-
-        all_trades.sort(key=lambda t: t.get("date_entry",""), reverse=True)
-        final_equity = portfolio_curve[-1] if portfolio_curve else STARTING_CAPITAL
-        stats        = calc_stats(all_trades, STARTING_CAPITAL, final_equity, portfolio_curve)
-
-        results[name] = {
-            "stats":          stats,
-            "trades":         all_trades[:50],
-            "equity_curve":   [round(v, 2) for v in portfolio_curve],
-            "tickers_tested": sorted(tickers_tested, key=lambda t: t["pnl"], reverse=True),
-        }
-        print(f"=== {name} done | {stats['total_trades']} trades | "
-              f"return {stats['return_pct']:+.1f}% | win rate {stats['win_rate']}% ===")
-
-    return {
-        "results":  results,
-        "config": {
-            "starting_capital": STARTING_CAPITAL,
-            "months_back":      MONTHS_BACK,
-            "threshold":        THRESHOLD,
-            "stop_loss_pct":    STOP_LOSS_PCT,
-            "take_profit_pct":  TAKE_PROFIT_PCT,
-            "friction_pct":     FRICTION_PCT,
-            "cooldown_bars":    COOLDOWN_BARS,
-        },
-        "run_at": datetime.now(pytz.timezone("America/New_York")).strftime("%I:%M %p ET %b %d"),
-    }
+const socket = io();
+socket.on('backtest_result', data => {
+  document.getElementById('runBtn').textContent = 'Run backtest';
+  document.getElementById('runBtn').disabled = false;
+  document.getElementById('statusMsg').textContent = '';
+  renderResult(data);
+});
+socket.on('backtest_status', data => {
+  const msg = document.getElementById('statusMsg');
+  if (data.status === 'running') {
+    msg.textContent = data.message || 'Running...';
+  } else if (data.status === 'error') {
+    msg.textContent = 'Error: ' + (data.message || 'unknown');
+    msg.style.color = '#D85A30';
+    document.getElementById('runBtn').textContent = 'Run backtest';
+    document.getElementById('runBtn').disabled = false;
+  } else if (data.status === 'done') {
+    msg.textContent = '';
+  }
+});
+</script>
+</body>
+</html>
