@@ -2,12 +2,12 @@
 predictions.py — Multi-factor prediction engine
 
 Features:
-  - 3-day news sentiment trend (FinBERT or keyword fallback)
+  - 3-day news sentiment trend (FinBERT via HuggingFace API or keyword fallback)
   - Next-day price direction (momentum trajectory + acceleration)
   - Volatility forecast (ATR expansion/contraction)
   - Pattern recognition (channels, breakouts, V-recovery)
   - Earnings risk flag
-  - Market condition forecast (regime + fear proxy)
+  - Market condition forecast (regime + fear proxy via UVXY)
   - Multi-timeframe confirmation (daily trend vs intraday)
 
 Output: prediction_score (-100 to +100) per ticker
@@ -84,11 +84,6 @@ def keyword_score(text):
 # ── Feature 1: Multi-timeframe confirmation ───────────────────
 
 def multi_timeframe_analysis(api, ticker):
-    """
-    Checks daily trend direction.
-    Returns: trend_bias (+1 bullish, -1 bearish, 0 neutral), details
-    This is used to filter out trades that go against the daily trend.
-    """
     bars = safe_bars(api, ticker, timeframe="1Day", days=15, limit=15)
     if bars is None or len(bars) < 5:
         return 0, "insufficient_data"
@@ -97,10 +92,8 @@ def multi_timeframe_analysis(api, ticker):
     ma5    = calc_ma(closes, min(5,  len(closes)))
     ma10   = calc_ma(closes, min(10, len(closes)))
     latest = closes[-1]
-
-    # Daily higher highs / lower lows
-    highs = list(bars["high"])
-    lows  = list(bars["low"])
+    highs  = list(bars["high"])
+    lows   = list(bars["low"])
     hh = len(highs) >= 4 and highs[-1] > highs[-3]
     ll = len(lows)  >= 4 and lows[-1]  < lows[-3]
     hl = len(lows)  >= 4 and lows[-1]  > lows[-3]
@@ -119,10 +112,6 @@ def multi_timeframe_analysis(api, ticker):
 # ── Feature 2: 3-day news sentiment trend ────────────────────
 
 def news_sentiment_trend(api, ticker):
-    """
-    Returns trend direction of news sentiment over 3 days.
-    Improving = bullish signal. Worsening = bearish signal.
-    """
     daily_scores = []
     for days_ago in [3, 2, 1]:
         try:
@@ -164,10 +153,6 @@ def news_sentiment_trend(api, ticker):
 # ── Feature 3: Price direction predictor ─────────────────────
 
 def price_direction_predictor(bars):
-    """
-    Momentum trajectory — is price accelerating or decelerating?
-    Returns score (-40 to +40), confidence, signals used.
-    """
     if bars is None or len(bars) < 5:
         return 0, "low", []
 
@@ -176,7 +161,6 @@ def price_direction_predictor(bars):
     score   = 0
     signals = []
 
-    # 3-day momentum
     if len(closes) >= 4:
         mom = (closes[-1] - closes[-4]) / closes[-4] * 100 if closes[-4] > 0 else 0
         if   mom >  3: score += 10; signals.append(f"3d momentum +{mom:.1f}%")
@@ -184,7 +168,6 @@ def price_direction_predictor(bars):
         elif mom < -3: score -= 10; signals.append(f"3d momentum {mom:.1f}%")
         elif mom < -1: score -=  5; signals.append(f"3d momentum {mom:.1f}%")
 
-    # Momentum acceleration
     if len(closes) >= 6:
         recent = closes[-1] - closes[-3]
         prior  = closes[-3] - closes[-5]
@@ -195,9 +178,8 @@ def price_direction_predictor(bars):
         elif recent > 0 and recent < prior:
             score -= 3; signals.append("momentum decelerating")
 
-    # Volume confirmation
     if len(volumes) >= 3:
-        avg_vol  = sum(volumes[-10:]) / min(len(volumes), 10)
+        avg_vol   = sum(volumes[-10:]) / min(len(volumes), 10)
         vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1
         last_move = closes[-1] - closes[-2] if len(closes) >= 2 else 0
         if last_move > 0 and vol_ratio > 1.5:
@@ -207,7 +189,6 @@ def price_direction_predictor(bars):
         elif last_move > 0 and vol_ratio < 0.7:
             score -= 3; signals.append("weak volume on up day")
 
-    # MA alignment
     if len(closes) >= 10:
         ma5  = calc_ma(closes, 5)
         ma10 = calc_ma(closes, 10)
@@ -217,7 +198,6 @@ def price_direction_predictor(bars):
         elif p < ma5 < ma10:
             score -= 7; signals.append("price < MA5 < MA10")
 
-    # Consecutive closes
     if len(closes) >= 3:
         if closes[-1] > closes[-2] > closes[-3]:
             score += 5; signals.append("2 consecutive up closes")
@@ -231,13 +211,12 @@ def price_direction_predictor(bars):
 # ── Feature 4: Volatility forecast ───────────────────────────
 
 def volatility_forecast(bars):
-    """ATR expansion = bigger moves. Contraction = breakout building."""
     if bars is None or len(bars) < 6:
         return 0, "unknown", {}
     try:
-        mid         = len(bars) // 2
-        atr_prior   = calc_atr(bars.iloc[:mid])
-        atr_recent  = calc_atr(bars.iloc[mid:])
+        mid        = len(bars) // 2
+        atr_prior  = calc_atr(bars.iloc[:mid])
+        atr_recent = calc_atr(bars.iloc[mid:])
         if atr_prior == 0:
             return 0, "unknown", {}
         ratio   = atr_recent / atr_prior
@@ -280,7 +259,7 @@ def pattern_recognition(bars):
             lh = highs[-1] < highs[-3] < highs[-5]
             ll = lows[-1]  < lows[-3]  < lows[-5]
             if hh and hl:
-                score = 20; pattern = "uptrend";   desc = "Higher highs and higher lows"
+                score = 20; pattern = "uptrend";    desc = "Higher highs and higher lows"
             elif lh and ll:
                 score = -20; pattern = "downtrend"; desc = "Lower highs and lower lows"
 
@@ -333,9 +312,9 @@ def earnings_risk(api, ticker):
                  "results","beat","miss","q1","q2","q3","q4"]
         hits  = sum(1 for n in (news or [])
                     if any(w in n.headline.lower() for w in words))
-        if hits >= 2:     return "high",    -20
-        elif hits == 1 or count > 15: return "medium", -8
-        else:             return "low",       0
+        if hits >= 2:                  return "high",    -20
+        elif hits == 1 or count > 15:  return "medium",  -8
+        else:                          return "low",       0
     except:
         return "unknown", 0
 
@@ -353,13 +332,13 @@ def market_condition_forecast(api, regime):
             vix_falling = vix_move < -5
 
         score = 0; condition = "neutral"
-        if   regime == "trending_up"   and vix_falling: score = 15;  condition = "bullish"
-        elif regime == "trending_up"   and not vix_rising: score = 8; condition = "mildly_bullish"
-        elif regime == "trending_down" and vix_rising:  score = -15; condition = "bearish"
-        elif regime == "trending_down" and not vix_falling: score = -8; condition = "mildly_bearish"
-        elif regime == "ranging":  score = 2;  condition = "neutral"
-        elif vix_rising:           score = -10; condition = "elevated_fear"
-        elif vix_falling:          score = 5;  condition = "calming"
+        if   regime == "trending_up"   and vix_falling:      score = 15;  condition = "bullish"
+        elif regime == "trending_up"   and not vix_rising:   score = 8;   condition = "mildly_bullish"
+        elif regime == "trending_down" and vix_rising:       score = -15; condition = "bearish"
+        elif regime == "trending_down" and not vix_falling:  score = -8;  condition = "mildly_bearish"
+        elif regime == "ranging":                             score = 2;   condition = "neutral"
+        elif vix_rising:                                      score = -10; condition = "elevated_fear"
+        elif vix_falling:                                     score = 5;   condition = "calming"
 
         return condition, score, round(vix_move, 1)
     except Exception as e:
@@ -370,10 +349,9 @@ def market_condition_forecast(api, regime):
 
 def calculate_stops(api, ticker, entry_price, stop_pct=0.05, target_pct=0.10):
     """
-    Calculates ATR-adjusted stop and target.
-    Uses 1.5x ATR for stop (respects normal volatility).
-    Uses 3x ATR for target (2:1 reward/risk minimum).
-    Falls back to percentage if ATR not available.
+    ATR-adjusted stop and target.
+    Stop:   entry - (ATR × 1.5)   — room for normal volatility
+    Target: entry + (ATR × 3.0)   — 2:1 reward/risk minimum
     """
     bars = safe_bars(api, ticker, days=10, limit=10)
     if bars is not None and len(bars) >= 5:
@@ -381,20 +359,17 @@ def calculate_stops(api, ticker, entry_price, stop_pct=0.05, target_pct=0.10):
         if atr > 0:
             stop   = round(entry_price - (atr * 1.5), 3)
             target = round(entry_price + (atr * 3.0), 3)
-            # Ensure stop isn't tighter than 2% or wider than 10%
             stop   = max(stop,   entry_price * 0.90)
             stop   = min(stop,   entry_price * 0.98)
             target = max(target, entry_price * 1.05)
             return stop, target, round(atr, 4)
-
-    # Fallback to fixed percentages
     return (
-        round(entry_price * (1 - stop_pct),   3),
-        round(entry_price * (1 + target_pct),  3),
+        round(entry_price * (1 - stop_pct),  3),
+        round(entry_price * (1 + target_pct), 3),
         None
     )
 
-# ── Master prediction ─────────────────────────────────────────
+# ── Master prediction for one ticker ─────────────────────────
 
 def predict_ticker(api, ticker, regime="ranging"):
     result = {
@@ -411,27 +386,19 @@ def predict_ticker(api, ticker, regime="ranging"):
     try:
         bars = safe_bars(api, ticker, days=20, limit=20)
 
-        # Multi-timeframe first — this gates everything else
-        tf_bias, tf_detail = multi_timeframe_analysis(api, ticker)
+        tf_bias, tf_detail             = multi_timeframe_analysis(api, ticker)
+        sent_score, sent_dir, sent_daily = news_sentiment_trend(api, ticker)
+        dir_score,  dir_conf, dir_sigs   = price_direction_predictor(bars)
+        vol_score,  vol_state, vol_det   = volatility_forecast(bars)
+        pat_score,  pat_name,  pat_desc  = pattern_recognition(bars)
+        earn_risk_lv, earn_adj           = earnings_risk(api, ticker)
+        mkt_cond,   mkt_score, vix_move  = market_condition_forecast(api, regime)
 
-        sent_score,  sent_dir,   sent_daily = news_sentiment_trend(api, ticker)
-        dir_score,   dir_conf,   dir_sigs   = price_direction_predictor(bars)
-        vol_score,   vol_state,  vol_det    = volatility_forecast(bars)
-        pat_score,   pat_name,   pat_desc   = pattern_recognition(bars)
-        earn_risk,   earn_adj               = earnings_risk(api, ticker)
-        mkt_cond,    mkt_score,  vix_move   = market_condition_forecast(api, regime)
-
-        # Multi-timeframe bias adjustment:
-        # If daily trend opposes prediction, dampen score significantly
-        tf_multiplier = 1.0
-        if tf_bias == 1 and dir_score < 0:
-            tf_multiplier = 0.5   # daily up but intraday weak — dampen
-        elif tf_bias == -1 and dir_score > 0:
-            tf_multiplier = 0.5   # daily down but intraday strong — dampen
-        elif tf_bias == 1:
-            tf_multiplier = 1.2   # daily up confirms — boost
-        elif tf_bias == -1:
-            tf_multiplier = 1.2   # daily down confirms — boost (negative)
+        if   tf_bias == 1 and dir_score < 0:  tf_multiplier = 0.5
+        elif tf_bias == -1 and dir_score > 0: tf_multiplier = 0.5
+        elif tf_bias == 1:                    tf_multiplier = 1.2
+        elif tf_bias == -1:                   tf_multiplier = 1.2
+        else:                                 tf_multiplier = 1.0
 
         total = (
             sent_score * 1.0 +
@@ -440,7 +407,7 @@ def predict_ticker(api, ticker, regime="ranging"):
             pat_score  * 0.8 * tf_multiplier +
             earn_adj   * 1.0 +
             mkt_score  * 0.7 +
-            tf_bias    * 10  # direct contribution from daily trend
+            tf_bias    * 10
         )
         total = max(-100, min(100, round(total, 1)))
 
@@ -462,60 +429,43 @@ def predict_ticker(api, ticker, regime="ranging"):
             "tf_bias":    tf_bias,
             "tf_detail":  tf_detail,
             "components": {
-                "sentiment_trend": {
-                    "score":     sent_score,
-                    "direction": sent_dir,
-                    "daily":     sent_daily,
-                },
-                "price_direction": {
-                    "score":      dir_score,
-                    "confidence": dir_conf,
-                    "signals":    dir_sigs,
-                },
-                "volatility": {
-                    "score":   vol_score,
-                    "state":   vol_state,
-                    "details": vol_det,
-                },
-                "pattern": {
-                    "score":       pat_score,
-                    "name":        pat_name,
-                    "description": pat_desc,
-                },
-                "earnings_risk": {
-                    "level":      earn_risk,
-                    "adjustment": earn_adj,
-                },
-                "market_condition": {
-                    "condition": mkt_cond,
-                    "score":     mkt_score,
-                    "vix_move":  vix_move,
-                },
-                "timeframe": {
-                    "bias":   tf_bias,
-                    "detail": tf_detail,
-                },
+                "sentiment_trend":  {"score": sent_score, "direction": sent_dir, "daily": sent_daily},
+                "price_direction":  {"score": dir_score,  "confidence": dir_conf, "signals": dir_sigs},
+                "volatility":       {"score": vol_score,  "state": vol_state, "details": vol_det},
+                "pattern":          {"score": pat_score,  "name": pat_name, "description": pat_desc},
+                "earnings_risk":    {"level": earn_risk_lv, "adjustment": earn_adj},
+                "market_condition": {"condition": mkt_cond, "score": mkt_score, "vix_move": vix_move},
+                "timeframe":        {"bias": tf_bias, "detail": tf_detail},
             },
             "signals": dir_sigs,
         })
     except Exception as e:
         print(f"predict_ticker error {ticker}: {e}")
 
-    lbl = result["label"]
-    tf  = result["tf_detail"]
-    print(f"  Pred {ticker}: {result['score']:+.0f} ({lbl}) tf={tf}")
+    print(f"  Pred {ticker}: {result['score']:+.0f} ({result['label']}) tf={result['tf_detail']}")
     return result
 
-def run_predictions(api, tickers, regime="ranging"):
+# ── Batch runner — required by app.py ────────────────────────
+
+def run_predictions(api, tickers, market_regime="ranging"):
+    """
+    Runs predictions for all active tickers.
+    Called by prediction_loop() and /predictions/manual in app.py.
+    Returns: { ticker: prediction_dict, ... }
+    """
     results = {}
+    print(f"=== run_predictions start: {tickers} | regime={market_regime} ===")
     for ticker in tickers:
         try:
-            results[ticker] = predict_ticker(api, ticker, regime)
-            time.sleep(0.5)
+            results[ticker] = predict_ticker(api, ticker, market_regime)
+            time.sleep(0.4)
         except Exception as e:
-            print(f"  run_predictions error {ticker}: {e}")
+            print(f"  run_predictions failed {ticker}: {e}")
             results[ticker] = {
                 "ticker": ticker, "score": 0, "label": "neutral",
-                "confidence": "low", "tf_bias": 0, "tf_detail": ""
+                "confidence": "low", "components": {}, "signals": [],
+                "tf_bias": 0, "tf_detail": str(e),
+                "timestamp": datetime.now(NY).strftime("%I:%M %p ET"),
             }
+    print(f"=== run_predictions done: {len(results)} results ===")
     return results
