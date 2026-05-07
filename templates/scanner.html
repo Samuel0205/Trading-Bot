@@ -92,7 +92,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
 <a href="/predictions" class="predictions-btn">Predictions page →</a>
 
 <div id="today-section">
-  <div class="empty">No scan data yet.<br>Tap "Run scan now" or wait for 9 AM, 11 AM, or 1 PM ET.<br>Only stocks you can afford will appear here.</div>
+  <div class="empty">No scan data yet.<br>Tap "Run scan now" or wait for 10 AM or 12 PM ET.<br>Only stocks you can afford will appear here.</div>
 </div>
 <div id="yesterday-section" style="display:none;">
   <div class="empty">No scan data yet.</div>
@@ -181,69 +181,42 @@ function renderList(stocks, containerId) {
 
 function handleData(data) {
   const btn = document.getElementById('scanBtn');
-
   if (!data || !data.scanned_at) {
     document.getElementById('scanTime').textContent = 'No scan yet — tap "Run scan now"';
-    btn.textContent = 'Run scan now';
-    btn.disabled    = false;
+    btn.textContent = 'Run scan now'; btn.disabled = false;
     return;
   }
-
   renderMeta(data);
   document.getElementById('scanTime').textContent = 'Last scan: ' + (data.scanned_at||'—');
   renderList(data.today,     'today-section');
   renderList(data.yesterday, 'yesterday-section');
-
-  // Re-enable button and show completion
   if (data.manual) {
-    btn.textContent = 'Scan complete ✓';
-    btn.disabled    = false;
+    btn.textContent = 'Scan complete ✓'; btn.disabled = false;
     setTimeout(() => { btn.textContent = 'Run scan now'; }, 3000);
   } else {
-    btn.textContent = 'Run scan now';
-    btn.disabled    = false;
+    btn.textContent = 'Run scan now'; btn.disabled = false;
   }
 }
 
 function triggerManualScan() {
   const btn = document.getElementById('scanBtn');
-  btn.textContent = 'Scanning...';
-  btn.disabled    = true;
+  btn.textContent = 'Scanning...'; btn.disabled = true;
   document.getElementById('scanTime').textContent = 'Scan running — takes ~30 seconds...';
-
-  // Show spinner in active tab
   document.getElementById(activeTab+'-section').innerHTML =
     '<div class="loading"><div class="spinner"></div>Scanning universe...</div>';
-
   fetch('/scan/manual', { method: 'POST' })
-    .catch(e => {
-      console.error('Manual scan request error:', e);
-      btn.textContent = 'Run scan now';
-      btn.disabled    = false;
-    });
-
-  // Safety re-enable after 90s if socket never fires
-  setTimeout(() => {
-    if (btn.disabled) {
-      btn.textContent = 'Run scan now';
-      btn.disabled    = false;
-    }
-  }, 90000);
+    .catch(e => { console.error(e); btn.textContent = 'Run scan now'; btn.disabled = false; });
+  setTimeout(() => { if (btn.disabled) { btn.textContent = 'Run scan now'; btn.disabled = false; } }, 90000);
 }
 
-// Load existing data on page open
-fetch('/scan')
-  .then(r => r.json())
-  .then(handleData)
-  .catch(() => {
-    document.getElementById('scanTime').textContent = 'Could not load scan data';
-  });
+fetch('/scan').then(r => r.json()).then(handleData).catch(() => {
+  document.getElementById('scanTime').textContent = 'Could not load scan data';
+});
 
-// Live updates
 const socket = io();
 socket.on('scan', handleData);
-socket.on('connect',    () => console.log('Scanner socket connected'));
-socket.on('disconnect', () => console.log('Scanner socket disconnected'));
+socket.on('connect',    () => console.log('Scanner connected'));
+socket.on('disconnect', () => console.log('Scanner disconnected'));
 </script>
 </body>
 </html>
