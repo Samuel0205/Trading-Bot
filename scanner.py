@@ -1,3 +1,17 @@
+"""
+scanner.py — Stock scanner + universe builder
+
+Builds a dynamic universe of affordable, liquid stocks each scan cycle.
+Uses IEX feed (free Alpaca tier). No circular imports.
+
+Exports required by app.py:
+  - SEED_UNIVERSE  (list of ticker strings)
+  - run_full_scan(api)  → dict with today/yesterday/meta
+
+Account sizing parameters are passed INTO run_full_scan rather than
+imported from app.py, which would cause a circular import.
+"""
+
 import time, os, requests as req
 from datetime import datetime, timedelta
 import pytz
@@ -7,7 +21,7 @@ HF_URL     = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
 NY          = pytz.timezone("America/New_York")
-MAX_ACCOUNT = 20.00  # update as your account grows
+MAX_ACCOUNT = float(os.environ.get("MAX_ACCOUNT", "30.00"))
 
 # ── Sentiment ─────────────────────────────────────────────────
 
@@ -24,7 +38,8 @@ NEGATIVE_WORDS = [
 
 def keyword_score(text):
     t = text.lower()
-    return sum(1 for w in POSITIVE_WORDS if w in t) - sum(1 for w in NEGATIVE_WORDS if w in t)
+    return (sum(1 for w in POSITIVE_WORDS if w in t) -
+            sum(1 for w in NEGATIVE_WORDS if w in t))
 
 def finbert_score(headlines):
     if not headlines:
@@ -32,8 +47,8 @@ def finbert_score(headlines):
     if not HF_TOKEN:
         return sum(keyword_score(h) for h in headlines), "keyword"
     try:
-        payload  = {"inputs": headlines[:5], "options": {"wait_for_model": True}}
-        resp     = req.post(HF_URL, headers=HF_HEADERS, json=payload, timeout=15)
+        payload = {"inputs": headlines[:5], "options": {"wait_for_model": True}}
+        resp    = req.post(HF_URL, headers=HF_HEADERS, json=payload, timeout=15)
         if resp.status_code != 200:
             return sum(keyword_score(h) for h in headlines), "keyword_fallback"
         total = 0
@@ -57,8 +72,7 @@ def get_headlines(api, ticker, days_back=1):
     except:
         return []
 
-# ── Seed universe — known liquid low-cost stocks ──────────────
-# These are checked first (fast). Scanner expands if needed.
+# ── Seed universe ─────────────────────────────────────────────
 
 SEED_UNIVERSE = [
     "SIRI","TELL","CLOV","NKLA","MVIS","SOFI","HOOD","NIO","MARA","RIOT",
@@ -67,27 +81,48 @@ SEED_UNIVERSE = [
     "AFRM","OPEN","DKNG","CHPT","WKHS","GOEV","FSR","HYLN","SNDL","ACB",
     "CGC","TLRY","CRON","OGI","VFF","HEXO","CWEB","SPCE","MAXN","ARRY",
     "STEM","NOVA","SHLS","SUNW","IDEX","GNUS","EXPR","AMC","BB","NOK",
-    "XELA","CLOV","MVIS","TELL","SIRI","WISH","OCGN","TIGR","XPEV","LI"
+    "XELA","MARA","MVIS","TELL","SIRI","OCGN","TIGR","XPEV","LI",
+    "F","BAC","AAL","CCL","SNAP","WISH","NAKD","KOSS",
 ]
+SEED_UNIVERSE = list(dict.fromkeys(SEED_UNIVERSE))  # deduplicate, preserve order
 
-# ── Helpers ───────────────────────────────────────────────────
+# ── Account sizing (no import from app — avoids circular import) ──
+
+def _get_account_size(api):
+    """Local account size — does NOT import from app.py."""
+    try:
+        acct = api.get_account()
+        return min(float(acct.equity), MAX_ACCOUNT)
+    except:
+        return MAX_ACCOUNT
+
+def _price_floor(account_size):
+    if account_size > 2000: return 5.00
+    if account_size > 500:  return 2.00
+    if account_size > 100:  return 1.00
+    return 0.50
+
+def _price_ceiling(account_size):
+    return max(min(account_size * 0.45, 10.00), 0.60)
+
+def _min_volume(account_size):
+    if account_size > 5000: return 1_000_000
+    if account_size > 1000: return 500_000
+    if account_size > 200:  return 250_000
+    return 100_000
+
+# ── Bar fetching helpers ──────────────────────────────────────
 
 def safe_get_bars(api, symbols, timeframe="1Day", days_back=5, limit=5):
-    """
-    Wrapper around api.get_bars that always uses feed=iex.
-    Returns a DataFrame or None on failure.
-    Always uses IEX feed — required for free Alpaca accounts.
-    """
+    """Always uses feed=iex — required for free Alpaca accounts."""
     try:
         end   = datetime.now(pytz.utc)
-        start = end - timedelta(days=days_back + 2)  # buffer for weekends
+        start = end - timedelta(days=days_back + 2)
         bars  = api.get_bars(
-            symbols,
-            timeframe,
+            symbols, timeframe,
             start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
             end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            limit=limit,
-            feed="iex"
+            limit=limit, feed="iex"
         ).df
         return bars if not bars.empty else None
     except Exception as e:
@@ -100,8 +135,7 @@ def extract_sym(bars_df, sym):
         if bars_df is None:
             return None
         if hasattr(bars_df.index, 'levels'):
-            lvl0 = bars_df.index.get_level_values(0)
-            if sym not in lvl0:
+            if sym not in bars_df.index.get_level_values(0):
                 return None
             return bars_df.loc[sym]
         return bars_df
@@ -112,19 +146,17 @@ def extract_sym(bars_df, sym):
 
 def build_universe(api, max_price, min_price=0.50, min_volume=100_000):
     """
-    Step 1: Check seed list (fast, ~2 batches).
-    Step 2: Expand with asset list if fewer than 20 found.
-    All bar requests use feed=iex.
+    Checks seed list first (fast). Expands with asset list if < 15 found.
+    Returns list of {symbol, price, volume} dicts.
     """
     print(f"  Building universe: ${min_price}–${max_price:.2f}, vol>{min_volume:,}")
     universe   = []
     seen       = set()
     batch_size = 50
 
-    # Step 1 — seed universe
-    seeds = list(dict.fromkeys(SEED_UNIVERSE))  # deduplicated, order preserved
-    for i in range(0, len(seeds), batch_size):
-        batch = seeds[i:i+batch_size]
+    # Step 1 — seed universe (fast path)
+    for i in range(0, len(SEED_UNIVERSE), batch_size):
+        batch = SEED_UNIVERSE[i:i+batch_size]
         bars  = safe_get_bars(api, batch)
         if bars is None:
             continue
@@ -138,17 +170,17 @@ def build_universe(api, max_price, min_price=0.50, min_volume=100_000):
                 price   = float(sym_bars.iloc[-1]["close"])
                 avg_vol = float(sym_bars["volume"].mean())
                 if min_price <= price <= max_price and avg_vol >= min_volume:
-                    universe.append({"symbol": sym, "price": round(price,2), "volume": int(avg_vol)})
+                    universe.append({"symbol": sym, "price": round(price, 2), "volume": int(avg_vol)})
                     seen.add(sym)
             except:
                 continue
         time.sleep(0.3)
 
-    print(f"  Seed scan done: {len(universe)} stocks found")
+    print(f"  Seed scan: {len(universe)} stocks")
 
     # Step 2 — expand if needed
     if len(universe) < 15:
-        print("  Expanding with asset list (max 300)...")
+        print("  Expanding with asset list (up to 300)...")
         try:
             assets    = api.list_assets(status="active", asset_class="us_equity")
             tradeable = [
@@ -175,7 +207,7 @@ def build_universe(api, max_price, min_price=0.50, min_volume=100_000):
                         price   = float(sym_bars.iloc[-1]["close"])
                         avg_vol = float(sym_bars["volume"].mean())
                         if min_price <= price <= max_price and avg_vol >= min_volume:
-                            universe.append({"symbol": sym, "price": round(price,2), "volume": int(avg_vol)})
+                            universe.append({"symbol": sym, "price": round(price, 2), "volume": int(avg_vol)})
                             seen.add(sym)
                     except:
                         continue
@@ -186,21 +218,17 @@ def build_universe(api, max_price, min_price=0.50, min_volume=100_000):
     print(f"  Universe built: {len(universe)} stocks total")
     return universe
 
-# ── Price data ────────────────────────────────────────────────
+# ── Price data fetcher ────────────────────────────────────────
 
 def get_price_data(api, ticker):
-    """Fetch OHLCV data for a single ticker using IEX feed."""
     try:
         bars = safe_get_bars(api, ticker, days_back=10, limit=10)
         if bars is None:
             return None
-
-        # Handle MultiIndex (single ticker may or may not be wrapped)
         if hasattr(bars.index, 'levels'):
             bars = extract_sym(bars, ticker)
             if bars is None:
                 return None
-
         if len(bars) < 2:
             return None
 
@@ -229,7 +257,7 @@ def get_price_data(api, ticker):
         print(f"  price_data error {ticker}: {e}")
         return None
 
-# ── Scoring ───────────────────────────────────────────────────
+# ── Composite scoring ─────────────────────────────────────────
 
 def composite_score(pd, sentiment, news_count, account_size):
     s  = abs(pd["change_pct"]) * 2.5
@@ -256,14 +284,14 @@ def composite_score(pd, sentiment, news_count, account_size):
 
 def risk_grade(pd):
     score = 0
-    if pd["vol_ratio"]         < 3:  score += 2
-    if abs(pd["change_pct"])   < 5:  score += 2
-    if abs(pd["rs_5d"])        < 10: score += 2
-    if pd["avg_range"]         < 5:  score += 2
-    if pd["avg_range"]         < 3:  score += 1
+    if pd["vol_ratio"]       < 3:  score += 2
+    if abs(pd["change_pct"]) < 5:  score += 2
+    if abs(pd["rs_5d"])      < 10: score += 2
+    if pd["avg_range"]       < 5:  score += 2
+    if pd["avg_range"]       < 3:  score += 1
     return {9:"A",8:"A",7:"B",6:"B",5:"C",4:"C",3:"D"}.get(score, "F")
 
-# ── Main scan ─────────────────────────────────────────────────
+# ── Per-day scan ──────────────────────────────────────────────
 
 def run_scan(api, universe, days_back=1, account_size=20):
     label = "today" if days_back == 1 else "yesterday"
@@ -278,10 +306,10 @@ def run_scan(api, universe, days_back=1, account_size=20):
                 continue
             if pd["price"] <= 0 or pd["price"] > (account_size * 0.6):
                 continue
-            headlines         = get_headlines(api, ticker, days_back=days_back)
-            sentiment, method = finbert_score(headlines)
-            score             = composite_score(pd, sentiment, len(headlines), account_size)
-            grade             = risk_grade(pd)
+            headlines          = get_headlines(api, ticker, days_back=days_back)
+            sentiment, method  = finbert_score(headlines)
+            score              = composite_score(pd, sentiment, len(headlines), account_size)
+            grade              = risk_grade(pd)
             results.append({
                 "ticker":      ticker,
                 "price":       pd["price"],
@@ -306,32 +334,20 @@ def run_scan(api, universe, days_back=1, account_size=20):
     print(f"=== Top 5 ({label}): {[(r['ticker'], r['grade'], r['score']) for r in top5]} ===")
     return top5
 
-# ── Account size ──────────────────────────────────────────────
-
-def get_account_size(api):
-    try:
-        return min(float(api.get_account().equity), MAX_ACCOUNT)
-    except:
-        return MAX_ACCOUNT
-
-# ── Full scan entry ───────────────────────────────────────────
+# ── Full scan entry point — called by app.py ─────────────────
 
 def run_full_scan(api):
-    account_size = get_account_size(api)
-    print(f"Full scan | account ${account_size:.2f}")
+    """
+    Main entry point called by app.py scanner_loop and /scan/manual.
+    Does NOT import from app.py to avoid circular imports.
+    Derives account sizing independently.
+    """
+    account_size = _get_account_size(api)
+    max_price    = _price_ceiling(account_size)
+    min_price    = _price_floor(account_size)
+    min_vol      = _min_volume(account_size)
 
-    # Dynamic price range
-    max_price = max(min(account_size * 0.45, 10.00), 0.60)
-    if   account_size > 2000: min_price = 5.00
-    elif account_size > 500:  min_price = 2.00
-    elif account_size > 100:  min_price = 1.00
-    else:                     min_price = 0.50
-
-    # Dynamic volume floor
-    if   account_size > 5000: min_vol = 1_000_000
-    elif account_size > 1000: min_vol = 500_000
-    elif account_size > 200:  min_vol = 250_000
-    else:                     min_vol = 100_000
+    print(f"Full scan | account ${account_size:.2f} | range ${min_price}–${max_price:.2f}")
 
     universe = build_universe(api, max_price, min_price, min_vol)
 
