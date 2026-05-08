@@ -89,10 +89,13 @@ SEED_UNIVERSE = list(dict.fromkeys(SEED_UNIVERSE))  # deduplicate, preserve orde
 # ── Account sizing (no import from app — avoids circular import) ──
 
 def _get_account_size(api):
-    """Local account size — does NOT import from app.py."""
+    """
+    Local account size — does NOT import from app.py (avoids circular import).
+    FIX: Returns real equity without hard cap, matching app.py behavior.
+    MAX_ACCOUNT is only the fallback when the API call fails.
+    """
     try:
-        acct = api.get_account()
-        return min(float(acct.equity), MAX_ACCOUNT)
+        return float(api.get_account().equity)
     except:
         return MAX_ACCOUNT
 
