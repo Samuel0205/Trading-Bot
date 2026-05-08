@@ -233,12 +233,8 @@ function renderResult(data) {
   const names = Object.keys(data.results);
   if (names.length) renderUniverse(names[0]);
   renderCompare();
-  document.getElementById('tabs').querySelectorAll('.tab').forEach((t,i)=>{
-    t.onclick = () => {
-      const tabNames = ['overview','tickers','trades','compare','config'];
-      showTab(tabNames[i]);
-    };
-  });
+  // Tab buttons already have inline onclick="showTab('...')" — no reassignment needed
+  showTab('overview');
 }
 
 function startBacktest() {
