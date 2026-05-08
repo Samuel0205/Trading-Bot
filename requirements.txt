@@ -1,16 +1,8 @@
-# requirements.txt
-alpaca-trade-api==3.2.0
+alpaca-trade-api==3.0.2
 flask==3.0.3
 flask-socketio==5.3.6
-pytz==2024.1
 eventlet==0.36.1
-requests==2.32.5
-
-# ── railway.toml (save as a separate file named exactly: railway.toml) ──
-# [build]
-# builder = "NIXPACKS"
-#
-# [deploy]
-# startCommand = "python bot.py"
-# restartPolicyType = "ON_FAILURE"
-# restartPolicyMaxRetries = 3
+requests==2.32.3
+pytz==2024.1
+transformers==4.41.2
+torch==2.3.1
