@@ -373,15 +373,19 @@ function renderAccount(acct) {
   document.getElementById('modeLabel').textContent = acct.live ? '🔴 LIVE' : '📄 PAPER';
   document.getElementById('modeLabel').style.color = acct.live ? '#D85A30' : '#4a9eff';
 
-  // Fetch PDT + next event from /stats
-  fetch('/stats').then(r=>r.json()).then(s => {
-    const pdt = s.pdt_trades_this_week ?? s.daily_trade_count ?? 0;
-    document.getElementById('pdtCount').textContent = `${pdt}/3`;
-    document.getElementById('pdtCount').style.color = pdt>=3?'#D85A30':pdt>=2?'#E9A84C':'#1D9E75';
-    if (s.unusual_volume && s.unusual_volume.length) {
-      renderUnusualVolume(s.unusual_volume);
-    }
-  }).catch(()=>{});
+  // Fetch PDT + unusual volume from /stats — cached every 5 min to avoid hammering Alpaca API
+  const now = Date.now();
+  if (!window._lastStatsFetch || now - window._lastStatsFetch > 300000) {
+    window._lastStatsFetch = now;
+    fetch('/stats').then(r=>r.json()).then(s => {
+      const pdt = s.pdt_trades_this_week ?? s.daily_trade_count ?? 0;
+      document.getElementById('pdtCount').textContent = `${pdt}/3`;
+      document.getElementById('pdtCount').style.color = pdt>=3?'#D85A30':pdt>=2?'#E9A84C':'#1D9E75';
+      if (s.unusual_volume && s.unusual_volume.length) {
+        renderUnusualVolume(s.unusual_volume);
+      }
+    }).catch(()=>{});
+  }
 }
 
 // FIX: render prediction score chips — was never done on dashboard
