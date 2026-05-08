@@ -56,7 +56,7 @@ print(f"=== MODE: {'🔴 LIVE TRADING' if LIVE_MODE else '📄 PAPER TRADING'} =
 
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # ── Config ────────────────────────────────────────────────────
 # FIX: MAX_ACCOUNT is now a DEFAULT cap only — if account grows beyond it,
@@ -596,18 +596,15 @@ def execute(ticker, action, price, signals, reason="signal"):
                 print(f"  PDT limit — skipping"); return
 
             today = datetime.now(NY).date()
+            # Check limit BEFORE doing expensive passes_filters/qty work
             with _trade_count_lock:
                 if daily_trade_date != today:
                     daily_trade_count = 0; daily_trade_date = today
                 if daily_trade_count >= MAX_DAILY_TRADES:
                     print(f"  Daily limit {MAX_DAILY_TRADES} reached"); return
-                # Increment inside lock to prevent race condition
-                daily_trade_count += 1
-                current_count = daily_trade_count
 
             acct_size = get_account_size()
             if not passes_filters(ticker, price, acct_size):
-                with _trade_count_lock: daily_trade_count -= 1  # rollback
                 return
 
             pred_score = prediction_cache.get(ticker, {}).get("score", 0)
@@ -615,7 +612,6 @@ def execute(ticker, action, price, signals, reason="signal"):
             qty        = position_size(price, acct_size, pred_score, rvol)
             if qty == 0:
                 print(f"  {ticker} qty 0")
-                with _trade_count_lock: daily_trade_count -= 1  # rollback
                 return
 
             stop   = round(price*(1-STOP_LOSS_PCT), 3)
@@ -630,8 +626,15 @@ def execute(ticker, action, price, signals, reason="signal"):
 
             if (target-price)/price < MIN_PROFIT_PCT:
                 print(f"  {ticker} profit too low")
-                with _trade_count_lock: daily_trade_count -= 1  # rollback
                 return
+
+            # FIX: increment ONLY when we're actually about to submit the order
+            # No rollback needed — if submit_order fails, we catch the exception below
+            with _trade_count_lock:
+                if daily_trade_count >= MAX_DAILY_TRADES:
+                    print(f"  Daily limit reached (race)"); return
+                daily_trade_count += 1
+                current_count = daily_trade_count
 
             api.submit_order(symbol=ticker, qty=qty, side="buy",
                              type="market", time_in_force="day")
@@ -1258,7 +1261,14 @@ def ping(): return "pong", 200
 
 # ── Startup ───────────────────────────────────────────────────
 
-if __name__ == "__main__":
+
+# ── Startup — runs regardless of how app is launched ─────────
+# Works with: python app.py  OR  gunicorn with eventlet worker
+# Threads are started at module load time. socketio.run() is only
+# called when launched directly (gunicorn handles serving instead).
+
+def _start_bot():
+    """Initialize DB, seed calendar, launch all background threads."""
     port = int(os.environ.get("PORT", 10000))
     print(f"=== BOT v10 | port {port} | {'🔴 LIVE' if LIVE_MODE else '📄 PAPER'} ===")
     print(f"=== DEFAULT_MAX=${DEFAULT_MAX_ACCOUNT} | PDT={MAX_DAILY_TRADES} | "
@@ -1289,12 +1299,19 @@ if __name__ == "__main__":
             print(f"Startup macro error: {e}")
         print(f"=== Ready | tickers={active_tickers} | regime={market_regime} ===")
 
-    threading.Thread(target=startup,         daemon=True).start()
-    threading.Thread(target=bot_loop,        daemon=True).start()
-    threading.Thread(target=scanner_loop,    daemon=True).start()
-    threading.Thread(target=prediction_loop, daemon=True).start()
-    threading.Thread(target=premarket_loop,  daemon=True).start()
-    threading.Thread(target=macro_loop,      daemon=True).start()
-    threading.Thread(target=db_snapshot_loop,daemon=True).start()
+    threading.Thread(target=startup,          daemon=True).start()
+    threading.Thread(target=bot_loop,         daemon=True).start()
+    threading.Thread(target=scanner_loop,     daemon=True).start()
+    threading.Thread(target=prediction_loop,  daemon=True).start()
+    threading.Thread(target=premarket_loop,   daemon=True).start()
+    threading.Thread(target=macro_loop,       daemon=True).start()
+    threading.Thread(target=db_snapshot_loop, daemon=True).start()
 
-    socketio.run(app, host="0.0.0.0", port=port)
+    return port
+
+# Start everything at import time (works for gunicorn AND python app.py)
+_port = _start_bot()
+
+if __name__ == "__main__":
+    # Direct launch: python app.py
+    socketio.run(app, host="0.0.0.0", port=_port)
