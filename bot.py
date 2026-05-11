@@ -1,11 +1,12 @@
-import os, time, threading, json
+import os, time, threading, json, sys
+sys.stdout.reconfigure(line_buffering=True)
+
 from datetime import datetime, timedelta
 import pytz
 import alpaca_trade_api as tradeapi
 from flask import Flask, render_template, jsonify
 from flask_socketio import SocketIO
 
-# ── Core imports ──────────────────────────────────────────────
 from database import (
     init_db, save_trade_open, save_trade_close, get_recent_trades,
     get_trade_stats_from_db, save_signal_performance, get_signal_win_rates,
@@ -18,7 +19,6 @@ from macro import (
     get_sector_momentum, scan_unusual_volume, get_macro_status, get_hot_sectors
 )
 
-# ── Lazy imports — prevents startup crash ─────────────────────
 def get_scanner():
     try:
         from scanner import run_full_scan, SEED_UNIVERSE
@@ -59,39 +59,45 @@ app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # ── Config ────────────────────────────────────────────────────
-# FIX: MAX_ACCOUNT is now a DEFAULT cap only — if account grows beyond it,
-# the bot will automatically use the real account size.
-# Set MAX_ACCOUNT=30 to start small, but it scales up automatically.
-DEFAULT_MAX_ACCOUNT     = float(os.environ.get("MAX_ACCOUNT", "30.00"))
-MAX_TRADE_PCT           = 0.45
-STOP_LOSS_PCT           = 0.05
-TAKE_PROFIT_PCT         = 0.12
-INTERVAL                = 30
-MIN_PRICE               = 0.50
-MIN_VOLUME              = 100_000
-MIN_GRADE               = ["A","B","C","D"]
-COOLDOWN_STOP           = 900
-COOLDOWN_PROFIT         = 600
-COOLDOWN_SIGNAL         = 300
-TRADING_START_H         = 9
-TRADING_START_M         = 35
-TRADING_END_H           = 15
-TRADING_END_M           = 30
-SCAN_HOURS              = [10, 12]
-PRED_HOURS              = [9, 11]
-MACRO_REFRESH_HOURS     = [8, 12]
-MIN_PROFIT_PCT          = 0.04
-MAX_DAILY_TRADES        = 3
-GAP_MIN_PCT             = 2.0
-GAP_MAX_PCT             = 15.0
-GAP_MIN_RVOL            = 1.5
-RVOL_THRESHOLD          = 1.2
-BASE_BUY_THRESHOLD      = 2.0
-BASE_SELL_THRESHOLD     = 2.0
-PRED_STRONG_BUY         = 40
-PRED_SKIP               = -35
-PRED_NEED_CONF          = -10
-DB_SNAPSHOT_INTERVAL    = 3600
+DEFAULT_MAX_ACCOUNT  = float(os.environ.get("MAX_ACCOUNT", "30.00"))
+MAX_TRADE_PCT        = 0.45
+STOP_LOSS_PCT        = 0.05
+TAKE_PROFIT_PCT      = 0.12
+PARTIAL_EXIT_PCT     = 0.06   # NEW: sell half position at 6% gain
+INTERVAL             = 30
+MIN_GRADE            = ["A","B","C","D"]
+COOLDOWN_STOP        = 900
+COOLDOWN_PROFIT      = 600
+COOLDOWN_SIGNAL      = 300
+TRADING_START_H      = 9
+TRADING_START_M      = 35
+TRADING_END_H        = 15
+TRADING_END_M        = 30
+NO_NEW_ENTRY_MINS    = 20    # NEW: no new buys in first 20 min (9:35–9:55)
+EOD_TIGHTEN_MINS     = 30   # NEW: tighter thresholds last 30 min (3:00–3:30)
+SCAN_HOURS           = [10, 12]
+PRED_HOURS           = [9, 11]
+MACRO_REFRESH_HOURS  = [8, 12]
+MIN_PROFIT_PCT       = 0.04
+MAX_DAILY_TRADES     = 3
+GAP_MIN_PCT          = 2.0
+GAP_MAX_PCT          = 15.0
+GAP_MIN_RVOL         = 1.5
+RVOL_THRESHOLD       = 1.2
+RVOL_PROMOTE_MIN     = 2.5   # NEW: promote ticker to active list if rvol exceeds this
+BASE_BUY_THRESHOLD   = 2.0
+BASE_SELL_THRESHOLD  = 2.0
+PRED_STRONG_BUY      = 40
+PRED_SKIP            = -35
+PRED_NEED_CONF       = -10
+DB_SNAPSHOT_INTERVAL = 3600
+
+# NEW: RSI veto thresholds — hard blocks regardless of other signals
+RSI_OVERBOUGHT_VETO  = 75   # block buys when RSI above this
+RSI_OVERSOLD_VETO    = 25   # block sells when RSI below this
+
+# NEW: price extension veto — don't chase extended moves
+PRICE_EXTENSION_VETO = 0.08  # block buys if price > 8% above 20-bar mean
 
 BASE_SIGNAL_WEIGHTS = {
     "MA Crossover":   0.8,
@@ -113,7 +119,7 @@ prediction_cache  = {}
 backtest_cache    = {}
 macro_status      = {}
 active_tickers    = list(FALLBACK_TICKERS)
-open_positions    = {}
+open_positions    = {}     # { ticker: {entry, stop, target, qty, partial_done, ...} }
 market_regime     = "ranging"
 cooldowns         = {}
 ticker_grades     = {}
@@ -125,28 +131,74 @@ daily_trade_date  = None
 last_db_snapshot  = 0
 signal_weights    = dict(BASE_SIGNAL_WEIGHTS)
 
-# FIX: cache blackout result per day — avoids hitting DB on every 30s loop tick
 _blackout_cache      = {"date": None, "result": (False, None)}
 _blackout_cache_lock = threading.Lock()
-
-# FIX: lock for market_regime to prevent race condition across threads
-_regime_lock = threading.Lock()
-
-# FIX: lock for daily_trade_count
-_trade_count_lock = threading.Lock()
+_regime_lock         = threading.Lock()
+_trade_count_lock    = threading.Lock()
 
 NY = pytz.timezone("America/New_York")
 
-# ── Blackout cache (eliminates double DB hit) ─────────────────
+# ── Time helpers ──────────────────────────────────────────────
+
+def now_et():
+    return datetime.now(NY)
+
+def in_trading_window():
+    now  = now_et()
+    if now.weekday() >= 5: return False
+    mins = now.hour * 60 + now.minute
+    return (TRADING_START_H*60+TRADING_START_M) <= mins < (TRADING_END_H*60+TRADING_END_M)
+
+def is_market_open():
+    try:
+        return api.get_clock().is_open
+    except Exception as e:
+        print(f"is_market_open error: {e}")
+        return False
+
+def mins_since_open():
+    """Minutes elapsed since 9:30 AM ET today."""
+    now = now_et()
+    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    return max(0, int((now - open_time).total_seconds() / 60))
+
+def mins_until_close():
+    """Minutes until 3:30 PM ET today."""
+    now = now_et()
+    close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return max(0, int((close_time - now).total_seconds() / 60))
+
+# NEW: time-of-day entry gate
+def can_enter_new_position():
+    """
+    Block new buys:
+    - First 20 minutes after open (9:30–9:50): too volatile, fakeouts common
+    - Last 5 minutes (3:25–3:30): EOD volatility, hard to fill cleanly
+    """
+    elapsed = mins_since_open()
+    remaining = mins_until_close()
+    if elapsed < NO_NEW_ENTRY_MINS:
+        print(f"  Time gate: {NO_NEW_ENTRY_MINS - elapsed}min until entry allowed")
+        return False
+    if remaining < 5:
+        print(f"  Time gate: too close to close ({remaining}min left)")
+        return False
+    return True
+
+def get_threshold_multiplier():
+    """
+    NEW: tighten vote thresholds in last 30 minutes.
+    Requires stronger consensus before entering a position late in the day.
+    """
+    remaining = mins_until_close()
+    if remaining <= EOD_TIGHTEN_MINS:
+        return 1.4   # 40% harder to get a signal late day
+    return 1.0
+
+# ── Blackout cache ─────────────────────────────────────────────
 
 def cached_blackout_today():
-    """
-    Returns (is_blackout, event_name).
-    Caches result for the current date — safe to call every tick.
-    FIX: original called is_macro_blackout_today() in both bot_loop and execute(),
-    hitting the DB twice per ticker per 30s cycle. Now cached per day.
-    """
-    today = datetime.now(NY).strftime("%Y-%m-%d")
+    today = now_et().strftime("%Y-%m-%d")
     with _blackout_cache_lock:
         if _blackout_cache["date"] == today:
             return _blackout_cache["result"]
@@ -189,12 +241,6 @@ def get_account():
         return None
 
 def get_account_size():
-    """
-    FIX: Original used min(equity, MAX_ACCOUNT) which permanently capped
-    growth at $30. Now returns actual equity — DEFAULT_MAX_ACCOUNT is only
-    used as a fallback when the API call fails.
-    Bot position sizing already scales via MAX_TRADE_PCT, so no hard cap needed.
-    """
     acct = get_account()
     if acct:
         return float(acct.equity)
@@ -211,17 +257,36 @@ def get_account_state():
     try:
         acct = get_account()
         if not acct:
-            return {"portfolio":0,"cash":0,"pnl":0,"regime":market_regime,"live":LIVE_MODE}
+            return {"portfolio":0,"cash":0,"pnl":0,"regime":market_regime,"live":LIVE_MODE,
+                    "open_positions":{}}
+
+        # NEW: include unrealized P&L per open position
+        positions_detail = {}
+        try:
+            for pos in api.list_positions():
+                sym = pos.symbol
+                positions_detail[sym] = {
+                    "qty":         int(pos.qty),
+                    "entry":       round(float(pos.avg_entry_price), 2),
+                    "current":     round(float(pos.current_price), 2),
+                    "unrealized":  round(float(pos.unrealized_pl), 2),
+                    "unrealized_pct": round(float(pos.unrealized_plpc) * 100, 2),
+                    "market_value": round(float(pos.market_value), 2),
+                }
+        except: pass
+
         return {
-            "portfolio": round(float(acct.equity), 2),
-            "cash":      round(float(acct.cash), 2),
-            "pnl":       round(float(acct.equity) - float(acct.last_equity), 2),
-            "regime":    market_regime,
-            "live":      LIVE_MODE,
+            "portfolio":      round(float(acct.equity), 2),
+            "cash":           round(float(acct.cash), 2),
+            "pnl":            round(float(acct.equity) - float(acct.last_equity), 2),
+            "regime":         market_regime,
+            "live":           LIVE_MODE,
+            "open_positions": positions_detail,
         }
     except Exception as e:
         print(f"get_account_state error: {e}")
-        return {"portfolio":0,"cash":0,"pnl":0,"regime":market_regime,"live":LIVE_MODE}
+        return {"portfolio":0,"cash":0,"pnl":0,"regime":market_regime,"live":LIVE_MODE,
+                "open_positions":{}}
 
 # ── Scaling ───────────────────────────────────────────────────
 
@@ -243,26 +308,11 @@ def get_min_volume(account_size=None):
     if account_size > 200:  return 250_000
     return 100_000
 
-# ── Time helpers ──────────────────────────────────────────────
-
-def in_trading_window():
-    now  = datetime.now(NY)
-    if now.weekday() >= 5: return False
-    mins = now.hour * 60 + now.minute
-    return (TRADING_START_H*60+TRADING_START_M) <= mins < (TRADING_END_H*60+TRADING_END_M)
-
-def is_market_open():
-    try:
-        return api.get_clock().is_open
-    except Exception as e:
-        print(f"is_market_open error: {e}")
-        return False
-
 # ── PDT compliance ────────────────────────────────────────────
 
 def count_day_trades_this_week():
     try:
-        now    = datetime.now(NY)
+        now    = now_et()
         cutoff = now - timedelta(days=7)
         orders = api.list_orders(
             status="filled",
@@ -287,7 +337,8 @@ def is_day_trade_safe():
 
 def set_cooldown(ticker, reason="signal"):
     d = {"stop_loss":COOLDOWN_STOP,"take_profit":COOLDOWN_PROFIT,
-         "signal":COOLDOWN_SIGNAL,"eod_close":COOLDOWN_SIGNAL}
+         "signal":COOLDOWN_SIGNAL,"eod_close":COOLDOWN_SIGNAL,
+         "partial":COOLDOWN_SIGNAL}
     cooldowns[ticker] = {"until": time.time()+d.get(reason, COOLDOWN_SIGNAL), "reason": reason}
 
 def is_on_cooldown(ticker):
@@ -340,37 +391,92 @@ def get_signals(ticker, price):
     vols = volume_history.get(ticker, [])
     n    = len(hist)
     if n < 5:
-        return [{"name":k,"action":"hold","signal":50} for k in signal_weights]
-    rsi  = calc_rsi(hist)
-    ma50 = calc_ma(hist, min(50, n))
-    ma200= calc_ma(hist, min(200, n))
-    mean, upper, lower = calc_bollinger(hist)
-    vwap = calc_vwap(hist[-78:], vols[-78:])
-    macd_line = calc_macd(hist)
-    z    = (price-mean)/max((upper-mean), 0.01)
-    ok_buy  = market_regime in ("trending_up","ranging")
-    ok_sell = market_regime in ("trending_down","ranging")
-    ma_conf = min(1.0, n/20)
+        return [{
+            "name":k,"action":"hold","signal":50,
+            "veto":False,"veto_reason":""
+        } for k in signal_weights]
 
-    def act(bc, sc):
-        if bc and ok_buy:  return "buy"
-        if sc and ok_sell: return "sell"
+    rsi       = calc_rsi(hist)
+    ma50      = calc_ma(hist, min(50, n))
+    ma200     = calc_ma(hist, min(200, n))
+    mean, upper, lower = calc_bollinger(hist)
+    vwap      = calc_vwap(hist[-78:], vols[-78:])
+    macd_line = calc_macd(hist)
+    z         = (price-mean)/max((upper-mean), 0.01)
+    ok_buy    = market_regime in ("trending_up","ranging")
+    ok_sell   = market_regime in ("trending_down","ranging")
+    ma_conf   = min(1.0, n/20)
+
+    # NEW: veto conditions — hard blocks independent of vote weights
+    rsi_overbought    = rsi > RSI_OVERBOUGHT_VETO
+    rsi_oversold      = rsi < RSI_OVERSOLD_VETO
+    price_extended    = (price - mean) / max(mean, 0.01) > PRICE_EXTENSION_VETO
+
+    def act(bc, sc, veto_buy=False, veto_sell=False):
+        if bc and ok_buy  and not veto_buy:  return "buy"
+        if sc and ok_sell and not veto_sell: return "sell"
         return "hold"
 
-    return [
-        {"name":"MA Crossover",
-         "action":act(ma50>ma200*1.005,ma200>ma50*1.005) if ma_conf>0.5 else "hold",
-         "signal":min(95,50+(ma50-ma200)/max(ma200,1)*600)},
-        {"name":"RSI","action":act(rsi<35,rsi>65),"signal":100-rsi},
-        {"name":"Bollinger","action":act(price<lower*0.99,price>upper*1.01),
-         "signal":max(5,min(95,50-z*40))},
-        {"name":"VWAP","action":act(price>vwap*1.001,price<vwap*0.999),
-         "signal":min(95,max(5,50+(price-vwap)/max(vwap,1)*500))},
-        {"name":"MACD","action":act(macd_line>0,macd_line<0),
-         "signal":min(95,max(5,50+macd_line*10))},
-        {"name":"Mean Reversion","action":act(price<mean*0.96,price>mean*1.04),
-         "signal":min(92,max(8,50+(mean-price)/max(mean,1)*250))},
+    signals = [
+        {
+            "name":"MA Crossover",
+            "action": act(ma50>ma200*1.005, ma200>ma50*1.005,
+                          veto_buy=rsi_overbought or price_extended) if ma_conf>0.5 else "hold",
+            "signal": min(95, 50+(ma50-ma200)/max(ma200,1)*600),
+            "veto":   (rsi_overbought or price_extended) and ma50>ma200*1.005,
+            "veto_reason": "RSI overbought" if rsi_overbought else ("extended" if price_extended else ""),
+        },
+        {
+            "name":"RSI",
+            "action": act(rsi<35, rsi>65),
+            "signal": 100-rsi,
+            "veto":   False, "veto_reason": "",
+        },
+        {
+            "name":"Bollinger",
+            "action": act(price<lower*0.99, price>upper*1.01,
+                          veto_buy=rsi_overbought or price_extended,
+                          veto_sell=rsi_oversold),
+            "signal": max(5,min(95,50-z*40)),
+            "veto":   (rsi_overbought or price_extended) and price<lower*0.99,
+            "veto_reason": "RSI overbought" if rsi_overbought else ("extended" if price_extended else ""),
+        },
+        {
+            "name":"VWAP",
+            "action": act(price>vwap*1.001, price<vwap*0.999,
+                          veto_buy=rsi_overbought or price_extended),
+            "signal": min(95,max(5,50+(price-vwap)/max(vwap,1)*500)),
+            "veto":   (rsi_overbought or price_extended) and price>vwap*1.001,
+            "veto_reason": "RSI overbought" if rsi_overbought else ("extended" if price_extended else ""),
+        },
+        {
+            "name":"MACD",
+            "action": act(macd_line>0, macd_line<0,
+                          veto_buy=rsi_overbought or price_extended),
+            "signal": min(95,max(5,50+macd_line*10)),
+            "veto":   (rsi_overbought or price_extended) and macd_line>0,
+            "veto_reason": "RSI overbought" if rsi_overbought else ("extended" if price_extended else ""),
+        },
+        {
+            "name":"Mean Reversion",
+            "action": act(price<mean*0.96, price>mean*1.04,
+                          veto_buy=rsi_overbought,
+                          veto_sell=rsi_oversold),
+            "signal": min(92,max(8,50+(mean-price)/max(mean,1)*250)),
+            "veto":   rsi_overbought and price<mean*0.96,
+            "veto_reason": "RSI overbought" if rsi_overbought else "",
+        },
     ]
+
+    # Global buy veto: if RSI is overbought AND price is extended, force all buys to hold
+    if rsi_overbought and price_extended:
+        for s in signals:
+            if s["action"] == "buy":
+                s["action"] = "hold"
+                s["veto"]   = True
+                s["veto_reason"] = f"RSI={rsi:.0f} + price {((price-mean)/mean*100):.1f}% above mean"
+
+    return signals
 
 def weighted_vote(signals):
     buy_w = sell_w = 0.0
@@ -406,10 +512,9 @@ def update_market_regime():
             closes=all_p if len(all_p)>=5 else None
         if closes is None:
             print(f"Regime: no data, keeping {market_regime}"); return
-        ma5  = calc_ma(closes, min(5,  len(closes)))
-        ma10 = calc_ma(closes, min(10, len(closes)))
+        ma5    = calc_ma(closes, min(5,  len(closes)))
+        ma10   = calc_ma(closes, min(10, len(closes)))
         latest = closes[-1]
-        # FIX: use lock when writing shared global
         with _regime_lock:
             if   ma5>ma10*1.005 and latest>ma5: market_regime="trending_up"
             elif ma5<ma10*0.995 and latest<ma5: market_regime="trending_down"
@@ -471,16 +576,48 @@ def position_size(price, account_size=None, pred_score=0, rvol=1.0):
     except Exception as e:
         print(f"  position_size error: {e}"); return 0
 
-# ── Stops ─────────────────────────────────────────────────────
+# ── Stops + partial exits ─────────────────────────────────────
 
 def check_stops(ticker, price):
     pos = open_positions.get(ticker)
     if not pos: return
-    if price > pos["entry"]*1.05:
-        new_stop = max(pos["stop"], pos["entry"]*1.01)
+
+    entry         = pos["entry"]
+    gain_pct      = (price - entry) / entry
+
+    # NEW: partial exit — sell half at PARTIAL_EXIT_PCT gain, let rest run
+    if not pos.get("partial_done") and gain_pct >= PARTIAL_EXIT_PCT:
+        half_qty = max(1, pos["qty"] // 2)
+        try:
+            api.submit_order(symbol=ticker, qty=half_qty, side="sell",
+                             type="market", time_in_force="day")
+            partial_pnl = round((price - entry) * half_qty, 2)
+            open_positions[ticker]["qty"]          = pos["qty"] - half_qty
+            open_positions[ticker]["partial_done"] = True
+            # Move stop to breakeven after partial exit
+            open_positions[ticker]["stop"]         = round(entry * 1.005, 3)
+            print(f"  PARTIAL EXIT {half_qty}x {ticker} @ ${price:.2f} "
+                  f"pnl=${partial_pnl:+.2f} | stop → breakeven")
+            trade_log.insert(0, {
+                "type":"SELL","ticker":ticker,"qty":half_qty,
+                "price":round(price,2),"pnl":partial_pnl,
+                "reason":"partial_exit","ts":int(time.time()*1000)
+            })
+            if LIVE_MODE:
+                save_alert("INFO",
+                    f"PARTIAL EXIT {half_qty}x {ticker} @ ${price:.2f} +${partial_pnl:.2f}",
+                    ticker)
+        except Exception as e:
+            print(f"  Partial exit error {ticker}: {e}")
+        return
+
+    # Trailing stop: once up 5%, move stop to entry+1%
+    if gain_pct > 0.05:
+        new_stop = max(pos["stop"], round(entry * 1.01, 3))
         if new_stop > pos["stop"]:
-            open_positions[ticker]["stop"] = round(new_stop, 3)
+            open_positions[ticker]["stop"] = new_stop
             print(f"  Trail stop {ticker} → ${new_stop:.3f}")
+
     if   price <= pos["stop"]:   force_sell(ticker, price, reason="stop_loss")
     elif price >= pos["target"]: force_sell(ticker, price, reason="take_profit")
 
@@ -494,8 +631,8 @@ def force_sell(ticker, price, reason="stop_loss"):
         pnl     = round((price - entry) * qty, 2)
         api.submit_order(symbol=ticker, qty=qty, side="sell",
                          type="market", time_in_force="day")
-        was_win  = pnl > 0
-        pos_data = open_positions.get(ticker, {})
+        was_win     = pnl > 0
+        pos_data    = open_positions.get(ticker, {})
         active_sigs = pos_data.get("active_signals", [])
 
         try:
@@ -518,7 +655,7 @@ def force_sell(ticker, price, reason="stop_loss"):
         wr   = get_trade_stats_from_db().get("win_rate", 0)
         mode = "🔴 LIVE" if LIVE_MODE else "PAPER"
         print(f"{mode} SELL {qty}x {ticker} @ ${price:.2f} "
-              f"| {reason} | PnL ${pnl:+.2f} | DB WR:{wr:.0f}%")
+              f"| {reason} | PnL ${pnl:+.2f} | WR:{wr:.0f}%")
 
         if LIVE_MODE and abs(pnl) > 1:
             save_alert("INFO" if was_win else "WARN",
@@ -548,10 +685,13 @@ def make_decision(ticker, signals, price):
     if pscore <= PRED_SKIP:
         return "hold", f"pred_skip({pscore})", buy_w, sell_w
 
-    if   pscore >= PRED_STRONG_BUY: bt = st = 1.2
-    elif pscore >= 20:              bt = st = 1.5
-    elif pscore < PRED_NEED_CONF:   bt = 2.5; st = 2.0
-    else:                           bt = BASE_BUY_THRESHOLD; st = BASE_SELL_THRESHOLD
+    # NEW: EOD threshold multiplier — harder to enter near close
+    tod_mult = get_threshold_multiplier()
+
+    if   pscore >= PRED_STRONG_BUY: bt = st = 1.2 * tod_mult
+    elif pscore >= 20:              bt = st = 1.5 * tod_mult
+    elif pscore < PRED_NEED_CONF:   bt = 2.5 * tod_mult; st = 2.0 * tod_mult
+    else:                           bt = BASE_BUY_THRESHOLD * tod_mult; st = BASE_SELL_THRESHOLD * tod_mult
 
     if is_gap and gap_candidates.get(ticker, {}).get("direction") == "up":
         bt = max(1.0, bt-0.3)
@@ -560,10 +700,15 @@ def make_decision(ticker, signals, price):
     if tf_bias == -1:
         bt += 0.8
 
-    # Sector alignment bonus
     hot_sectors = macro_status.get("hot_sectors", [])
     if hot_sectors:
         bt = max(1.0, bt-0.1)
+
+    # Count active vetos — if any signals are vetoed, note it
+    veto_count = sum(1 for s in signals if s.get("veto"))
+    if veto_count >= 2:
+        # 2+ signals vetoed means the setup is compromised — require stronger vote
+        bt = min(bt * 1.3, 5.0)
 
     if   buy_w  >= bt: action = "buy"
     elif sell_w >= st: action = "sell"
@@ -583,10 +728,13 @@ def execute(ticker, action, price, signals, reason="signal"):
             if is_on_cooldown(ticker):
                 print(f"  {ticker} cooldown {cooldown_remaining(ticker)}s"); return
 
-            # FIX: use cached blackout — no DB hit per tick
             blackout, event_name = cached_blackout_today()
             if blackout:
                 print(f"  MACRO BLACKOUT: {event_name} — no trades today"); return
+
+            # NEW: time-of-day gate
+            if not can_enter_new_position():
+                return
 
             earn_risk, earn_adj, earn_detail = check_earnings_risk(api, ticker)
             if earn_risk == "high":
@@ -595,8 +743,7 @@ def execute(ticker, action, price, signals, reason="signal"):
             if LIVE_MODE and not is_day_trade_safe():
                 print(f"  PDT limit — skipping"); return
 
-            today = datetime.now(NY).date()
-            # Check limit BEFORE doing expensive passes_filters/qty work
+            today = now_et().date()
             with _trade_count_lock:
                 if daily_trade_date != today:
                     daily_trade_count = 0; daily_trade_date = today
@@ -611,8 +758,7 @@ def execute(ticker, action, price, signals, reason="signal"):
             rvol       = rvol_cache.get(ticker, 1.0)
             qty        = position_size(price, acct_size, pred_score, rvol)
             if qty == 0:
-                print(f"  {ticker} qty 0")
-                return
+                print(f"  {ticker} qty 0"); return
 
             stop   = round(price*(1-STOP_LOSS_PCT), 3)
             target = round(price*(1+TAKE_PROFIT_PCT), 3)
@@ -625,11 +771,8 @@ def execute(ticker, action, price, signals, reason="signal"):
             except: pass
 
             if (target-price)/price < MIN_PROFIT_PCT:
-                print(f"  {ticker} profit too low")
-                return
+                print(f"  {ticker} profit too low"); return
 
-            # FIX: increment ONLY when we're actually about to submit the order
-            # No rollback needed — if submit_order fails, we catch the exception below
             with _trade_count_lock:
                 if daily_trade_count >= MAX_DAILY_TRADES:
                     print(f"  Daily limit reached (race)"); return
@@ -642,8 +785,9 @@ def execute(ticker, action, price, signals, reason="signal"):
             active_sigs = [s["name"] for s in signals if s["action"]=="buy"]
             ts = int(time.time()*1000)
             open_positions[ticker] = {
-                "entry":price,"stop":stop,"target":target,
-                "qty":qty,"atr":atr,"active_signals":active_sigs
+                "entry":price, "stop":stop, "target":target,
+                "qty":qty, "atr":atr, "active_signals":active_sigs,
+                "partial_done": False,   # NEW: tracks partial exit
             }
 
             try:
@@ -675,7 +819,7 @@ def execute(ticker, action, price, signals, reason="signal"):
     except Exception as e:
         print(f"Order error {ticker}: {e}")
 
-# ── Fallback + scan ───────────────────────────────────────────
+# ── Universe / tickers ────────────────────────────────────────
 
 def validate_fallback_tickers():
     global active_tickers
@@ -726,13 +870,74 @@ def apply_scan_results(results_today, acct_size=None):
             save_scan_result(new_tickers, scores)
         except: pass
 
-# ── Gap scanner ───────────────────────────────────────────────
+# NEW: dynamic rvol promotion — swap in high-rvol tickers from seed universe
+def promote_rvol_tickers():
+    """
+    Checks the seed universe every 15 minutes for tickers with exceptional
+    rvol (>= RVOL_PROMOTE_MIN). If found and affordable, promotes them into
+    the active list, replacing the lowest-scored current ticker.
+    """
+    global active_tickers
+    _, SEED = get_scanner()
+    candidates = SEED if SEED else FALLBACK_TICKERS
+    acct_size  = get_account_size()
+    floor      = get_price_floor(acct_size)
+    ceiling    = get_price_ceiling(acct_size)
+    promoted   = []
+
+    # Only check tickers NOT already being watched
+    check = [t for t in candidates if t not in active_tickers][:30]
+    for ticker in check:
+        try:
+            bar   = api.get_latest_bar(ticker, feed="iex")
+            price = float(bar.c)
+            if not (floor <= price <= ceiling):
+                continue
+
+            end   = datetime.now(pytz.utc) - timedelta(minutes=20)
+            start = end - timedelta(days=10)
+            bars  = api.get_bars(ticker,"1Day",
+                        start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        limit=10, feed="iex").df
+            if bars is None or bars.empty: continue
+            if hasattr(bars.index,'levels'):
+                if ticker in bars.index.get_level_values(0): bars=bars.loc[ticker]
+                else: continue
+
+            avg_vol   = float(bars["volume"].mean())
+            now       = now_et()
+            mins_open = max(1,(now.hour-9)*60+now.minute-30)
+            projected = float(bar.v)*(390/mins_open) if mins_open<390 else float(bar.v)
+            rvol      = projected/avg_vol if avg_vol>0 else 1.0
+
+            if rvol >= RVOL_PROMOTE_MIN:
+                promoted.append({"ticker":ticker,"price":price,"rvol":round(rvol,2)})
+                rvol_cache[ticker] = round(rvol, 2)
+                print(f"  PROMOTE {ticker} rvol={rvol:.1f}x @ ${price:.2f}")
+
+            time.sleep(0.15)
+        except: continue
+
+    if promoted:
+        promoted.sort(key=lambda x: x["rvol"], reverse=True)
+        for p in promoted[:2]:   # promote up to 2 tickers at a time
+            t = p["ticker"]
+            if t not in active_tickers:
+                # Replace last ticker in list (lowest priority)
+                if len(active_tickers) >= 5:
+                    removed = active_tickers[-1]
+                    active_tickers = active_tickers[:-1]
+                    print(f"  Swapped {removed} → {t} (rvol {p['rvol']}x)")
+                active_tickers = [t] + active_tickers
+                price_history.setdefault(t, [])
+                volume_history.setdefault(t, [])
+        print(f"Active tickers after promotion: {active_tickers}")
 
 def run_gap_scan():
     global gap_candidates, active_tickers
     print("=== Gap scan ===")
     _, SEED_UNIVERSE = get_scanner()
-    # FIX: fallback to FALLBACK_TICKERS if scanner import failed or returned empty
     seed = SEED_UNIVERSE if SEED_UNIVERSE else FALLBACK_TICKERS
     acct_size = get_account_size()
     floor     = get_price_floor(acct_size)
@@ -777,7 +982,7 @@ def run_gap_scan():
             price_history[t]  = ph if ph else []
             volume_history[t] = vh if vh else []
     socketio.emit("gaps", {"candidates":list(candidates.values()),
-                            "scanned_at":datetime.now(NY).strftime("%I:%M %p ET")})
+                            "scanned_at":now_et().strftime("%I:%M %p ET")})
     print(f"=== Gap scan: {len(candidates)} candidates ===")
 
 def update_rvol():
@@ -796,7 +1001,7 @@ def update_rvol():
             avg_vol   = float(bars["volume"].mean())
             latest    = api.get_latest_bar(ticker, feed="iex")
             today_vol = float(latest.v)
-            now       = datetime.now(NY)
+            now       = now_et()
             mins_open = max(1,(now.hour-9)*60+now.minute-30)
             projected = today_vol*(390/mins_open) if mins_open<390 else today_vol
             rvol      = projected/avg_vol if avg_vol>0 else 1.0
@@ -811,7 +1016,7 @@ def macro_loop():
     macro_done = set(); macro_day = None
     while True:
         try:
-            now  = datetime.now(NY); hour = now.hour; day = now.date()
+            now  = now_et(); hour = now.hour; day = now.date()
             if day != macro_day: macro_done.clear(); macro_day = day
             if now.weekday()<5 and hour in MACRO_REFRESH_HOURS and hour not in macro_done:
                 macro_done.add(hour)
@@ -824,7 +1029,6 @@ def macro_loop():
                     except: status["hot_sectors"] = []
                     macro_status.update(status)
                     _, SEED = get_scanner()
-                    # FIX: fallback so unusual volume scan always has something to check
                     scan_universe = SEED if SEED else FALLBACK_TICKERS
                     acct_size = get_account_size()
                     uv = scan_unusual_volume(api, scan_universe, acct_size)
@@ -844,20 +1048,32 @@ def macro_loop():
 
 def premarket_loop():
     gap_day = None; rvol_buckets = set(); rvol_day = None
+    promote_buckets = set(); promote_day = None
     while True:
         try:
-            now = datetime.now(NY); day = now.date()
-            if day != rvol_day: rvol_buckets.clear(); rvol_day = day
+            now = now_et(); day = now.date()
+            if day != rvol_day:     rvol_buckets.clear();    rvol_day    = day
+            if day != promote_day:  promote_buckets.clear(); promote_day = day
+
             if now.weekday()<5 and now.hour==8 and now.minute>=45 and gap_day!=day:
                 gap_day = day
                 try: run_gap_scan()
                 except Exception as e: print(f"Gap scan error: {e}")
+
             if now.weekday()<5 and in_trading_window() and is_market_open():
                 bucket = now.hour*4+now.minute//15
+
                 if bucket not in rvol_buckets:
                     rvol_buckets.add(bucket)
                     try: update_rvol(); socketio.emit("rvol", rvol_cache)
                     except Exception as e: print(f"RVOL error: {e}")
+
+                # NEW: dynamic rvol promotion — runs every 15 min same bucket cadence
+                if bucket not in promote_buckets:
+                    promote_buckets.add(bucket)
+                    try: promote_rvol_tickers()
+                    except Exception as e: print(f"Promote error: {e}")
+
         except Exception as e: print(f"Premarket loop error: {e}")
         time.sleep(60)
 
@@ -866,7 +1082,7 @@ def prediction_loop():
     pred_done = set(); pred_day = None; last_tickers = []
     while True:
         try:
-            now  = datetime.now(NY); hour = now.hour; day = now.date()
+            now  = now_et(); hour = now.hour; day = now.date()
             if day != pred_day: pred_done.clear(); pred_day = day
             changed = set(active_tickers) != set(last_tickers)
             should  = (now.weekday()<5 and in_trading_window() and
@@ -900,7 +1116,7 @@ def scanner_loop():
     print("Scanner loop started")
     while True:
         try:
-            now  = datetime.now(NY); hour = now.hour; day = now.date()
+            now  = now_et(); hour = now.hour; day = now.date()
             if day != scan_day: scan_done.clear(); scan_day = day
             if (now.weekday()<5 and hour in SCAN_HOURS
                     and hour not in scan_done and in_trading_window()):
@@ -947,14 +1163,14 @@ def db_snapshot_loop():
 
 def bot_loop():
     global market_regime
-    last_regime    = None
-    last_blackout  = None   # FIX: only close positions once on blackout, not every tick
+    last_regime   = None
+    last_blackout = None
     while True:
         try:
-            now          = datetime.now(NY)
-            market_open  = is_market_open()
-            window_open  = in_trading_window()
-            mode         = "🔴LIVE" if LIVE_MODE else "paper"
+            now         = now_et()
+            market_open = is_market_open()
+            window_open = in_trading_window()
+            mode        = "🔴LIVE" if LIVE_MODE else "paper"
             print(f"[{mode}] {now.strftime('%H:%M')} ET | "
                   f"mkt={market_open} win={window_open} | "
                   f"{active_tickers} | {market_regime}")
@@ -971,7 +1187,6 @@ def bot_loop():
                     "message":"Warming up — market opens 9:30 AM ET","live":LIVE_MODE})
                 time.sleep(30); continue
 
-            # FIX: use cached blackout — single DB hit per day
             blackout, event_name = cached_blackout_today()
             if blackout:
                 if last_blackout != now.strftime("%Y-%m-%d"):
@@ -991,7 +1206,9 @@ def bot_loop():
 
             state = {"tickers":{},"account":{},"market_status":"open",
                      "regime":market_regime,"live":LIVE_MODE,
-                     "blackout":False,"macro":macro_status}
+                     "blackout":False,"macro":macro_status,
+                     "mins_since_open": mins_since_open(),
+                     "mins_until_close": mins_until_close()}
 
             for ticker in list(active_tickers):
                 try:
@@ -1011,25 +1228,28 @@ def bot_loop():
                     cd   = cooldown_remaining(ticker)
                     n_b  = sum(1 for s in sigs if s["action"]=="buy")
                     n_s  = sum(1 for s in sigs if s["action"]=="sell")
+                    n_v  = sum(1 for s in sigs if s.get("veto"))
                     state["tickers"][ticker] = {
-                        "price":      round(price, 2),
-                        "signals":    sigs,
-                        "action":     action,
-                        "buy_weight": buy_w,
-                        "sell_weight":sell_w,
-                        "stop":       pos["stop"]   if pos else None,
-                        "target":     pos["target"] if pos else None,
-                        "cooldown":   cd,
-                        "grade":      ticker_grades.get(ticker, "—"),
-                        "pred_score": pred.get("score",   None),
-                        "pred_label": pred.get("label",   "—"),
-                        "pred_conf":  pred.get("confidence","—"),
-                        "tf_bias":    pred.get("tf_bias",  0),
-                        "rvol":       rvol_cache.get(ticker, None),
-                        "is_gap":     ticker in gap_candidates,
+                        "price":       round(price, 2),
+                        "signals":     sigs,
+                        "action":      action,
+                        "buy_weight":  buy_w,
+                        "sell_weight": sell_w,
+                        "stop":        pos["stop"]    if pos else None,
+                        "target":      pos["target"]  if pos else None,
+                        "partial_done":pos.get("partial_done", False) if pos else False,
+                        "cooldown":    cd,
+                        "grade":       ticker_grades.get(ticker, "—"),
+                        "pred_score":  pred.get("score",  None),
+                        "pred_label":  pred.get("label",  "—"),
+                        "pred_conf":   pred.get("confidence","—"),
+                        "tf_bias":     pred.get("tf_bias", 0),
+                        "rvol":        rvol_cache.get(ticker, None),
+                        "is_gap":      ticker in gap_candidates,
+                        "veto_count":  n_v,
                     }
                     print(f"  {ticker}: ${price:.2f} | {action} | "
-                          f"v={n_b}b/{n_s}s w={buy_w:.1f}/{sell_w:.1f} | "
+                          f"v={n_b}b/{n_s}s veto={n_v} w={buy_w:.1f}/{sell_w:.1f} | "
                           f"{market_regime} pred={pred.get('score',0):+.0f}"
                           +(f" rvol={rvol_cache.get(ticker,0):.1f}x" if ticker in rvol_cache else "")
                           +(f" GAP" if ticker in gap_candidates else "")
@@ -1089,8 +1309,9 @@ def on_connect():
                     state["tickers"][ticker] = {
                         "price":round(price,2),"signals":sigs,
                         "action":action,"buy_weight":buy_w,"sell_weight":sell_w,
-                        "stop":pos["stop"]   if pos else None,
+                        "stop":pos["stop"]    if pos else None,
                         "target":pos["target"] if pos else None,
+                        "partial_done":pos.get("partial_done",False) if pos else False,
                         "cooldown":cooldown_remaining(ticker),
                         "grade":ticker_grades.get(ticker,"—"),
                         "pred_score":pred.get("score",None),
@@ -1098,6 +1319,7 @@ def on_connect():
                         "tf_bias":pred.get("tf_bias",0),
                         "rvol":rvol_cache.get(ticker,None),
                         "is_gap":ticker in gap_candidates,
+                        "veto_count":sum(1 for s in sigs if s.get("veto")),
                     }
                 except Exception as e:
                     print(f"on_connect {ticker}: {e}")
@@ -1115,7 +1337,7 @@ def on_connect():
         if macro_status: socketio.emit("macro", macro_status)
         if gap_candidates:
             socketio.emit("gaps", {"candidates":list(gap_candidates.values()),
-                                    "scanned_at":datetime.now(NY).strftime("%I:%M %p ET")})
+                                    "scanned_at":now_et().strftime("%I:%M %p ET")})
         if rvol_cache: socketio.emit("rvol", rvol_cache)
         if backtest_cache: socketio.emit("backtest_result", backtest_cache)
         alerts = get_alerts(limit=10, unacknowledged_only=True)
@@ -1152,7 +1374,7 @@ def backtest_data_json(): return jsonify(backtest_cache)
 @app.route("/gaps")
 def gaps_json():
     return jsonify({"candidates":list(gap_candidates.values()),
-                    "scanned_at":datetime.now(NY).strftime("%I:%M %p ET")})
+                    "scanned_at":now_et().strftime("%I:%M %p ET")})
 
 @app.route("/macro")
 def macro_json(): return jsonify(macro_status)
@@ -1189,6 +1411,8 @@ def stats_json():
         "unusual_volume":       unusual_volume[:5],
         "active_tickers":       active_tickers,
         "market_regime":        market_regime,
+        "mins_since_open":      mins_since_open(),
+        "mins_until_close":     mins_until_close(),
     })
 
 @app.route("/scan/manual", methods=["POST"])
@@ -1261,18 +1485,11 @@ def ping(): return "pong", 200
 
 # ── Startup ───────────────────────────────────────────────────
 
-
-# ── Startup — runs regardless of how app is launched ─────────
-# Works with: python app.py  OR  gunicorn with eventlet worker
-# Threads are started at module load time. socketio.run() is only
-# called when launched directly (gunicorn handles serving instead).
-
 def _start_bot():
-    """Initialize DB, seed calendar, launch all background threads."""
     port = int(os.environ.get("PORT", 10000))
-    print(f"=== BOT v10 | port {port} | {'🔴 LIVE' if LIVE_MODE else '📄 PAPER'} ===")
-    print(f"=== DEFAULT_MAX=${DEFAULT_MAX_ACCOUNT} | PDT={MAX_DAILY_TRADES} | "
-          f"WINDOW={TRADING_START_H}:{TRADING_START_M:02d}–{TRADING_END_H}:{TRADING_END_M:02d} ET ===")
+    print(f"=== BOT v11 | port {port} | {'🔴 LIVE' if LIVE_MODE else '📄 PAPER'} ===")
+    print(f"=== Improvements: time-of-day gates | veto signals | partial exits | "
+          f"dynamic rvol promotion | live P&L ===")
 
     try:
         init_db()
@@ -1285,16 +1502,14 @@ def _start_bot():
 
     def startup():
         time.sleep(3)
-        print("=== Startup: regime ===")
         update_market_regime()
-        print("=== Startup: fallback tickers ===")
         validate_fallback_tickers()
-        print("=== Startup: macro status ===")
         try:
             status = get_macro_status(api)
             status["hot_sectors"] = get_hot_sectors(api)
             macro_status.update(status)
-            print(f"Macro: blackout={status.get('blackout')} sectors={status.get('hot_sectors')}")
+            print(f"Macro: blackout={status.get('blackout')} "
+                  f"sectors={status.get('hot_sectors')}")
         except Exception as e:
             print(f"Startup macro error: {e}")
         print(f"=== Ready | tickers={active_tickers} | regime={market_regime} ===")
@@ -1309,9 +1524,7 @@ def _start_bot():
 
     return port
 
-# Start everything at import time (works for gunicorn AND python app.py)
 _port = _start_bot()
 
 if __name__ == "__main__":
-    # Direct launch: python app.py
     socketio.run(app, host="0.0.0.0", port=_port)
