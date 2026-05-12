@@ -525,6 +525,12 @@ def update_market_regime():
 
 # ── Filters ───────────────────────────────────────────────────
 
+# Cache: volume check per ticker per day to avoid fetching bars on every buy attempt
+_vol_check_cache = {}  # { ticker: (date, passed_bool) }
+
+# Cache: earnings risk per ticker per day — avoids news API call every 30s
+_earnings_cache = {}   # { ticker: (date, (risk_level, adj, detail)) }
+
 def passes_filters(ticker, price, account_size=None):
     if account_size is None: account_size = get_account_size()
     floor   = get_price_floor(account_size)
@@ -535,9 +541,19 @@ def passes_filters(ticker, price, account_size=None):
     grade = ticker_grades.get(ticker)
     if grade and grade not in MIN_GRADE:
         print(f"  {ticker} grade {grade} excluded"); return False
+
+    # rvol check — skip if 0.0/None (means bar.v was 0 from IEX, not real data)
     rvol = rvol_cache.get(ticker)
-    if rvol is not None and rvol < RVOL_THRESHOLD:
+    if rvol is not None and rvol > 0.10 and rvol < RVOL_THRESHOLD:
         print(f"  {ticker} rvol {rvol:.2f}x low"); return False
+
+    # Volume check — cached per day to avoid hitting Alpaca on every 30s tick
+    today_str = now_et().strftime("%Y-%m-%d")
+    cached_vol = _vol_check_cache.get(ticker)
+    if cached_vol and cached_vol[0] == today_str:
+        if not cached_vol[1]:
+            print(f"  {ticker} low volume (cached)"); return False
+        return True
     try:
         end   = datetime.now(pytz.utc) - timedelta(minutes=20)
         start = end - timedelta(days=5)
@@ -545,11 +561,14 @@ def passes_filters(ticker, price, account_size=None):
                     start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     limit=5, feed="iex").df
-        if bars is None or bars.empty: return False
+        if bars is None or bars.empty:
+            _vol_check_cache[ticker] = (today_str, False); return False
         if hasattr(bars.index,'levels'):
             if ticker in bars.index.get_level_values(0): bars=bars.loc[ticker]
-            else: return False
-        if float(bars["volume"].mean()) < min_vol:
+            else: _vol_check_cache[ticker] = (today_str, False); return False
+        passed = float(bars["volume"].mean()) >= min_vol
+        _vol_check_cache[ticker] = (today_str, passed)
+        if not passed:
             print(f"  {ticker} low volume"); return False
         return True
     except Exception as e:
@@ -736,7 +755,14 @@ def execute(ticker, action, price, signals, reason="signal"):
             if not can_enter_new_position():
                 return
 
-            earn_risk, earn_adj, earn_detail = check_earnings_risk(api, ticker)
+            # Earnings risk — cached per ticker per day (avoids news API hit every 30s)
+            today_str = now_et().strftime("%Y-%m-%d")
+            cached_earn = _earnings_cache.get(ticker)
+            if cached_earn and cached_earn[0] == today_str:
+                earn_risk, earn_adj, earn_detail = cached_earn[1]
+            else:
+                earn_risk, earn_adj, earn_detail = check_earnings_risk(api, ticker)
+                _earnings_cache[ticker] = (today_str, (earn_risk, earn_adj, earn_detail))
             if earn_risk == "high":
                 print(f"  {ticker} earnings risk HIGH — skipping"); return
 
@@ -1003,11 +1029,18 @@ def update_rvol():
             today_vol = float(latest.v)
             now       = now_et()
             mins_open = max(1,(now.hour-9)*60+now.minute-30)
+            # IEX sometimes returns v=0 for low-volume tickers — fall back to history
+            if today_vol <= 0:
+                vols = volume_history.get(ticker, [])
+                if vols: today_vol = sum(vols[-10:]) * (390 / mins_open / 10)
             projected = today_vol*(390/mins_open) if mins_open<390 else today_vol
             rvol      = projected/avg_vol if avg_vol>0 else 1.0
-            rvol_cache[ticker] = round(rvol, 2)
+            # Only store if it looks real (not another zero)
+            if rvol > 0:
+                rvol_cache[ticker] = round(rvol, 2)
+                print(f"  rvol {ticker}: {rvol:.2f}x")
             time.sleep(0.2)
-        except: pass
+        except Exception as e: print(f"  update_rvol {ticker}: {e}")
 
 # ── Background loops ──────────────────────────────────────────
 
@@ -1055,10 +1088,14 @@ def premarket_loop():
             if day != rvol_day:     rvol_buckets.clear();    rvol_day    = day
             if day != promote_day:  promote_buckets.clear(); promote_day = day
 
-            if now.weekday()<5 and now.hour==8 and now.minute>=45 and gap_day!=day:
-                gap_day = day
-                try: run_gap_scan()
-                except Exception as e: print(f"Gap scan error: {e}")
+            # Gap scan: 8:45 AM premarket OR first time in window after a mid-day deploy
+            if now.weekday()<5 and gap_day!=day:
+                premarket_ready = (now.hour==8 and now.minute>=45)
+                inday_first_run = in_trading_window() and is_market_open()
+                if premarket_ready or inday_first_run:
+                    gap_day = day
+                    try: run_gap_scan()
+                    except Exception as e: print(f"Gap scan error: {e}")
 
             if now.weekday()<5 and in_trading_window() and is_market_open():
                 bucket = now.hour*4+now.minute//15
@@ -1215,9 +1252,18 @@ def bot_loop():
                     bar   = api.get_latest_bar(ticker, feed="iex")
                     price = float(bar.c); vol = float(bar.v)
                     price_history.setdefault(ticker, []).append(price)
-                    volume_history.setdefault(ticker, []).append(vol)
+                    # Store volume DELTA (not cumulative) so VWAP and rvol estimates are correct.
+                    # bar.v from get_latest_bar is total volume today — we want the increment.
+                    prev_vol = volume_history[ticker][-1] if volume_history.get(ticker) else 0
+                    vol_delta = max(0, vol - prev_vol) if prev_vol > 0 else vol
+                    volume_history.setdefault(ticker, []).append(vol_delta)
                     if len(price_history[ticker])  > 200: price_history[ticker].pop(0)
                     if len(volume_history[ticker]) > 200: volume_history[ticker].pop(0)
+                    # Live rvol estimate from accumulated deltas (fallback if update_rvol hasn't fired)
+                    if vol_delta > 0 and len(volume_history[ticker]) >= 10:
+                        hist_mean = sum(volume_history[ticker]) / len(volume_history[ticker])
+                        if hist_mean > 0:
+                            rvol_cache[ticker] = round(vol_delta / hist_mean, 2)
                     check_stops(ticker, price)
                     sigs              = get_signals(ticker, price)
                     action, reason, buy_w, sell_w = make_decision(ticker, sigs, price)
@@ -1301,7 +1347,8 @@ def on_connect():
                     bar   = api.get_latest_bar(ticker, feed="iex")
                     price = float(bar.c)
                     price_history.setdefault(ticker, []).append(price)
-                    volume_history.setdefault(ticker, []).append(float(bar.v))
+                    vol_delta = float(bar.v) if not volume_history.get(ticker) else max(0, float(bar.v) - sum(volume_history[ticker]))
+                    volume_history.setdefault(ticker, []).append(max(0, vol_delta))
                     sigs  = get_signals(ticker, price)
                     action, reason, buy_w, sell_w = make_decision(ticker, sigs, price)
                     pos   = open_positions.get(ticker)
