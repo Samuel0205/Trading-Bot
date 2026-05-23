@@ -400,14 +400,26 @@ def predict_ticker(api, ticker, regime="ranging"):
         elif tf_bias == -1:                   tf_multiplier = 1.2
         else:                                 tf_multiplier = 1.0
 
+        # Congressional STOCK Act activity — scale 0-25 raw score to max +15 points.
+        # Politician buys are a lagging signal (30-45 day disclosure delay) but
+        # carry meaningful forward-looking value as a confirmation signal.
+        pol_raw = 0
+        try:
+            from politician_tracker import get_ticker_scores
+            pol_raw = get_ticker_scores().get(ticker, 0)
+        except Exception:
+            pass
+        pol_pred_score = round(min(15, pol_raw * 0.6), 1)
+
         total = (
-            sent_score * 1.0 +
-            dir_score  * 1.0 * tf_multiplier +
-            vol_score  * 0.5 +
-            pat_score  * 0.8 * tf_multiplier +
-            earn_adj   * 1.0 +
-            mkt_score  * 0.7 +
-            tf_bias    * 10
+            sent_score     * 1.0 +
+            dir_score      * 1.0 * tf_multiplier +
+            vol_score      * 0.5 +
+            pat_score      * 0.8 * tf_multiplier +
+            earn_adj       * 1.0 +
+            mkt_score      * 0.7 +
+            tf_bias        * 10  +
+            pol_pred_score * 1.0
         )
         total = max(-100, min(100, round(total, 1)))
 
@@ -429,13 +441,14 @@ def predict_ticker(api, ticker, regime="ranging"):
             "tf_bias":    tf_bias,
             "tf_detail":  tf_detail,
             "components": {
-                "sentiment_trend":  {"score": sent_score, "direction": sent_dir, "daily": sent_daily},
-                "price_direction":  {"score": dir_score,  "confidence": dir_conf, "signals": dir_sigs},
-                "volatility":       {"score": vol_score,  "state": vol_state, "details": vol_det},
-                "pattern":          {"score": pat_score,  "name": pat_name, "description": pat_desc},
-                "earnings_risk":    {"level": earn_risk_lv, "adjustment": earn_adj},
-                "market_condition": {"condition": mkt_cond, "score": mkt_score, "vix_move": vix_move},
-                "timeframe":        {"bias": tf_bias, "detail": tf_detail},
+                "sentiment_trend":    {"score": sent_score,    "direction": sent_dir, "daily": sent_daily},
+                "price_direction":    {"score": dir_score,     "confidence": dir_conf, "signals": dir_sigs},
+                "volatility":         {"score": vol_score,     "state": vol_state, "details": vol_det},
+                "pattern":            {"score": pat_score,     "name": pat_name, "description": pat_desc},
+                "earnings_risk":      {"level": earn_risk_lv,  "adjustment": earn_adj},
+                "market_condition":   {"condition": mkt_cond,  "score": mkt_score, "vix_move": vix_move},
+                "timeframe":          {"bias": tf_bias,        "detail": tf_detail},
+                "politician_activity":{"score": pol_pred_score, "raw_score": pol_raw},
             },
             "signals": dir_sigs,
         })
