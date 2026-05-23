@@ -135,6 +135,7 @@ _blackout_cache      = {"date": None, "result": (False, None)}
 _blackout_cache_lock = threading.Lock()
 _regime_lock         = threading.Lock()
 _trade_count_lock    = threading.Lock()
+_positions_lock      = threading.Lock()   # guards open_positions check-then-set
 
 NY = pytz.timezone("America/New_York")
 
@@ -645,7 +646,9 @@ def force_sell(ticker, price, reason="stop_loss"):
         pos_api = api.get_position(ticker)
         qty     = int(pos_api.qty)
         if qty <= 0:
-            open_positions.pop(ticker, None); return
+            with _positions_lock:
+                open_positions.pop(ticker, None)
+            return
         entry   = float(pos_api.avg_entry_price)
         pnl     = round((price - entry) * qty, 2)
         api.submit_order(symbol=ticker, qty=qty, side="sell",
@@ -668,7 +671,8 @@ def force_sell(ticker, price, reason="stop_loss"):
             "price":round(price,2),"pnl":pnl,"reason":reason,
             "ts":int(time.time()*1000)
         })
-        open_positions.pop(ticker, None)
+        with _positions_lock:
+            open_positions.pop(ticker, None)
         set_cooldown(ticker, reason)
 
         wr   = get_trade_stats_from_db().get("win_rate", 0)
@@ -805,16 +809,23 @@ def execute(ticker, action, price, signals, reason="signal"):
                 daily_trade_count += 1
                 current_count = daily_trade_count
 
+            # Final race check under lock — prevents duplicate orders if two
+            # threads somehow reach this point for the same ticker simultaneously.
+            with _positions_lock:
+                if ticker in open_positions:
+                    print(f"  {ticker} position opened concurrently, skipping"); return
+
             api.submit_order(symbol=ticker, qty=qty, side="buy",
                              type="market", time_in_force="day")
 
             active_sigs = [s["name"] for s in signals if s["action"]=="buy"]
             ts = int(time.time()*1000)
-            open_positions[ticker] = {
-                "entry":price, "stop":stop, "target":target,
-                "qty":qty, "atr":atr, "active_signals":active_sigs,
-                "partial_done": False,   # NEW: tracks partial exit
-            }
+            with _positions_lock:
+                open_positions[ticker] = {
+                    "entry":price, "stop":stop, "target":target,
+                    "qty":qty, "atr":atr, "active_signals":active_sigs,
+                    "partial_done": False,
+                }
 
             try:
                 save_trade_open(ticker, qty, price, stop, target, pred_score,
@@ -1200,8 +1211,10 @@ def db_snapshot_loop():
 
 def bot_loop():
     global market_regime
-    last_regime   = None
-    last_blackout = None
+    last_regime    = None
+    last_blackout  = None
+    eod_closed_date = None   # tracks which day we've already EOD-closed
+    hard_close_date = None   # tracks which day the 3:55 failsafe has fired
     while True:
         try:
             now         = now_et()
@@ -1211,6 +1224,28 @@ def bot_loop():
             print(f"[{mode}] {now.strftime('%H:%M')} ET | "
                   f"mkt={market_open} win={window_open} | "
                   f"{active_tickers} | {market_regime}")
+
+            # EOD hard close — must run BEFORE the window_open check because
+            # in_trading_window() returns False at exactly 3:30 PM ET, making
+            # any check inside the window block unreachable at that time.
+            if now.weekday() < 5 and now.hour == 15 and now.minute >= 28:
+                if eod_closed_date != now.date():
+                    eod_closed_date = now.date()
+                    close_all_positions_eod()
+
+            # Hard failsafe at 3:55 PM — Alpaca-native cancel+close regardless of
+            # position tracking state. Fires once per day only.
+            if now.weekday() < 5 and now.hour == 15 and now.minute >= 55:
+                if hard_close_date != now.date():
+                    hard_close_date = now.date()
+                    try:
+                        api.cancel_all_orders()
+                        api.close_all_positions()
+                        with _positions_lock:
+                            open_positions.clear()
+                        print("Hard failsafe: Alpaca cancel+close all fired at 3:55 PM")
+                    except Exception as e:
+                        print(f"Hard failsafe error: {e}")
 
             if not window_open:
                 socketio.emit("state", {"tickers":{},"account":get_account_state(),
@@ -1236,10 +1271,6 @@ def bot_loop():
 
             if not last_regime or (now - last_regime).total_seconds() > 1800:
                 update_market_regime(); last_regime = now
-
-            if now.hour == 15 and now.minute >= 30:
-                close_all_positions_eod()
-                time.sleep(600); continue
 
             state = {"tickers":{},"account":{},"market_status":"open",
                      "regime":market_regime,"live":LIVE_MODE,
@@ -1532,6 +1563,43 @@ def ping(): return "pong", 200
 
 # ── Startup ───────────────────────────────────────────────────
 
+def reconcile_open_positions():
+    """
+    Sync open_positions with Alpaca on startup to survive bot restarts.
+    Any live position not already in open_positions is restored with fallback
+    stop/target so the bot immediately manages its risk.
+    """
+    try:
+        alpaca_positions = api.list_positions()
+        if not alpaca_positions:
+            print("Reconcile: no open positions in Alpaca")
+            return
+        restored = 0
+        for pos in alpaca_positions:
+            ticker = pos.symbol
+            if ticker in open_positions:
+                continue
+            entry  = float(pos.avg_entry_price)
+            qty    = int(pos.qty)
+            stop   = round(entry * (1 - STOP_LOSS_PCT), 3)
+            target = round(entry * (1 + TAKE_PROFIT_PCT), 3)
+            with _positions_lock:
+                open_positions[ticker] = {
+                    "entry": entry, "stop": stop, "target": target,
+                    "qty": qty, "atr": None, "active_signals": [],
+                    "partial_done": False,
+                }
+            price_history.setdefault(ticker, [])
+            volume_history.setdefault(ticker, [])
+            restored += 1
+            print(f"  Reconcile restored: {qty}x {ticker} @ ${entry:.2f} "
+                  f"SL${stop:.3f} TP${target:.3f}")
+        if restored:
+            print(f"Reconcile: {restored} position(s) restored from Alpaca")
+    except Exception as e:
+        print(f"Reconcile error: {e}")
+
+
 def _start_bot():
     port = int(os.environ.get("PORT", 10000))
     print(f"=== BOT v11 | port {port} | {'🔴 LIVE' if LIVE_MODE else '📄 PAPER'} ===")
@@ -1551,6 +1619,7 @@ def _start_bot():
         time.sleep(3)
         update_market_regime()
         validate_fallback_tickers()
+        reconcile_open_positions()
         try:
             status = get_macro_status(api)
             status["hot_sectors"] = get_hot_sectors(api)
