@@ -262,7 +262,7 @@ def get_price_data(api, ticker):
 
 # ── Composite scoring ─────────────────────────────────────────
 
-def composite_score(pd, sentiment, news_count, account_size):
+def composite_score(pd, sentiment, news_count, account_size, politician_score=0):
     s  = abs(pd["change_pct"]) * 2.5
     s += abs(pd["rs_5d"])      * 1.5
     vr = pd["vol_ratio"]
@@ -283,6 +283,8 @@ def composite_score(pd, sentiment, news_count, account_size):
     elif account_size < 200:
         if   pd["price"] < 5: s +=  8
         elif pd["price"] < 8: s +=  3
+    if politician_score > 0:
+        s += politician_score * 3.5
     return round(s, 2)
 
 def risk_grade(pd):
@@ -301,6 +303,16 @@ def run_scan(api, universe, days_back=1, account_size=20):
     print(f"\n=== Scanning {len(universe)} stocks ({label}) | acct ${account_size:.2f} ===")
     results = []
 
+    # Fetch politician scores once per scan cycle (cached 6 hrs, ~free API)
+    pol_scores = {}
+    try:
+        from politician_tracker import get_ticker_scores
+        pol_scores = get_ticker_scores()
+        if pol_scores:
+            print(f"  Politician scores: {len(pol_scores)} tickers tracked")
+    except Exception as e:
+        print(f"  politician_tracker unavailable: {e}")
+
     for stock in universe:
         ticker = stock["symbol"]
         try:
@@ -311,7 +323,8 @@ def run_scan(api, universe, days_back=1, account_size=20):
                 continue
             headlines          = get_headlines(api, ticker, days_back=days_back)
             sentiment, method  = finbert_score(headlines)
-            score              = composite_score(pd, sentiment, len(headlines), account_size)
+            pol_score          = pol_scores.get(ticker, 0)
+            score              = composite_score(pd, sentiment, len(headlines), account_size, pol_score)
             grade              = risk_grade(pd)
             results.append({
                 "ticker":      ticker,
@@ -326,6 +339,7 @@ def run_scan(api, universe, days_back=1, account_size=20):
                 "score":       score,
                 "grade":       grade,
                 "direction":   "up" if pd["change_pct"] > 0 else "down",
+                "pol_score":   pol_score,
             })
             time.sleep(0.1)
         except Exception as e:
@@ -354,6 +368,22 @@ def run_full_scan(api):
 
     universe = build_universe(api, max_price, min_price, min_vol)
 
+    # Hard-include tickers with notable recent congressional buy activity.
+    # They're added to the universe so run_scan() evaluates them and applies
+    # the politician score boost — they still must pass price/volume filters.
+    pol_tickers = []
+    try:
+        from politician_tracker import get_politician_tickers
+        pol_tickers = get_politician_tickers()
+        existing    = {s["symbol"] for s in universe}
+        added       = [t for t in pol_tickers if t not in existing]
+        for t in added:
+            universe.append({"symbol": t, "price": 0.0, "volume": 0})
+        if added:
+            print(f"  Politician-tracked tickers added to universe: {added}")
+    except Exception as e:
+        print(f"  politician_tracker expand error: {e}")
+
     if not universe:
         print("Universe empty — using fallback")
         universe = [{"symbol": s, "price": 1.0, "volume": 500_000}
@@ -364,10 +394,11 @@ def run_full_scan(api):
     yesterday = run_scan(api, universe, days_back=2, account_size=account_size)
 
     return {
-        "today":         today,
-        "yesterday":     yesterday,
-        "scanned_at":    datetime.now(NY).strftime("%I:%M %p ET"),
-        "account_size":  round(account_size, 2),
-        "price_range":   f"${min_price}–${max_price:.2f}",
-        "universe_size": len(universe),
+        "today":               today,
+        "yesterday":           yesterday,
+        "scanned_at":          datetime.now(NY).strftime("%I:%M %p ET"),
+        "account_size":        round(account_size, 2),
+        "price_range":         f"${min_price}–${max_price:.2f}",
+        "universe_size":       len(universe),
+        "politician_tickers":  pol_tickers[:10],
     }
