@@ -389,6 +389,23 @@ def load_price_history(ticker):
     volumes = [r["volume"] for r in rows]
     return prices, volumes
 
+# ── Partial exit log ─────────────────────────────────────────
+
+def save_partial_exit(ticker, qty, entry_price, exit_price, pnl, ts):
+    """
+    Record a partial exit (half-position sell at +6%) as a separate SELL row.
+    Does NOT close the original BUY row — that stays open until the full exit.
+    """
+    with _db_lock:
+        conn = get_conn()
+        conn.execute("""
+            INSERT INTO trades (ticker, side, qty, price, pnl, reason, entry_ts, date)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (ticker, "PARTIAL", qty, exit_price, pnl, "partial_exit", ts,
+              datetime.now(NY).strftime("%Y-%m-%d")))
+        conn.commit()
+        conn.close()
+
 # ── Scan history ──────────────────────────────────────────────
 
 def save_scan_result(tickers, scores):
