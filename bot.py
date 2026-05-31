@@ -809,14 +809,22 @@ def execute(ticker, action, price, signals, reason="signal"):
                 daily_trade_count += 1
                 current_count = daily_trade_count
 
-            # Final race check under lock — prevents duplicate orders if two
-            # threads somehow reach this point for the same ticker simultaneously.
+            # Final race check — roll back count if position appeared concurrently.
             with _positions_lock:
                 if ticker in open_positions:
-                    print(f"  {ticker} position opened concurrently, skipping"); return
+                    print(f"  {ticker} position opened concurrently, skipping")
+                    with _trade_count_lock:
+                        daily_trade_count = max(0, daily_trade_count - 1)
+                    return
 
-            api.submit_order(symbol=ticker, qty=qty, side="buy",
-                             type="market", time_in_force="day")
+            try:
+                api.submit_order(symbol=ticker, qty=qty, side="buy",
+                                 type="market", time_in_force="day")
+            except Exception as order_err:
+                print(f"  Order failed {ticker}: {order_err}")
+                with _trade_count_lock:
+                    daily_trade_count = max(0, daily_trade_count - 1)
+                return
 
             active_sigs = [s["name"] for s in signals if s["action"]=="buy"]
             ts = int(time.time()*1000)
@@ -1247,6 +1255,18 @@ def bot_loop():
                     except Exception as e:
                         print(f"Hard failsafe error: {e}")
 
+            # Blackout check runs BEFORE the window_open guard so that a blackout
+            # detected after 3:30 PM (window already closed) still force-closes positions.
+            blackout, event_name = cached_blackout_today()
+            if blackout:
+                if last_blackout != now.strftime("%Y-%m-%d"):
+                    close_all_positions_eod()
+                    last_blackout = now.strftime("%Y-%m-%d")
+                socketio.emit("state", {"tickers":{},"account":get_account_state(),
+                    "trades":trade_log[:40],"market_status":"blackout",
+                    "message":f"MACRO BLACKOUT: {event_name} — trading suspended","live":LIVE_MODE})
+                time.sleep(300); continue
+
             if not window_open:
                 socketio.emit("state", {"tickers":{},"account":get_account_state(),
                     "trades":trade_log[:40],"market_status":"closed",
@@ -1258,16 +1278,6 @@ def bot_loop():
                     "trades":trade_log[:40],"market_status":"closed",
                     "message":"Warming up — market opens 9:30 AM ET","live":LIVE_MODE})
                 time.sleep(30); continue
-
-            blackout, event_name = cached_blackout_today()
-            if blackout:
-                if last_blackout != now.strftime("%Y-%m-%d"):
-                    close_all_positions_eod()
-                    last_blackout = now.strftime("%Y-%m-%d")
-                socketio.emit("state", {"tickers":{},"account":get_account_state(),
-                    "trades":trade_log[:40],"market_status":"blackout",
-                    "message":f"MACRO BLACKOUT: {event_name} — trading suspended","live":LIVE_MODE})
-                time.sleep(300); continue
 
             if not last_regime or (now - last_regime).total_seconds() > 1800:
                 update_market_regime(); last_regime = now
@@ -1511,8 +1521,9 @@ def manual_scan():
             scan_results["scanned_at"]    = new_scan["scanned_at"]
             scan_results["account_size"]  = new_scan.get("account_size", acct_size)
             scan_results["price_range"]   = new_scan.get("price_range","—")
-            scan_results["universe_size"] = new_scan.get("universe_size", 0)
-            scan_results["manual"]        = True
+            scan_results["universe_size"]      = new_scan.get("universe_size", 0)
+            scan_results["politician_tickers"] = new_scan.get("politician_tickers", [])
+            scan_results["manual"]             = True
             apply_scan_results(scan_results["today"], acct_size)
             socketio.emit("scan", scan_results)
         except Exception as e: print(f"Manual scan error: {e}")
@@ -1577,13 +1588,15 @@ def reconcile_open_positions():
         restored = 0
         for pos in alpaca_positions:
             ticker = pos.symbol
-            if ticker in open_positions:
-                continue
             entry  = float(pos.avg_entry_price)
             qty    = int(pos.qty)
+            if qty <= 0:
+                continue  # skip short or zero positions; bot only manages longs
             stop   = round(entry * (1 - STOP_LOSS_PCT), 3)
             target = round(entry * (1 + TAKE_PROFIT_PCT), 3)
             with _positions_lock:
+                if ticker in open_positions:
+                    continue  # already tracked; atomic check-then-skip inside lock
                 open_positions[ticker] = {
                     "entry": entry, "stop": stop, "target": target,
                     "qty": qty, "atr": None, "active_signals": [],

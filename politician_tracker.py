@@ -43,22 +43,28 @@ _score_cache  = {"data": None, "ts": 0}
 
 # ── Amount range parser ───────────────────────────────────────
 
-_AMOUNT_MAP = [
-    ("$1,000,001", 6),
-    ("$500,001",   5),
-    ("$100,001",   4),
-    ("$50,001",    3),
-    ("$15,001",    2),
-    ("$1,001",     1),
+_AMOUNT_TIERS = [
+    (1_000_001, 6),
+    (500_001,   5),
+    (100_001,   4),
+    (50_001,    3),
+    (15_001,    2),
+    (1_001,     1),
 ]
 
 def _parse_amount(amount_str):
-    """'$15,001 - $50,000' → integer score 1–6 reflecting trade size."""
+    """'$15,001 - $50,000' → score 1–6; parses the lower bound numerically so
+    ordering of tiers is irrelevant and adding new tiers is safe."""
     if not amount_str:
         return 1
-    for marker, score in _AMOUNT_MAP:
-        if marker in amount_str:
-            return score
+    try:
+        lower = amount_str.split(" - ")[0].strip().lstrip("$").replace(",", "")
+        val = int(lower)
+        for threshold, score in _AMOUNT_TIERS:
+            if val >= threshold:
+                return score
+    except (ValueError, IndexError):
+        pass
     return 1
 
 # ── Raw data fetching ─────────────────────────────────────────
@@ -120,9 +126,11 @@ def _load_raw():
     combined = senate_records + fmp_records
 
     with _lock:
-        _raw_cache["data"]   = combined
-        _raw_cache["ts"]     = time.time()
-        _raw_cache["source"] = source
+        # Re-check: skip write if another thread populated the cache while we fetched.
+        if _raw_cache["data"] is None or time.time() - _raw_cache["ts"] >= CACHE_TTL:
+            _raw_cache["data"]   = combined
+            _raw_cache["ts"]     = time.time()
+            _raw_cache["source"] = source
     return combined
 
 # ── Scoring ───────────────────────────────────────────────────
@@ -196,8 +204,12 @@ def get_ticker_scores(days=90):
         result[ticker] = round(min(25, score), 1)
 
     with _lock:
-        _score_cache["data"] = result
-        _score_cache["ts"]   = time.time()
+        # Re-check: use the other thread's result if it beat us to the write.
+        if _score_cache["data"] is None or time.time() - _score_cache["ts"] >= CACHE_TTL:
+            _score_cache["data"] = result
+            _score_cache["ts"]   = time.time()
+        else:
+            result = _score_cache["data"]
 
     if result:
         top = sorted(result.items(), key=lambda x: x[1], reverse=True)[:8]
