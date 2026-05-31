@@ -643,7 +643,15 @@ def check_stops(ticker, price):
 
 def force_sell(ticker, price, reason="stop_loss"):
     try:
-        pos_api = api.get_position(ticker)
+        try:
+            pos_api = api.get_position(ticker)
+        except Exception as pos_err:
+            # Position doesn't exist in Alpaca (closed externally, 404, etc.)
+            # Remove from tracking so the bot stops trying to manage it.
+            with _positions_lock:
+                open_positions.pop(ticker, None)
+            print(f"  {ticker}: position not found in Alpaca ({pos_err}), removed from tracking")
+            return
         qty     = int(pos_api.qty)
         if qty <= 0:
             with _positions_lock:
@@ -1388,8 +1396,9 @@ def on_connect():
                     bar   = api.get_latest_bar(ticker, feed="iex")
                     price = float(bar.c)
                     price_history.setdefault(ticker, []).append(price)
-                    vol_delta = float(bar.v) if not volume_history.get(ticker) else max(0, float(bar.v) - sum(volume_history[ticker]))
-                    volume_history.setdefault(ticker, []).append(max(0, vol_delta))
+                    prev_vol  = volume_history[ticker][-1] if volume_history.get(ticker) else 0
+                    vol_delta = max(0, float(bar.v) - prev_vol) if prev_vol > 0 else float(bar.v)
+                    volume_history.setdefault(ticker, []).append(vol_delta)
                     sigs  = get_signals(ticker, price)
                     action, reason, buy_w, sell_w = make_decision(ticker, sigs, price)
                     pos   = open_positions.get(ticker)
@@ -1404,6 +1413,7 @@ def on_connect():
                         "grade":ticker_grades.get(ticker,"—"),
                         "pred_score":pred.get("score",None),
                         "pred_label":pred.get("label","—"),
+                        "pred_conf": pred.get("confidence","—"),
                         "tf_bias":pred.get("tf_bias",0),
                         "rvol":rvol_cache.get(ticker,None),
                         "is_gap":ticker in gap_candidates,
@@ -1604,6 +1614,10 @@ def reconcile_open_positions():
                 }
             price_history.setdefault(ticker, [])
             volume_history.setdefault(ticker, [])
+            # Add to active_tickers so bot_loop calls check_stops() on every tick.
+            # Without this, stops are never enforced for restored positions.
+            if ticker not in active_tickers:
+                active_tickers.append(ticker)
             restored += 1
             print(f"  Reconcile restored: {qty}x {ticker} @ ${entry:.2f} "
                   f"SL${stop:.3f} TP${target:.3f}")
