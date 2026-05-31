@@ -8,11 +8,11 @@ from flask import Flask, render_template, jsonify
 from flask_socketio import SocketIO
 
 from database import (
-    init_db, save_trade_open, save_trade_close, get_recent_trades,
-    get_trade_stats_from_db, save_signal_performance, get_signal_win_rates,
-    save_portfolio_snapshot, get_portfolio_history, save_alert,
-    get_alerts, acknowledge_alerts, save_price_history, load_price_history,
-    save_scan_result, is_macro_blackout
+    init_db, save_trade_open, save_trade_close, save_partial_exit,
+    get_recent_trades, get_trade_stats_from_db, save_signal_performance,
+    get_signal_win_rates, save_portfolio_snapshot, get_portfolio_history,
+    save_alert, get_alerts, acknowledge_alerts, save_price_history,
+    load_price_history, save_scan_result, is_macro_blackout
 )
 from macro import (
     seed_macro_calendar, check_earnings_risk, is_macro_blackout_today,
@@ -130,6 +130,18 @@ daily_trade_count = 0
 daily_trade_date  = None
 last_db_snapshot  = 0
 signal_weights    = dict(BASE_SIGNAL_WEIGHTS)
+
+# Pending limit orders — keyed by Alpaca order_id
+# Each entry: {ticker, qty, stop, target, atr, active_signals,
+#              price, pred_score, rvol, submitted_at, ts}
+_pending_orders      = {}
+_pending_buy_tickers = set()    # tickers with an open limit order (blocks duplicate entries)
+_pending_lock        = threading.Lock()
+ORDER_FILL_TIMEOUT   = 90       # seconds before an unfilled limit order is cancelled
+
+# PDT check cache — avoids hitting Alpaca API on every buy attempt
+_pdt_cache      = {"count": 0, "ts": 0.0}
+_PDT_CACHE_TTL  = 300   # 5 minutes
 
 _blackout_cache      = {"date": None, "result": (False, None)}
 _blackout_cache_lock = threading.Lock()
@@ -312,6 +324,9 @@ def get_min_volume(account_size=None):
 # ── PDT compliance ────────────────────────────────────────────
 
 def count_day_trades_this_week():
+    # Cached — avoids an Alpaca API call on every buy attempt in live mode
+    if time.time() - _pdt_cache["ts"] < _PDT_CACHE_TTL:
+        return _pdt_cache["count"]
     try:
         now    = now_et()
         cutoff = now - timedelta(days=7)
@@ -326,13 +341,51 @@ def count_day_trades_this_week():
             k = (o.symbol, d)
             if o.side == "buy":  buys[k]  = buys.get(k, 0) + 1
             if o.side == "sell": sells[k] = sells.get(k, 0) + 1
-        return sum(1 for k in buys if k in sells)
+        count = sum(1 for k in buys if k in sells)
+        _pdt_cache["count"] = count
+        _pdt_cache["ts"]    = time.time()
+        return count
     except Exception as e:
         print(f"PDT count error: {e}"); return 0
 
 def is_day_trade_safe():
     if not LIVE_MODE: return True
     return count_day_trades_this_week() < MAX_DAILY_TRADES
+
+# ── Correlation helper ────────────────────────────────────────
+
+def _pearson(a, b, n=30):
+    """Pearson correlation over the last n bars. Returns 0 if insufficient data."""
+    n = min(len(a), len(b), n)
+    if n < 10:
+        return 0.0
+    a, b   = a[-n:], b[-n:]
+    ma, mb = sum(a)/n, sum(b)/n
+    cov    = sum((x-ma)*(y-mb) for x,y in zip(a,b)) / n
+    sa     = (sum((x-ma)**2 for x in a) / n) ** 0.5
+    sb     = (sum((y-mb)**2 for y in b) / n) ** 0.5
+    return cov / (sa*sb) if sa > 0 and sb > 0 else 0.0
+
+def is_correlated_with_open_position(ticker, threshold=0.75):
+    """
+    Returns True if the candidate ticker's recent price moves are highly
+    correlated with any currently open position.  Prevents doubling up on
+    the same underlying bet (e.g. MARA + RIOT both tracking Bitcoin).
+    """
+    candidate = price_history.get(ticker, [])
+    if len(candidate) < 10:
+        return False
+    for pos_ticker in list(open_positions.keys()):
+        if pos_ticker == ticker:
+            continue
+        pos_prices = price_history.get(pos_ticker, [])
+        if len(pos_prices) < 10:
+            continue
+        corr = _pearson(candidate, pos_prices)
+        if corr > threshold:
+            print(f"  {ticker} corr={corr:.2f} with open {pos_ticker} — skipping (concentration risk)")
+            return True
+    return False
 
 # ── Cooldowns ─────────────────────────────────────────────────
 
@@ -618,15 +671,19 @@ def check_stops(ticker, price):
             open_positions[ticker]["stop"]         = round(entry * 1.005, 3)
             print(f"  PARTIAL EXIT {half_qty}x {ticker} @ ${price:.2f} "
                   f"pnl=${partial_pnl:+.2f} | stop → breakeven")
+            ts_partial = int(time.time()*1000)
             trade_log.insert(0, {
                 "type":"SELL","ticker":ticker,"qty":half_qty,
                 "price":round(price,2),"pnl":partial_pnl,
-                "reason":"partial_exit","ts":int(time.time()*1000)
+                "reason":"partial_exit","ts":ts_partial
             })
-            if LIVE_MODE:
-                save_alert("INFO",
-                    f"PARTIAL EXIT {half_qty}x {ticker} @ ${price:.2f} +${partial_pnl:.2f}",
-                    ticker)
+            try:
+                save_partial_exit(ticker, half_qty, entry, price, partial_pnl, ts_partial)
+            except Exception as e:
+                print(f"  DB save_partial_exit error: {e}")
+            save_alert("INFO",
+                f"PARTIAL EXIT {half_qty}x {ticker} @ ${price:.2f} +${partial_pnl:.2f}",
+                ticker)
         except Exception as e:
             print(f"  Partial exit error {ticker}: {e}")
         return
@@ -688,7 +745,7 @@ def force_sell(ticker, price, reason="stop_loss"):
         print(f"{mode} SELL {qty}x {ticker} @ ${price:.2f} "
               f"| {reason} | PnL ${pnl:+.2f} | WR:{wr:.0f}%")
 
-        if LIVE_MODE and abs(pnl) > 1:
+        if abs(pnl) > 0.01:
             save_alert("INFO" if was_win else "WARN",
                        f"{'WIN' if was_win else 'LOSS'} ${pnl:+.2f} on {ticker} ({reason})",
                        ticker)
@@ -716,13 +773,20 @@ def make_decision(ticker, signals, price):
     if pscore <= PRED_SKIP:
         return "hold", f"pred_skip({pscore})", buy_w, sell_w
 
-    # NEW: EOD threshold multiplier — harder to enter near close
+    # EOD threshold multiplier — harder to enter near close
     tod_mult = get_threshold_multiplier()
 
     if   pscore >= PRED_STRONG_BUY: bt = st = 1.2 * tod_mult
     elif pscore >= 20:              bt = st = 1.5 * tod_mult
     elif pscore < PRED_NEED_CONF:   bt = 2.5 * tod_mult; st = 2.0 * tod_mult
     else:                           bt = BASE_BUY_THRESHOLD * tod_mult; st = BASE_SELL_THRESHOLD * tod_mult
+
+    # Confidence multiplier — prediction confidence now affects entry threshold.
+    # High confidence → lower bar (0.85×), low confidence → raise bar (1.20×).
+    pred_conf = pred.get("confidence", "low")
+    conf_mult = {"high": 0.85, "medium": 1.0, "low": 1.20}.get(pred_conf, 1.0)
+    bt *= conf_mult
+    st *= conf_mult
 
     if is_gap and gap_candidates.get(ticker, {}).get("direction") == "up":
         bt = max(1.0, bt-0.3)
@@ -752,10 +816,106 @@ def make_decision(ticker, signals, price):
 
 # ── Trade execution ───────────────────────────────────────────
 
+def _register_filled_order(order_id, fill_price):
+    """
+    Called when a pending limit order has been confirmed filled.
+    Creates the open_positions entry, saves to DB, and logs the trade.
+    """
+    with _pending_lock:
+        pdata = _pending_orders.pop(order_id, None)
+        if pdata:
+            _pending_buy_tickers.discard(pdata["ticker"])
+    if not pdata:
+        return
+
+    ticker      = pdata["ticker"]
+    qty         = pdata["qty"]
+    stop        = pdata["stop"]
+    target      = pdata["target"]
+    atr         = pdata["atr"]
+    active_sigs = pdata["active_signals"]
+    pred_score  = pdata["pred_score"]
+    rvol        = pdata["rvol"]
+    ts          = int(time.time() * 1000)
+
+    with _positions_lock:
+        if ticker in open_positions:
+            return  # position was reconciled or entered another way
+        open_positions[ticker] = {
+            "entry": fill_price, "stop": stop, "target": target,
+            "qty": qty, "atr": atr, "active_signals": active_sigs,
+            "partial_done": False,
+        }
+
+    try:
+        save_trade_open(ticker, qty, fill_price, stop, target, pred_score,
+                        rvol, ticker in gap_candidates, active_sigs, ts)
+    except Exception as e:
+        print(f"  DB save_trade_open error: {e}")
+
+    rr = round((target-fill_price)/(fill_price-stop), 2) if fill_price > stop else "?"
+    trade_log.insert(0, {
+        "type":"BUY","ticker":ticker,"qty":qty,
+        "price":round(fill_price,2),"pnl":None,
+        "stop":stop,"target":target,
+        "pred_score":pred_score,"rvol":rvol,
+        "gap":ticker in gap_candidates,"reason":"limit_filled",
+        "ts":ts
+    })
+    mode = "🔴 LIVE" if LIVE_MODE else "PAPER"
+    print(f"{mode} BUY FILLED {qty}x {ticker} @ ${fill_price:.2f} "
+          f"SL${stop} TP${target} R:R={rr} pred={pred_score:+.0f}")
+    save_alert("INFO", f"BUY {qty}x {ticker} @ ${fill_price:.2f} | pred={pred_score:+.0f}", ticker)
+
+
+def check_pending_orders():
+    """
+    Poll Alpaca for the status of each pending limit order.
+    Called from bot_loop on every tick.
+    - Filled → register position, save to DB
+    - Canceled/rejected/expired → roll back daily_trade_count
+    - Age > ORDER_FILL_TIMEOUT → cancel it (will clean up next tick)
+    """
+    for order_id in list(_pending_orders.keys()):
+        pdata = _pending_orders.get(order_id)
+        if not pdata:
+            continue
+        try:
+            order = api.get_order(order_id)
+            status = order.status
+
+            if status == "filled":
+                fill_price = float(order.filled_avg_price or order.limit_price)
+                _register_filled_order(order_id, fill_price)
+
+            elif status in ("canceled", "expired", "rejected"):
+                with _pending_lock:
+                    removed = _pending_orders.pop(order_id, None)
+                    if removed:
+                        _pending_buy_tickers.discard(removed["ticker"])
+                if removed:
+                    with _trade_count_lock:
+                        daily_trade_count = max(0, daily_trade_count - 1)
+                    print(f"  Limit order {status}: {removed['ticker']} — count rolled back")
+
+            elif time.time() - pdata["submitted_at"] > ORDER_FILL_TIMEOUT:
+                print(f"  Limit order timeout ({ORDER_FILL_TIMEOUT}s): cancelling {pdata['ticker']}")
+                try:
+                    api.cancel_order(order_id)
+                except Exception:
+                    pass  # status update will clean up next tick
+        except Exception as e:
+            print(f"  check_pending_orders error {order_id}: {e}")
+
+
 def execute(ticker, action, price, signals, reason="signal"):
     global daily_trade_count, daily_trade_date
     try:
         if action == "buy" and ticker not in open_positions:
+            # Block if there's already a pending limit order for this ticker
+            if ticker in _pending_buy_tickers:
+                return
+
             if is_on_cooldown(ticker):
                 print(f"  {ticker} cooldown {cooldown_remaining(ticker)}s"); return
 
@@ -763,11 +923,14 @@ def execute(ticker, action, price, signals, reason="signal"):
             if blackout:
                 print(f"  MACRO BLACKOUT: {event_name} — no trades today"); return
 
-            # NEW: time-of-day gate
             if not can_enter_new_position():
                 return
 
-            # Earnings risk — cached per ticker per day (avoids news API hit every 30s)
+            # Correlation check — avoid doubling up on highly correlated positions
+            if open_positions and is_correlated_with_open_position(ticker):
+                return
+
+            # Earnings risk — cached per ticker per day
             today_str = now_et().strftime("%Y-%m-%d")
             cached_earn = _earnings_cache.get(ticker)
             if cached_earn and cached_earn[0] == today_str:
@@ -817,7 +980,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                 daily_trade_count += 1
                 current_count = daily_trade_count
 
-            # Final race check — roll back count if position appeared concurrently.
+            # Final race check — roll back count if position appeared concurrently
             with _positions_lock:
                 if ticker in open_positions:
                     print(f"  {ticker} position opened concurrently, skipping")
@@ -825,47 +988,44 @@ def execute(ticker, action, price, signals, reason="signal"):
                         daily_trade_count = max(0, daily_trade_count - 1)
                     return
 
+            # Submit as limit order at 0.3% above current price.
+            # Eliminates market-order slippage on thin stocks while still filling
+            # quickly (aggressive limit).  Position is registered when the fill
+            # confirmation arrives in check_pending_orders().
+            limit_price = round(price * 1.003, 2)
+            active_sigs = [s["name"] for s in signals if s["action"]=="buy"]
             try:
-                api.submit_order(symbol=ticker, qty=qty, side="buy",
-                                 type="market", time_in_force="day")
+                order = api.submit_order(
+                    symbol=ticker, qty=qty, side="buy",
+                    type="limit", limit_price=limit_price,
+                    time_in_force="day"
+                )
             except Exception as order_err:
                 print(f"  Order failed {ticker}: {order_err}")
                 with _trade_count_lock:
                     daily_trade_count = max(0, daily_trade_count - 1)
                 return
 
-            active_sigs = [s["name"] for s in signals if s["action"]=="buy"]
-            ts = int(time.time()*1000)
-            with _positions_lock:
-                open_positions[ticker] = {
-                    "entry":price, "stop":stop, "target":target,
-                    "qty":qty, "atr":atr, "active_signals":active_sigs,
-                    "partial_done": False,
+            with _pending_lock:
+                _pending_orders[order.id] = {
+                    "ticker":        ticker,
+                    "qty":           qty,
+                    "stop":          stop,
+                    "target":        target,
+                    "atr":           atr,
+                    "active_signals":active_sigs,
+                    "price":         price,
+                    "pred_score":    pred_score,
+                    "rvol":          rvol,
+                    "submitted_at":  time.time(),
+                    "ts":            int(time.time() * 1000),
                 }
+                _pending_buy_tickers.add(ticker)
 
-            try:
-                save_trade_open(ticker, qty, price, stop, target, pred_score,
-                                rvol, ticker in gap_candidates, active_sigs, ts)
-            except Exception as e:
-                print(f"  DB save_trade_open error: {e}")
-
-            rr = round((target-price)/(price-stop), 2) if price > stop else "?"
-            trade_log.insert(0, {
-                "type":"BUY","ticker":ticker,"qty":qty,
-                "price":round(price,2),"pnl":None,
-                "stop":stop,"target":target,
-                "pred_score":pred_score,"rvol":rvol,
-                "gap":ticker in gap_candidates,"reason":reason,
-                "ts":ts
-            })
             mode = "🔴 LIVE" if LIVE_MODE else "PAPER"
-            print(f"{mode} BUY {qty}x {ticker} @ ${price:.2f} "
-                  f"SL${stop} TP${target} R:R={rr} "
-                  f"pred={pred_score:+.0f} rvol={rvol:.1f}x "
+            print(f"{mode} LIMIT ORDER {qty}x {ticker} @ ${limit_price:.3f} "
+                  f"SL${stop} TP${target} pred={pred_score:+.0f} "
                   f"#{current_count}/{MAX_DAILY_TRADES}")
-            if LIVE_MODE:
-                save_alert("INFO",
-                    f"BUY {qty}x {ticker} @ ${price:.2f} | pred={pred_score:+.0f}", ticker)
 
         elif action == "sell" and ticker in open_positions:
             force_sell(ticker, price, reason=reason or "signal")
@@ -1296,23 +1456,24 @@ def bot_loop():
                      "mins_since_open": mins_since_open(),
                      "mins_until_close": mins_until_close()}
 
+            # Check pending limit orders before processing tickers
+            if _pending_orders:
+                try: check_pending_orders()
+                except Exception as e: print(f"check_pending_orders error: {e}")
+
             for ticker in list(active_tickers):
                 try:
                     bar   = api.get_latest_bar(ticker, feed="iex")
                     price = float(bar.c); vol = float(bar.v)
                     price_history.setdefault(ticker, []).append(price)
-                    # Store volume DELTA (not cumulative) so VWAP and rvol estimates are correct.
-                    # bar.v from get_latest_bar is total volume today — we want the increment.
-                    prev_vol = volume_history[ticker][-1] if volume_history.get(ticker) else 0
+                    # Store volume DELTA (not cumulative) — bar.v is cumulative today.
+                    prev_vol  = volume_history[ticker][-1] if volume_history.get(ticker) else 0
                     vol_delta = max(0, vol - prev_vol) if prev_vol > 0 else vol
                     volume_history.setdefault(ticker, []).append(vol_delta)
                     if len(price_history[ticker])  > 200: price_history[ticker].pop(0)
                     if len(volume_history[ticker]) > 200: volume_history[ticker].pop(0)
-                    # Live rvol estimate from accumulated deltas (fallback if update_rvol hasn't fired)
-                    if vol_delta > 0 and len(volume_history[ticker]) >= 10:
-                        hist_mean = sum(volume_history[ticker]) / len(volume_history[ticker])
-                        if hist_mean > 0:
-                            rvol_cache[ticker] = round(vol_delta / hist_mean, 2)
+                    # rvol_cache is the single source of truth — populated by update_rvol()
+                    # every 15 minutes.  No inline estimate here to avoid formula conflicts.
                     check_stops(ticker, price)
                     sigs              = get_signals(ticker, price)
                     action, reason, buy_w, sell_w = make_decision(ticker, sigs, price)
@@ -1627,11 +1788,33 @@ def reconcile_open_positions():
         print(f"Reconcile error: {e}")
 
 
+def restore_daily_trade_count():
+    """
+    Count today's filled buy orders from Alpaca so daily_trade_count survives restarts.
+    Only counts orders where a same-day sell also exists (actual day trades in LIVE mode),
+    or all filled buy orders in paper mode.
+    """
+    global daily_trade_count, daily_trade_date
+    try:
+        today = now_et().date()
+        # Use ET midnight as the cutoff
+        midnight_et = datetime.combine(today, datetime.min.time())
+        midnight_et = NY.localize(midnight_et)
+        after_str   = midnight_et.strftime("%Y-%m-%dT%H:%M:%SZ")
+        orders = api.list_orders(status="filled", after=after_str, limit=50, direction="desc")
+        count  = sum(1 for o in orders if o.side == "buy")
+        daily_trade_count = min(count, MAX_DAILY_TRADES)
+        daily_trade_date  = today
+        print(f"Restored daily_trade_count: {daily_trade_count} (from Alpaca fills today)")
+    except Exception as e:
+        print(f"restore_daily_trade_count error: {e}")
+
+
 def _start_bot():
     port = int(os.environ.get("PORT", 10000))
-    print(f"=== BOT v11 | port {port} | {'🔴 LIVE' if LIVE_MODE else '📄 PAPER'} ===")
-    print(f"=== Improvements: time-of-day gates | veto signals | partial exits | "
-          f"dynamic rvol promotion | live P&L ===")
+    print(f"=== BOT v12 | port {port} | {'🔴 LIVE' if LIVE_MODE else '📄 PAPER'} ===")
+    print(f"=== Improvements: limit orders | confidence scoring | correlation check | "
+          f"social+insider signals | dynamic macro calendar | single RVOL source ===")
 
     try:
         init_db()
@@ -1647,6 +1830,7 @@ def _start_bot():
         update_market_regime()
         validate_fallback_tickers()
         reconcile_open_positions()
+        restore_daily_trade_count()
         try:
             status = get_macro_status(api)
             status["hot_sectors"] = get_hot_sectors(api)

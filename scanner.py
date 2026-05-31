@@ -262,7 +262,8 @@ def get_price_data(api, ticker):
 
 # ── Composite scoring ─────────────────────────────────────────
 
-def composite_score(pd, sentiment, news_count, account_size, politician_score=0):
+def composite_score(pd, sentiment, news_count, account_size,
+                    politician_score=0, social_score=0, short_score=0, insider_score=0):
     s  = abs(pd["change_pct"]) * 2.5
     s += abs(pd["rs_5d"])      * 1.5
     vr = pd["vol_ratio"]
@@ -285,6 +286,15 @@ def composite_score(pd, sentiment, news_count, account_size, politician_score=0)
         elif pd["price"] < 8: s +=  3
     if politician_score > 0:
         s += politician_score * 3.5
+    # Social sentiment: crowd is directly relevant for meme/momentum universe
+    if social_score != 0:
+        s += social_score * 1.5   # -15 to +15
+    # Short squeeze potential: days-to-cover + current rvol context
+    if short_score > 0:
+        s += short_score * 1.2    # 0 to +18
+    # Insider (Form 4) buying: slower signal but high conviction
+    if insider_score > 0:
+        s += insider_score * 2.5  # 0 to +50 at max, capped below
     return round(s, 2)
 
 def risk_grade(pd):
@@ -299,12 +309,17 @@ def risk_grade(pd):
 # ── Per-day scan ──────────────────────────────────────────────
 
 def run_scan(api, universe, days_back=1, account_size=20):
-    label = "today" if days_back == 1 else "yesterday"
-    print(f"\n=== Scanning {len(universe)} stocks ({label}) | acct ${account_size:.2f} ===")
+    label    = "today" if days_back == 1 else "yesterday"
+    max_price = _price_ceiling(account_size)   # consistent with bot.py passes_filters
+    print(f"\n=== Scanning {len(universe)} stocks ({label}) | acct ${account_size:.2f} "
+          f"max ${max_price:.2f} ===")
     results = []
 
-    # Fetch politician scores once per scan cycle (cached 6 hrs, ~free API)
-    pol_scores = {}
+    # ── Fetch all signal caches once per scan cycle ───────────────────────
+    pol_scores    = {}
+    insider_scores = {}
+    social_data   = {}
+
     try:
         from politician_tracker import get_ticker_scores
         pol_scores = get_ticker_scores()
@@ -313,33 +328,64 @@ def run_scan(api, universe, days_back=1, account_size=20):
     except Exception as e:
         print(f"  politician_tracker unavailable: {e}")
 
+    try:
+        from insider_tracker import get_insider_scores
+        insider_scores = get_insider_scores()
+        if insider_scores:
+            print(f"  Insider scores: {len(insider_scores)} tickers tracked")
+    except Exception as e:
+        print(f"  insider_tracker unavailable: {e}")
+
+    tickers_list = [s["symbol"] for s in universe]
+    try:
+        from social_sentiment import get_social_batch
+        social_data = get_social_batch(tickers_list)
+    except Exception as e:
+        print(f"  social_sentiment unavailable: {e}")
+
     for stock in universe:
         ticker = stock["symbol"]
         try:
             pd = get_price_data(api, ticker)
             if not pd:
                 continue
-            if pd["price"] <= 0 or pd["price"] > (account_size * 0.6):
+            # Use the same ceiling formula as bot.py passes_filters to avoid
+            # promoting tickers that will be immediately rejected at entry.
+            if pd["price"] <= 0 or pd["price"] > max_price:
                 continue
-            headlines          = get_headlines(api, ticker, days_back=days_back)
-            sentiment, method  = finbert_score(headlines)
-            pol_score          = pol_scores.get(ticker, 0)
-            score              = composite_score(pd, sentiment, len(headlines), account_size, pol_score)
-            grade              = risk_grade(pd)
+            headlines         = get_headlines(api, ticker, days_back=days_back)
+            sentiment, method = finbert_score(headlines)
+            pol_score         = pol_scores.get(ticker, 0)
+            insider_score     = insider_scores.get(ticker, 0)
+            soc               = social_data.get(ticker, {})
+            social_score      = soc.get("social", 0)
+            short_score       = soc.get("short", 0)
+            score             = composite_score(
+                pd, sentiment, len(headlines), account_size,
+                politician_score=pol_score,
+                social_score=social_score,
+                short_score=short_score,
+                insider_score=insider_score,
+            )
+            grade             = risk_grade(pd)
             results.append({
-                "ticker":      ticker,
-                "price":       pd["price"],
-                "change_pct":  pd["change_pct"],
-                "vol_ratio":   pd["vol_ratio"],
-                "rs_5d":       pd["rs_5d"],
-                "avg_range":   pd["avg_range"],
-                "sentiment":   sentiment,
-                "sent_method": method,
-                "news_count":  len(headlines),
-                "score":       score,
-                "grade":       grade,
-                "direction":   "up" if pd["change_pct"] > 0 else "down",
-                "pol_score":   pol_score,
+                "ticker":       ticker,
+                "price":        pd["price"],
+                "change_pct":   pd["change_pct"],
+                "vol_ratio":    pd["vol_ratio"],
+                "rs_5d":        pd["rs_5d"],
+                "avg_range":    pd["avg_range"],
+                "sentiment":    sentiment,
+                "sent_method":  method,
+                "news_count":   len(headlines),
+                "score":        score,
+                "grade":        grade,
+                "direction":    "up" if pd["change_pct"] > 0 else "down",
+                "pol_score":    pol_score,
+                "social_score": round(social_score, 2),
+                "short_score":  round(short_score, 2),
+                "insider_score":insider_score,
+                "squeeze":      soc.get("squeeze", False),
             })
             time.sleep(0.1)
         except Exception as e:
@@ -368,9 +414,9 @@ def run_full_scan(api):
 
     universe = build_universe(api, max_price, min_price, min_vol)
 
-    # Hard-include tickers with notable recent congressional buy activity.
+    # Hard-include tickers flagged by congressional and insider buying signals.
     # They're added to the universe so run_scan() evaluates them and applies
-    # the politician score boost — they still must pass price/volume filters.
+    # the score boosts — they still must pass price/volume filters.
     pol_tickers = []
     try:
         from politician_tracker import get_politician_tickers
@@ -383,6 +429,18 @@ def run_full_scan(api):
             print(f"  Politician-tracked tickers added to universe: {added}")
     except Exception as e:
         print(f"  politician_tracker expand error: {e}")
+
+    try:
+        from insider_tracker import get_insider_tickers
+        insider_tickers = get_insider_tickers()
+        existing        = {s["symbol"] for s in universe}
+        added_ins       = [t for t in insider_tickers if t not in existing]
+        for t in added_ins:
+            universe.append({"symbol": t, "price": 0.0, "volume": 0})
+        if added_ins:
+            print(f"  Insider-tracked tickers added to universe: {added_ins}")
+    except Exception as e:
+        print(f"  insider_tracker expand error: {e}")
 
     if not universe:
         print("Universe empty — using fallback")

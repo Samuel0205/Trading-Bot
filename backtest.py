@@ -35,7 +35,7 @@ TAKE_PROFIT_PCT   = 0.10
 FRICTION_PCT      = 0.005
 COOLDOWN_BARS     = 3
 MIN_PROFIT_PCT    = 0.03
-THRESHOLD         = 2.2
+THRESHOLD         = 2.0   # matches BASE_BUY_THRESHOLD in bot.py
 MAX_TRADES_PER_TICKER = 30
 
 MONTHS_BACK = 3
@@ -105,6 +105,10 @@ def calc_atr(highs, lows, closes, period=10):
         ))
     return sum(trs) / len(trs) if trs else closes[-1] * 0.02
 
+RSI_OVERBOUGHT_VETO  = 75
+RSI_OVERSOLD_VETO    = 25
+PRICE_EXTENSION_VETO = 0.08
+
 def get_signals(hist_closes, hist_volumes, price):
     if len(hist_closes) < 5:
         return {n: "hold" for n in SIGNAL_WEIGHTS}
@@ -115,22 +119,36 @@ def get_signals(hist_closes, hist_volumes, price):
     mean, upper, lower = calc_bollinger(hist_closes)
     vwap             = calc_vwap(hist_closes[-20:], hist_volumes[-20:])
     macd_line        = calc_macd(hist_closes)
-    z_score          = (price - mean) / max((upper - mean), 0.01)
     ma_conf          = min(1.0, len(hist_closes) / 20)
 
-    def act(bc, sc):
-        if bc: return "buy"
-        if sc: return "sell"
+    # Veto conditions — mirrors live bot logic
+    rsi_overbought = rsi > RSI_OVERBOUGHT_VETO
+    rsi_oversold   = rsi < RSI_OVERSOLD_VETO
+    price_extended = (price - mean) / max(mean, 0.01) > PRICE_EXTENSION_VETO
+
+    def act(bc, sc, veto_buy=False, veto_sell=False):
+        if bc and not veto_buy:  return "buy"
+        if sc and not veto_sell: return "sell"
         return "hold"
 
-    return {
-        "MA Crossover":   act(ma50>ma200*1.005, ma200>ma50*1.005) if ma_conf > 0.5 else "hold",
+    signals = {
+        "MA Crossover":   act(ma50>ma200*1.005, ma200>ma50*1.005,
+                              veto_buy=rsi_overbought or price_extended) if ma_conf > 0.5 else "hold",
         "RSI":            act(rsi<35, rsi>65),
-        "Bollinger":      act(price<lower*0.99, price>upper*1.01),
-        "VWAP":           act(price>vwap*1.001, price<vwap*0.999),
-        "MACD":           act(macd_line>0, macd_line<0),
-        "Mean Reversion": act(price<mean*0.96, price>mean*1.04),
+        "Bollinger":      act(price<lower*0.99, price>upper*1.01,
+                              veto_buy=rsi_overbought or price_extended,
+                              veto_sell=rsi_oversold),
+        "VWAP":           act(price>vwap*1.001, price<vwap*0.999,
+                              veto_buy=rsi_overbought or price_extended),
+        "MACD":           act(macd_line>0, macd_line<0,
+                              veto_buy=rsi_overbought or price_extended),
+        "Mean Reversion": act(price<mean*0.96, price>mean*1.04,
+                              veto_buy=rsi_overbought, veto_sell=rsi_oversold),
     }
+    # Global veto: RSI overbought + price extended → all buys off
+    if rsi_overbought and price_extended:
+        signals = {k: "hold" if v == "buy" else v for k, v in signals.items()}
+    return signals
 
 def weighted_vote(signal_actions):
     buy_w = sell_w = 0.0

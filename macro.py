@@ -12,7 +12,7 @@ FIX vs original:
   - check_sec_8k() is now called inside check_earnings_risk() as a secondary signal.
 """
 
-import requests, time, json
+import requests, time, json, re
 from datetime import datetime, timedelta, date
 import pytz
 from database import save_macro_event, is_macro_blackout, save_alert, get_upcoming_macro_events
@@ -75,16 +75,107 @@ SECTOR_ETFS = {
 
 # ── Initialize macro calendar ─────────────────────────────────
 
+def _fetch_fomc_dates_from_web():
+    """
+    Scrape upcoming FOMC meeting dates from the Federal Reserve website.
+    Returns list of 'YYYY-MM-DD' strings or [] on failure.
+    """
+    try:
+        url  = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "trading-bot/1.0"})
+        if resp.status_code != 200:
+            return []
+        # Fed page uses patterns like: "January 28-29, 2025" or "March 18-19, 2025"
+        # The second day is the decision day — that's the blackout date.
+        months = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+                  "july":7,"august":8,"september":9,"october":10,"november":11,"december":12}
+        found = []
+        # Match patterns like "January 28-29, 2025" (two-day meeting)
+        for m in re.finditer(
+                r'(january|february|march|april|may|june|july|august|'
+                r'september|october|november|december)\s+(\d+)[-–](\d+),\s*(\d{4})',
+                resp.text, re.IGNORECASE):
+            month_name, _, day2, year = m.group(1).lower(), m.group(2), m.group(3), m.group(4)
+            month_num = months.get(month_name)
+            if month_num:
+                try:
+                    dt = date(int(year), month_num, int(day2))
+                    found.append(dt.strftime("%Y-%m-%d"))
+                except ValueError:
+                    continue
+        # Also match single-day meetings like "May 7, 2025"
+        for m in re.finditer(
+                r'(january|february|march|april|may|june|july|august|'
+                r'september|october|november|december)\s+(\d+),\s*(\d{4})',
+                resp.text, re.IGNORECASE):
+            month_name, day, year = m.group(1).lower(), m.group(2), m.group(3)
+            month_num = months.get(month_name)
+            if month_num:
+                try:
+                    dt = date(int(year), month_num, int(day))
+                    dt_str = dt.strftime("%Y-%m-%d")
+                    if dt_str not in found:
+                        found.append(dt_str)
+                except ValueError:
+                    continue
+        found = sorted(set(found))
+        if found:
+            print(f"  Fed calendar: fetched {len(found)} FOMC dates from web")
+        return found
+    except Exception as e:
+        print(f"  Fed calendar fetch error: {e}")
+        return []
+
+
+def _fetch_bls_dates_from_web(release_name):
+    """
+    Scrape CPI or Jobs Report release dates from BLS website.
+    release_name: 'cpi' or 'empsit' (Employment Situation = jobs)
+    Returns list of 'YYYY-MM-DD' strings or [] on failure.
+    """
+    urls = {
+        "cpi":    "https://www.bls.gov/schedule/news_release/cpi.htm",
+        "empsit": "https://www.bls.gov/schedule/news_release/empsit.htm",
+    }
+    url = urls.get(release_name)
+    if not url:
+        return []
+    try:
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "trading-bot/1.0"})
+        if resp.status_code != 200:
+            return []
+        # BLS pages use ISO dates in table cells: e.g. "2025-01-15"
+        found = re.findall(r'\b(20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]))\b', resp.text)
+        found = sorted(set(found))
+        if found:
+            print(f"  BLS {release_name}: fetched {len(found)} dates from web")
+        return found
+    except Exception as e:
+        print(f"  BLS {release_name} fetch error: {e}")
+        return []
+
+
 def seed_macro_calendar():
     """
-    Populate DB with all known macro events.
-    FIX: JOBS_DATES_2025 is now included (was missing in original).
+    Populate DB with macro event dates.
+    First tries to fetch live dates from Fed/BLS websites; falls back to
+    hardcoded lists so the bot always has data even when offline.
     """
     print("Seeding macro calendar...")
+
+    # Try live sources first; fall back to hardcoded
+    fomc_live  = _fetch_fomc_dates_from_web()
+    cpi_live   = _fetch_bls_dates_from_web("cpi")
+    jobs_live  = _fetch_bls_dates_from_web("empsit")
+
+    fomc_dates = fomc_live  if len(fomc_live)  >= 4 else FOMC_DATES_2025 + FOMC_DATES_2026
+    cpi_dates  = cpi_live   if len(cpi_live)   >= 4 else CPI_DATES_2025  + CPI_DATES_2026
+    jobs_dates = jobs_live  if len(jobs_live)  >= 4 else JOBS_DATES_2025 + JOBS_DATES_2026
+
     all_events = (
-        [(d, "FOMC Meeting",  "high", "federal_reserve") for d in FOMC_DATES_2025 + FOMC_DATES_2026] +
-        [(d, "CPI Release",   "high", "BLS")             for d in CPI_DATES_2025  + CPI_DATES_2026]  +
-        [(d, "Jobs Report",   "high", "BLS")             for d in JOBS_DATES_2025 + JOBS_DATES_2026]  # FIX
+        [(d, "FOMC Meeting", "high", "federal_reserve") for d in fomc_dates] +
+        [(d, "CPI Release",  "high", "BLS")             for d in cpi_dates]  +
+        [(d, "Jobs Report",  "high", "BLS")             for d in jobs_dates]
     )
     seeded = 0
     for event_date, name, impact, source in all_events:
@@ -93,7 +184,8 @@ def seed_macro_calendar():
             seeded += 1
         except:
             pass
-    print(f"Macro calendar: {seeded}/{len(all_events)} events seeded")
+    print(f"Macro calendar: {seeded}/{len(all_events)} events seeded "
+          f"({'live' if fomc_live else 'hardcoded'})")
 
 # ── SEC 8-K check ─────────────────────────────────────────────
 

@@ -400,9 +400,8 @@ def predict_ticker(api, ticker, regime="ranging"):
         elif tf_bias == -1:                   tf_multiplier = 1.2
         else:                                 tf_multiplier = 1.0
 
-        # Congressional STOCK Act activity — scale 0-25 raw score to max +15 points.
-        # Politician buys are a lagging signal (30-45 day disclosure delay) but
-        # carry meaningful forward-looking value as a confirmation signal.
+        # Congressional STOCK Act activity — lagging (30-45 day disclosure delay)
+        # but carries meaningful confirmation value.
         pol_raw = 0
         try:
             from politician_tracker import get_ticker_scores
@@ -411,15 +410,45 @@ def predict_ticker(api, ticker, regime="ranging"):
             pass
         pol_pred_score = round(min(15, pol_raw * 0.6), 1)
 
+        # Corporate insider Form 4 purchases — faster disclosure (2 business days),
+        # high-conviction signal when executives buy their own stock.
+        insider_raw = 0
+        try:
+            from insider_tracker import get_insider_scores
+            insider_raw = get_insider_scores().get(ticker, 0)
+        except Exception:
+            pass
+        insider_pred_score = round(min(12, insider_raw * 0.6), 1)
+
+        # StockTwits crowd sentiment + short squeeze potential — directly
+        # relevant for the meme/momentum universe this bot targets.
+        social_score = 0.0
+        short_score  = 0.0
+        try:
+            from social_sentiment import get_social_score, get_short_score
+            price_trend   = 1 if (bars is not None and len(bars) >= 2 and
+                                  float(bars.iloc[-1]["close"]) > float(bars.iloc[-2]["close"])) else -1
+            social_score  = get_social_score(ticker)
+            short_score   = get_short_score(ticker, price_trend=price_trend)
+        except Exception:
+            pass
+        # Social: -10 to +10 → scale to -8 to +8 in prediction space
+        social_pred_score = round(max(-8, min(8, social_score * 0.8)), 1)
+        # Short squeeze: 0-15 → 0-8 (only positive; squeezes are bullish)
+        short_pred_score  = round(min(8, short_score * 0.55), 1)
+
         total = (
-            sent_score     * 1.0 +
-            dir_score      * 1.0 * tf_multiplier +
-            vol_score      * 0.5 +
-            pat_score      * 0.8 * tf_multiplier +
-            earn_adj       * 1.0 +
-            mkt_score      * 0.7 +
-            tf_bias        * 10  +
-            pol_pred_score * 1.0
+            sent_score         * 1.0 +
+            dir_score          * 1.0 * tf_multiplier +
+            vol_score          * 0.5 +
+            pat_score          * 0.8 * tf_multiplier +
+            earn_adj           * 1.0 +
+            mkt_score          * 0.7 +
+            tf_bias            * 10  +
+            pol_pred_score     * 1.0 +
+            insider_pred_score * 1.2 +   # slightly higher weight: faster + more direct signal
+            social_pred_score  * 0.8 +   # crowd can be noisy; moderate weight
+            short_pred_score   * 0.9     # squeeze potential is directional but timing-dependent
         )
         total = max(-100, min(100, round(total, 1)))
 
@@ -441,14 +470,17 @@ def predict_ticker(api, ticker, regime="ranging"):
             "tf_bias":    tf_bias,
             "tf_detail":  tf_detail,
             "components": {
-                "sentiment_trend":    {"score": sent_score,    "direction": sent_dir, "daily": sent_daily},
-                "price_direction":    {"score": dir_score,     "confidence": dir_conf, "signals": dir_sigs},
-                "volatility":         {"score": vol_score,     "state": vol_state, "details": vol_det},
-                "pattern":            {"score": pat_score,     "name": pat_name, "description": pat_desc},
-                "earnings_risk":      {"level": earn_risk_lv,  "adjustment": earn_adj},
-                "market_condition":   {"condition": mkt_cond,  "score": mkt_score, "vix_move": vix_move},
-                "timeframe":          {"bias": tf_bias,        "detail": tf_detail},
-                "politician_activity":{"score": pol_pred_score, "raw_score": pol_raw},
+                "sentiment_trend":    {"score": sent_score,         "direction": sent_dir, "daily": sent_daily},
+                "price_direction":    {"score": dir_score,          "confidence": dir_conf, "signals": dir_sigs},
+                "volatility":         {"score": vol_score,          "state": vol_state, "details": vol_det},
+                "pattern":            {"score": pat_score,          "name": pat_name, "description": pat_desc},
+                "earnings_risk":      {"level": earn_risk_lv,       "adjustment": earn_adj},
+                "market_condition":   {"condition": mkt_cond,       "score": mkt_score, "vix_move": vix_move},
+                "timeframe":          {"bias": tf_bias,             "detail": tf_detail},
+                "politician_activity":{"score": pol_pred_score,     "raw_score": pol_raw},
+                "insider_buying":     {"score": insider_pred_score, "raw_score": insider_raw},
+                "social_sentiment":   {"score": social_pred_score,  "raw_score": social_score},
+                "short_squeeze":      {"score": short_pred_score,   "raw_score": short_score},
             },
             "signals": dir_sigs,
         })
