@@ -149,12 +149,21 @@ _regime_lock         = threading.Lock()
 _trade_count_lock    = threading.Lock()
 _positions_lock      = threading.Lock()   # guards open_positions check-then-set
 
+# ── Health tracking ───────────────────────────────────────────
+_thread_heartbeats = {}   # name → Unix timestamp of last tick
+_thread_errors     = {}   # name → last exception string
+_bot_start_time    = time.time()
+_api_last_success  = 0.0
+
 NY = pytz.timezone("America/New_York")
 
 # ── Time helpers ──────────────────────────────────────────────
 
 def now_et():
     return datetime.now(NY)
+
+def _hb(name):
+    _thread_heartbeats[name] = time.time()
 
 def in_trading_window():
     now  = now_et()
@@ -247,8 +256,11 @@ def update_signal_weights_from_db():
 # ── Account ───────────────────────────────────────────────────
 
 def get_account():
+    global _api_last_success
     try:
-        return api.get_account()
+        acct = api.get_account()
+        _api_last_success = time.time()
+        return acct
     except Exception as e:
         print(f"get_account error: {e}")
         return None
@@ -1236,6 +1248,7 @@ def macro_loop():
     macro_done = set(); macro_day = None
     while True:
         try:
+            _hb("macro_loop")
             now  = now_et(); hour = now.hour; day = now.date()
             if day != macro_day: macro_done.clear(); macro_day = day
             if now.weekday()<5 and hour in MACRO_REFRESH_HOURS and hour not in macro_done:
@@ -1263,6 +1276,7 @@ def macro_loop():
                 except Exception as e:
                     print(f"Macro refresh error: {e}")
         except Exception as e:
+            _thread_errors["macro_loop"] = str(e)
             print(f"Macro loop error: {e}")
         time.sleep(60)
 
@@ -1271,6 +1285,7 @@ def premarket_loop():
     promote_buckets = set(); promote_day = None
     while True:
         try:
+            _hb("premarket_loop")
             now = now_et(); day = now.date()
             if day != rvol_day:     rvol_buckets.clear();    rvol_day    = day
             if day != promote_day:  promote_buckets.clear(); promote_day = day
@@ -1298,7 +1313,9 @@ def premarket_loop():
                     try: promote_rvol_tickers()
                     except Exception as e: print(f"Promote error: {e}")
 
-        except Exception as e: print(f"Premarket loop error: {e}")
+        except Exception as e:
+            _thread_errors["premarket_loop"] = str(e)
+            print(f"Premarket loop error: {e}")
         time.sleep(60)
 
 def prediction_loop():
@@ -1306,6 +1323,7 @@ def prediction_loop():
     pred_done = set(); pred_day = None; last_tickers = []
     while True:
         try:
+            _hb("prediction_loop")
             now  = now_et(); hour = now.hour; day = now.date()
             if day != pred_day: pred_done.clear(); pred_day = day
             changed = set(active_tickers) != set(last_tickers)
@@ -1331,7 +1349,9 @@ def prediction_loop():
                             for t,r in results.items()
                         })
                 except Exception as e: print(f"Prediction error: {e}")
-        except Exception as e: print(f"Prediction loop error: {e}")
+        except Exception as e:
+            _thread_errors["prediction_loop"] = str(e)
+            print(f"Prediction loop error: {e}")
         time.sleep(60)
 
 def scanner_loop():
@@ -1340,6 +1360,7 @@ def scanner_loop():
     print("Scanner loop started")
     while True:
         try:
+            _hb("scanner_loop")
             now  = now_et(); hour = now.hour; day = now.date()
             if day != scan_day: scan_done.clear(); scan_day = day
             if (now.weekday()<5 and hour in SCAN_HOURS
@@ -1356,13 +1377,16 @@ def scanner_loop():
                         socketio.emit("scan", scan_results)
                         print(f"Scan done | regime:{market_regime}")
                 except Exception as e: print(f"Scanner error: {e}")
-        except Exception as e: print(f"Scanner loop error: {e}")
+        except Exception as e:
+            _thread_errors["scanner_loop"] = str(e)
+            print(f"Scanner loop error: {e}")
         time.sleep(60)
 
 def db_snapshot_loop():
     global last_db_snapshot
     while True:
         try:
+            _hb("db_snapshot_loop")
             now = time.time()
             if now - last_db_snapshot >= DB_SNAPSHOT_INTERVAL:
                 last_db_snapshot = now
@@ -1382,6 +1406,7 @@ def db_snapshot_loop():
                 except Exception as e:
                     print(f"DB snapshot error: {e}")
         except Exception as e:
+            _thread_errors["db_snapshot_loop"] = str(e)
             print(f"DB snapshot loop error: {e}")
         time.sleep(300)
 
@@ -1393,6 +1418,7 @@ def bot_loop():
     hard_close_date = None   # tracks which day the 3:55 failsafe has fired
     while True:
         try:
+            _hb("bot_loop")
             now         = now_et()
             market_open = is_market_open()
             window_open = in_trading_window()
@@ -1517,6 +1543,7 @@ def bot_loop():
             state["trades"]  = trade_log[:40]
             socketio.emit("state", state)
         except Exception as e:
+            _thread_errors["bot_loop"] = str(e)
             print(f"Loop error: {e}")
         time.sleep(INTERVAL)
 
@@ -1742,6 +1769,105 @@ def backtest_run():
 
 @app.route("/ping")
 def ping(): return "pong", 200
+
+@app.route("/health")
+def health_page():
+    return render_template("health.html")
+
+@app.route("/health/data")
+def health_data():
+    now_ts = time.time()
+    # Max lag (seconds) before each thread is flagged — set generously for infrequent loops
+    THREAD_MAX_LAGS = {
+        "bot_loop":         INTERVAL * 4,   # runs every 30s
+        "premarket_loop":   180,             # runs every 60s
+        "macro_loop":       180,             # runs every 60s
+        "db_snapshot_loop": 600,             # runs every 300s
+        "scanner_loop":     10800,           # runs at 10am/12pm; OK to be idle for hours
+        "prediction_loop":  10800,           # runs at 9am/11am; OK to be idle for hours
+    }
+    threads = {}
+    for name, max_lag in THREAD_MAX_LAGS.items():
+        last = _thread_heartbeats.get(name)
+        lag  = int(now_ts - last) if last else None
+        if last is None:
+            status = "not_started"
+        elif lag < max_lag:
+            status = "ok"
+        elif lag < max_lag * 2:
+            status = "slow"
+        else:
+            status = "dead"
+        threads[name] = {
+            "last_beat":  last,
+            "lag_secs":   lag,
+            "status":     status,
+            "last_error": _thread_errors.get(name),
+        }
+
+    rvol_vals     = list(rvol_cache.values())
+    rvol_zero_pct = round(100 * sum(1 for v in rvol_vals if not v) / max(1, len(rvol_vals)), 1)
+
+    # Per-ticker diagnostics — no API calls, uses cached state only
+    floor   = get_price_floor(DEFAULT_MAX_ACCOUNT)
+    ceiling = get_price_ceiling(DEFAULT_MAX_ACCOUNT)
+    ticker_diag = {}
+    for t in list(active_tickers):
+        ph    = price_history.get(t, [])
+        price = ph[-1] if ph else None
+        rvol  = rvol_cache.get(t)
+        vol   = _vol_check_cache.get(t)
+        blocks = []
+        if price is not None and not (floor <= price <= ceiling):
+            blocks.append(f"price ${price:.2f} outside ${floor:.0f}–${ceiling:.0f}")
+        if rvol is not None and 0.10 < rvol < RVOL_THRESHOLD:
+            blocks.append(f"rvol {rvol:.1f}x below {RVOL_THRESHOLD}x threshold")
+        if vol and not vol[1]:
+            blocks.append("avg daily volume too low")
+        if is_on_cooldown(t):
+            blocks.append(f"cooldown {int(cooldown_remaining(t))}s remaining")
+        ticker_diag[t] = {
+            "price":         round(price, 2) if price is not None else None,
+            "rvol":          round(rvol, 2) if rvol is not None else None,
+            "vol_ok":        vol[1] if vol else None,
+            "price_depth":   len(ph),
+            "blocks":        blocks,
+            "passes":        len(blocks) == 0,
+            "cooldown_secs": int(cooldown_remaining(t)) if is_on_cooldown(t) else 0,
+            "pred_score":    prediction_cache.get(t, {}).get("score"),
+            "pred_conf":     prediction_cache.get(t, {}).get("confidence"),
+            "has_position":  t in open_positions,
+            "pending_order": t in _pending_buy_tickers,
+            "grade":         ticker_grades.get(t, "—"),
+        }
+
+    blackout, blackout_event = cached_blackout_today()
+    api_lag = int(now_ts - _api_last_success) if _api_last_success else None
+
+    return jsonify({
+        "uptime_secs":      int(now_ts - _bot_start_time),
+        "threads":          threads,
+        "api_lag_secs":     api_lag,
+        "api_ok":           api_lag is not None and api_lag < 300,
+        "daily_trades":     daily_trade_count,
+        "max_daily_trades": MAX_DAILY_TRADES,
+        "pdt_safe":         is_day_trade_safe(),
+        "open_positions":   len(open_positions),
+        "position_tickers": list(open_positions.keys()),
+        "pending_orders":   len(_pending_orders),
+        "active_tickers":   active_tickers,
+        "market_open":      is_market_open(),
+        "window_open":      in_trading_window(),
+        "blackout":         blackout,
+        "blackout_event":   blackout_event,
+        "market_regime":    market_regime,
+        "rvol_zero_pct":    rvol_zero_pct,
+        "rvol_ticker_count":len(rvol_vals),
+        "last_scan":        scan_results.get("scanned_at"),
+        "live_mode":        LIVE_MODE,
+        "ticker_diag":      ticker_diag,
+        "signal_weights":   signal_weights,
+    })
 
 # ── Startup ───────────────────────────────────────────────────
 
