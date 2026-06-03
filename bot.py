@@ -97,6 +97,7 @@ TRAILING_STOP_GAP_PCT = 0.03   # trail stop 3% below highest price for gap plays
 BREAKEVEN_TRIGGER_PCT = 0.08   # move stop to breakeven when up 8%
 TRAILING_TRIGGER_PCT  = 0.15   # activate 3% trail once up 15%
 RVOL_THRESHOLD        = 1.2
+CHOP_BLOCK_THRESHOLD  = 2      # stop a ticker for rest of day after this many stop losses
 RVOL_PROMOTE_MIN     = 2.5   # NEW: promote ticker to active list if rvol exceeds this
 BASE_BUY_THRESHOLD   = 2.0
 BASE_SELL_THRESHOLD  = 2.0
@@ -139,6 +140,7 @@ ticker_grades     = {}
 gap_candidates    = {}
 catalyst_cache    = {}
 rvol_cache        = {}
+_daily_stop_counts = {}   # ticker → {date_str: count}  (anti-chop gate)
 unusual_volume    = []
 daily_trade_count = 0
 daily_trade_date  = None
@@ -833,6 +835,18 @@ def force_sell(ticker, price, reason="stop_loss"):
             open_positions.pop(ticker, None)
         set_cooldown(ticker, reason)
 
+        # Anti-chop gate: count stop losses per ticker per day
+        if reason == "stop_loss":
+            today_str = now_et().strftime("%Y-%m-%d")
+            _daily_stop_counts.setdefault(ticker, {})
+            _daily_stop_counts[ticker][today_str] = (
+                _daily_stop_counts[ticker].get(today_str, 0) + 1
+            )
+            stops_today = _daily_stop_counts[ticker][today_str]
+            if stops_today >= CHOP_BLOCK_THRESHOLD:
+                print(f"  CHOP BLOCK: {ticker} stopped out {stops_today}x today — "
+                      f"blocked for the rest of the day")
+
         wr   = get_trade_stats_from_db().get("win_rate", 0)
         mode = "🔴 LIVE" if LIVE_MODE else "PAPER"
         print(f"{mode} SELL {qty}x {ticker} @ ${price:.2f} "
@@ -1026,6 +1040,12 @@ def execute(ticker, action, price, signals, reason="signal"):
 
             if is_on_cooldown(ticker):
                 print(f"  {ticker} cooldown {cooldown_remaining(ticker)}s"); return
+
+            # Anti-chop gate: block re-entry if stopped out CHOP_BLOCK_THRESHOLD times today
+            today_str = now_et().strftime("%Y-%m-%d")
+            stops_today = _daily_stop_counts.get(ticker, {}).get(today_str, 0)
+            if stops_today >= CHOP_BLOCK_THRESHOLD:
+                print(f"  CHOP BLOCK: {ticker} stopped out {stops_today}x today"); return
 
             blackout, event_name = cached_blackout_today()
             if blackout:
@@ -1899,6 +1919,20 @@ def backtest_run():
             socketio.emit("backtest_status", {"status":"error","message":str(e)})
     threading.Thread(target=run, daemon=True).start()
     return jsonify({"status":"started"}), 202
+
+@app.route("/review")
+def review_page():
+    return render_template("review.html")
+
+@app.route("/review/data")
+def review_data():
+    try:
+        from trade_reviewer import get_trade_review
+        trades = get_recent_trades(days=30)
+        return jsonify(get_trade_review(trades))
+    except Exception as e:
+        return jsonify({"error": str(e), "suggestions": [{"priority":"ERROR","area":"System",
+                        "finding": str(e), "action":"Check server logs"}]})
 
 @app.route("/ping")
 def ping(): return "pong", 200
