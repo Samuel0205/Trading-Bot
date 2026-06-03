@@ -437,18 +437,32 @@ def predict_ticker(api, ticker, regime="ranging"):
         # Short squeeze: 0-15 → 0-8 (only positive; squeezes are bullish)
         short_pred_score  = round(min(8, short_score * 0.55), 1)
 
+        # SEC EDGAR + Yahoo Finance catalyst — fundamental driver behind price move
+        catalyst_raw      = 0
+        catalyst_headline = ""
+        try:
+            from catalyst_tracker import get_catalyst_score as _get_cat
+            cat               = _get_cat(ticker)
+            catalyst_raw      = cat.get("score", 0)
+            catalyst_headline = cat.get("headline", "")
+        except Exception:
+            pass
+        # Scale: catalyst raw (-20 to +20) → prediction space (-15 to +15)
+        catalyst_pred_score = round(max(-15, min(15, catalyst_raw * 0.75)), 1)
+
         total = (
-            sent_score         * 1.0 +
-            dir_score          * 1.0 * tf_multiplier +
-            vol_score          * 0.5 +
-            pat_score          * 0.8 * tf_multiplier +
-            earn_adj           * 1.0 +
-            mkt_score          * 0.7 +
-            tf_bias            * 10  +
-            pol_pred_score     * 1.0 +
-            insider_pred_score * 1.2 +   # slightly higher weight: faster + more direct signal
-            social_pred_score  * 0.8 +   # crowd can be noisy; moderate weight
-            short_pred_score   * 0.9     # squeeze potential is directional but timing-dependent
+            sent_score          * 1.0 +
+            dir_score           * 1.0 * tf_multiplier +
+            vol_score           * 0.5 +
+            pat_score           * 0.8 * tf_multiplier +
+            earn_adj            * 1.0 +
+            mkt_score           * 0.7 +
+            tf_bias             * 10  +
+            pol_pred_score      * 1.0 +
+            insider_pred_score  * 1.2 +   # slightly higher weight: faster + more direct signal
+            social_pred_score   * 0.8 +   # crowd can be noisy; moderate weight
+            short_pred_score    * 0.9 +   # squeeze potential is directional but timing-dependent
+            catalyst_pred_score * 1.5     # strong weight: real fundamental backing
         )
         total = max(-100, min(100, round(total, 1)))
 
@@ -481,6 +495,8 @@ def predict_ticker(api, ticker, regime="ranging"):
                 "insider_buying":     {"score": insider_pred_score, "raw_score": insider_raw},
                 "social_sentiment":   {"score": social_pred_score,  "raw_score": social_score},
                 "short_squeeze":      {"score": short_pred_score,   "raw_score": short_score},
+                "catalyst":           {"score": catalyst_pred_score, "raw_score": catalyst_raw,
+                                       "headline": catalyst_headline},
             },
             "signals": dir_sigs,
         })

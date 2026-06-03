@@ -263,7 +263,8 @@ def get_price_data(api, ticker):
 # ── Composite scoring ─────────────────────────────────────────
 
 def composite_score(pd, sentiment, news_count, account_size,
-                    politician_score=0, social_score=0, short_score=0, insider_score=0):
+                    politician_score=0, social_score=0, short_score=0, insider_score=0,
+                    catalyst_score=0):
     s  = abs(pd["change_pct"]) * 2.5
     s += abs(pd["rs_5d"])      * 1.5
     vr = pd["vol_ratio"]
@@ -295,6 +296,8 @@ def composite_score(pd, sentiment, news_count, account_size,
     # Insider (Form 4) buying: slower signal but high conviction
     if insider_score > 0:
         s += insider_score * 2.5  # 0 to +50 at max, capped below
+    if catalyst_score != 0:
+        s += catalyst_score * 2.0  # EDGAR/news catalyst quality boost
     return round(s, 2)
 
 def risk_grade(pd):
@@ -336,6 +339,15 @@ def run_scan(api, universe, days_back=1, account_size=20):
     except Exception as e:
         print(f"  insider_tracker unavailable: {e}")
 
+    edgar_scores = {}
+    try:
+        from catalyst_tracker import get_edgar_scores
+        edgar_scores = get_edgar_scores()
+        if edgar_scores:
+            print(f"  EDGAR catalyst scores: {len(edgar_scores)} tickers")
+    except Exception as e:
+        print(f"  catalyst_tracker unavailable: {e}")
+
     tickers_list = [s["symbol"] for s in universe]
     try:
         from social_sentiment import get_social_batch
@@ -360,32 +372,35 @@ def run_scan(api, universe, days_back=1, account_size=20):
             soc               = social_data.get(ticker, {})
             social_score      = soc.get("social", 0)
             short_score       = soc.get("short", 0)
+            cat_score         = edgar_scores.get(ticker, 0)
             score             = composite_score(
                 pd, sentiment, len(headlines), account_size,
                 politician_score=pol_score,
                 social_score=social_score,
                 short_score=short_score,
                 insider_score=insider_score,
+                catalyst_score=cat_score,
             )
             grade             = risk_grade(pd)
             results.append({
-                "ticker":       ticker,
-                "price":        pd["price"],
-                "change_pct":   pd["change_pct"],
-                "vol_ratio":    pd["vol_ratio"],
-                "rs_5d":        pd["rs_5d"],
-                "avg_range":    pd["avg_range"],
-                "sentiment":    sentiment,
-                "sent_method":  method,
-                "news_count":   len(headlines),
-                "score":        score,
-                "grade":        grade,
-                "direction":    "up" if pd["change_pct"] > 0 else "down",
-                "pol_score":    pol_score,
-                "social_score": round(social_score, 2),
-                "short_score":  round(short_score, 2),
-                "insider_score":insider_score,
-                "squeeze":      soc.get("squeeze", False),
+                "ticker":         ticker,
+                "price":          pd["price"],
+                "change_pct":     pd["change_pct"],
+                "vol_ratio":      pd["vol_ratio"],
+                "rs_5d":          pd["rs_5d"],
+                "avg_range":      pd["avg_range"],
+                "sentiment":      sentiment,
+                "sent_method":    method,
+                "news_count":     len(headlines),
+                "score":          score,
+                "grade":          grade,
+                "direction":      "up" if pd["change_pct"] > 0 else "down",
+                "pol_score":      pol_score,
+                "social_score":   round(social_score, 2),
+                "short_score":    round(short_score, 2),
+                "insider_score":  insider_score,
+                "squeeze":        soc.get("squeeze", False),
+                "catalyst_score": cat_score,
             })
             time.sleep(0.1)
         except Exception as e:
@@ -441,6 +456,18 @@ def run_full_scan(api):
             print(f"  Insider-tracked tickers added to universe: {added_ins}")
     except Exception as e:
         print(f"  insider_tracker expand error: {e}")
+
+    try:
+        from catalyst_tracker import get_catalyst_tickers
+        cat_tickers = get_catalyst_tickers(min_score=5)
+        existing    = {s["symbol"] for s in universe}
+        added_cat   = [t for t in cat_tickers if t not in existing]
+        for t in added_cat:
+            universe.append({"symbol": t, "price": 0.0, "volume": 0})
+        if added_cat:
+            print(f"  Catalyst-tracked tickers added to universe: {added_cat[:10]}")
+    except Exception as e:
+        print(f"  catalyst_tracker expand error: {e}")
 
     if not universe:
         print("Universe empty — using fallback")
