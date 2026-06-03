@@ -140,7 +140,7 @@ _pending_lock        = threading.Lock()
 ORDER_FILL_TIMEOUT   = 90       # seconds before an unfilled limit order is cancelled
 
 # PDT check cache — avoids hitting Alpaca API on every buy attempt
-_pdt_cache      = {"count": 0, "ts": 0.0}
+_pdt_cache      = {"count": 0, "ts": 0.0, "window_start": None, "reset_date": None}
 _PDT_CACHE_TTL  = 300   # 5 minutes
 
 _blackout_cache      = {"date": None, "result": (False, None)}
@@ -149,12 +149,21 @@ _regime_lock         = threading.Lock()
 _trade_count_lock    = threading.Lock()
 _positions_lock      = threading.Lock()   # guards open_positions check-then-set
 
+# ── Health tracking ───────────────────────────────────────────
+_thread_heartbeats = {}   # name → Unix timestamp of last tick
+_thread_errors     = {}   # name → last exception string
+_bot_start_time    = time.time()
+_api_last_success  = 0.0
+
 NY = pytz.timezone("America/New_York")
 
 # ── Time helpers ──────────────────────────────────────────────
 
 def now_et():
     return datetime.now(NY)
+
+def _hb(name):
+    _thread_heartbeats[name] = time.time()
 
 def in_trading_window():
     now  = now_et()
@@ -247,8 +256,11 @@ def update_signal_weights_from_db():
 # ── Account ───────────────────────────────────────────────────
 
 def get_account():
+    global _api_last_success
     try:
-        return api.get_account()
+        acct = api.get_account()
+        _api_last_success = time.time()
+        return acct
     except Exception as e:
         print(f"get_account error: {e}")
         return None
@@ -323,34 +335,76 @@ def get_min_volume(account_size=None):
 
 # ── PDT compliance ────────────────────────────────────────────
 
-def count_day_trades_this_week():
-    # Cached — avoids an Alpaca API call on every buy attempt in live mode
+def _pdt_window_start():
+    """First date of the rolling 5-business-day PDT window (today inclusive)."""
+    dt  = now_et().date()
+    bds = 0
+    while bds < 4:          # back 4 more BDs so window = today + 4 prior BDs = 5 total
+        dt -= timedelta(days=1)
+        if dt.weekday() < 5:
+            bds += 1
+    return dt
+
+def _add_business_days(dt, n):
+    """Return the date exactly n business days after dt."""
+    result = dt
+    count  = 0
+    while count < n:
+        result += timedelta(days=1)
+        if result.weekday() < 5:
+            count += 1
+    return result
+
+def count_rolling_day_trades():
+    """
+    Count same-security same-day round-trips (day trades) in the rolling
+    5-business-day PDT window.  Alpaca flags accounts that exceed 3.
+    Works in both LIVE and PAPER mode (paper fills appear in the orders API).
+
+    Returns (count, window_start_str, reset_date_str).
+    reset_date_str is a human-readable date when the oldest trade rolls off.
+    Cached for _PDT_CACHE_TTL seconds.
+    """
     if time.time() - _pdt_cache["ts"] < _PDT_CACHE_TTL:
-        return _pdt_cache["count"]
+        return (_pdt_cache["count"],
+                _pdt_cache["window_start"],
+                _pdt_cache["reset_date"])
     try:
-        now    = now_et()
-        cutoff = now - timedelta(days=7)
-        orders = api.list_orders(
+        win_start = _pdt_window_start()
+        after_dt  = NY.localize(datetime.combine(win_start, datetime.min.time()))
+        orders    = api.list_orders(
             status="filled",
-            after=cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            limit=100, direction="desc"
+            after=after_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            limit=100, direction="asc"
         )
-        buys = {}; sells = {}
+        buys  = set()
+        sells = set()
         for o in orders:
             d = o.filled_at[:10] if o.filled_at else ""
             k = (o.symbol, d)
-            if o.side == "buy":  buys[k]  = buys.get(k, 0) + 1
-            if o.side == "sell": sells[k] = sells.get(k, 0) + 1
-        count = sum(1 for k in buys if k in sells)
-        _pdt_cache["count"] = count
-        _pdt_cache["ts"]    = time.time()
-        return count
+            if o.side == "buy":  buys.add(k)
+            if o.side == "sell": sells.add(k)
+        round_trips = sorted(buys & sells, key=lambda x: x[1])
+        count = len(round_trips)
+        reset_date_str = None
+        if round_trips:
+            oldest_dt      = datetime.strptime(round_trips[0][1], "%Y-%m-%d").date()
+            reset_dt       = _add_business_days(oldest_dt, 5)
+            reset_date_str = reset_dt.strftime("%a %b %-d")
+        _pdt_cache["count"]        = count
+        _pdt_cache["ts"]           = time.time()
+        _pdt_cache["window_start"] = win_start.strftime("%Y-%m-%d")
+        _pdt_cache["reset_date"]   = reset_date_str
+        return count, win_start.strftime("%Y-%m-%d"), reset_date_str
     except Exception as e:
-        print(f"PDT count error: {e}"); return 0
+        print(f"PDT count error: {e}")
+        return (_pdt_cache["count"],
+                _pdt_cache.get("window_start"),
+                _pdt_cache.get("reset_date"))
 
 def is_day_trade_safe():
-    if not LIVE_MODE: return True
-    return count_day_trades_this_week() < MAX_DAILY_TRADES
+    count, _, _ = count_rolling_day_trades()
+    return count < MAX_DAILY_TRADES
 
 # ── Correlation helper ────────────────────────────────────────
 
@@ -941,15 +995,10 @@ def execute(ticker, action, price, signals, reason="signal"):
             if earn_risk == "high":
                 print(f"  {ticker} earnings risk HIGH — skipping"); return
 
-            if LIVE_MODE and not is_day_trade_safe():
-                print(f"  PDT limit — skipping"); return
-
-            today = now_et().date()
-            with _trade_count_lock:
-                if daily_trade_date != today:
-                    daily_trade_count = 0; daily_trade_date = today
-                if daily_trade_count >= MAX_DAILY_TRADES:
-                    print(f"  Daily limit {MAX_DAILY_TRADES} reached"); return
+            dt_count, _, dt_reset = count_rolling_day_trades()
+            if dt_count >= MAX_DAILY_TRADES:
+                print(f"  PDT limit: {dt_count}/3 day trades in rolling 5-day window"
+                      + (f" — resets {dt_reset}" if dt_reset else "")); return
 
             acct_size = get_account_size()
             if not passes_filters(ticker, price, acct_size):
@@ -975,6 +1024,9 @@ def execute(ticker, action, price, signals, reason="signal"):
                 print(f"  {ticker} profit too low"); return
 
             with _trade_count_lock:
+                today = now_et().date()
+                if daily_trade_date != today:
+                    daily_trade_count = 0; daily_trade_date = today
                 if daily_trade_count >= MAX_DAILY_TRADES:
                     print(f"  Daily limit reached (race)"); return
                 daily_trade_count += 1
@@ -1022,10 +1074,12 @@ def execute(ticker, action, price, signals, reason="signal"):
                 }
                 _pending_buy_tickers.add(ticker)
 
+            _pdt_cache["ts"] = 0.0  # force refresh so next check sees this order
+
             mode = "🔴 LIVE" if LIVE_MODE else "PAPER"
             print(f"{mode} LIMIT ORDER {qty}x {ticker} @ ${limit_price:.3f} "
                   f"SL${stop} TP${target} pred={pred_score:+.0f} "
-                  f"#{current_count}/{MAX_DAILY_TRADES}")
+                  f"#{current_count}/{MAX_DAILY_TRADES} PDT:{dt_count+1}/3")
 
         elif action == "sell" and ticker in open_positions:
             force_sell(ticker, price, reason=reason or "signal")
@@ -1236,6 +1290,7 @@ def macro_loop():
     macro_done = set(); macro_day = None
     while True:
         try:
+            _hb("macro_loop")
             now  = now_et(); hour = now.hour; day = now.date()
             if day != macro_day: macro_done.clear(); macro_day = day
             if now.weekday()<5 and hour in MACRO_REFRESH_HOURS and hour not in macro_done:
@@ -1263,6 +1318,7 @@ def macro_loop():
                 except Exception as e:
                     print(f"Macro refresh error: {e}")
         except Exception as e:
+            _thread_errors["macro_loop"] = str(e)
             print(f"Macro loop error: {e}")
         time.sleep(60)
 
@@ -1271,6 +1327,7 @@ def premarket_loop():
     promote_buckets = set(); promote_day = None
     while True:
         try:
+            _hb("premarket_loop")
             now = now_et(); day = now.date()
             if day != rvol_day:     rvol_buckets.clear();    rvol_day    = day
             if day != promote_day:  promote_buckets.clear(); promote_day = day
@@ -1298,7 +1355,9 @@ def premarket_loop():
                     try: promote_rvol_tickers()
                     except Exception as e: print(f"Promote error: {e}")
 
-        except Exception as e: print(f"Premarket loop error: {e}")
+        except Exception as e:
+            _thread_errors["premarket_loop"] = str(e)
+            print(f"Premarket loop error: {e}")
         time.sleep(60)
 
 def prediction_loop():
@@ -1306,6 +1365,7 @@ def prediction_loop():
     pred_done = set(); pred_day = None; last_tickers = []
     while True:
         try:
+            _hb("prediction_loop")
             now  = now_et(); hour = now.hour; day = now.date()
             if day != pred_day: pred_done.clear(); pred_day = day
             changed = set(active_tickers) != set(last_tickers)
@@ -1331,7 +1391,9 @@ def prediction_loop():
                             for t,r in results.items()
                         })
                 except Exception as e: print(f"Prediction error: {e}")
-        except Exception as e: print(f"Prediction loop error: {e}")
+        except Exception as e:
+            _thread_errors["prediction_loop"] = str(e)
+            print(f"Prediction loop error: {e}")
         time.sleep(60)
 
 def scanner_loop():
@@ -1340,6 +1402,7 @@ def scanner_loop():
     print("Scanner loop started")
     while True:
         try:
+            _hb("scanner_loop")
             now  = now_et(); hour = now.hour; day = now.date()
             if day != scan_day: scan_done.clear(); scan_day = day
             if (now.weekday()<5 and hour in SCAN_HOURS
@@ -1356,13 +1419,16 @@ def scanner_loop():
                         socketio.emit("scan", scan_results)
                         print(f"Scan done | regime:{market_regime}")
                 except Exception as e: print(f"Scanner error: {e}")
-        except Exception as e: print(f"Scanner loop error: {e}")
+        except Exception as e:
+            _thread_errors["scanner_loop"] = str(e)
+            print(f"Scanner loop error: {e}")
         time.sleep(60)
 
 def db_snapshot_loop():
     global last_db_snapshot
     while True:
         try:
+            _hb("db_snapshot_loop")
             now = time.time()
             if now - last_db_snapshot >= DB_SNAPSHOT_INTERVAL:
                 last_db_snapshot = now
@@ -1382,6 +1448,7 @@ def db_snapshot_loop():
                 except Exception as e:
                     print(f"DB snapshot error: {e}")
         except Exception as e:
+            _thread_errors["db_snapshot_loop"] = str(e)
             print(f"DB snapshot loop error: {e}")
         time.sleep(300)
 
@@ -1393,6 +1460,7 @@ def bot_loop():
     hard_close_date = None   # tracks which day the 3:55 failsafe has fired
     while True:
         try:
+            _hb("bot_loop")
             now         = now_et()
             market_open = is_market_open()
             window_open = in_trading_window()
@@ -1517,6 +1585,7 @@ def bot_loop():
             state["trades"]  = trade_log[:40]
             socketio.emit("state", state)
         except Exception as e:
+            _thread_errors["bot_loop"] = str(e)
             print(f"Loop error: {e}")
         time.sleep(INTERVAL)
 
@@ -1657,21 +1726,24 @@ def history_json():
 
 @app.route("/stats")
 def stats_json():
-    db_stats = get_trade_stats_from_db()
-    blackout, _ = cached_blackout_today()
+    db_stats              = get_trade_stats_from_db()
+    blackout, _           = cached_blackout_today()
+    pdt_count, pdt_ws, pdt_rd = count_rolling_day_trades()
     return jsonify({
         **db_stats,
-        "signal_weights":       signal_weights,
-        "signal_win_rates":     get_signal_win_rates(),
-        "live_mode":            LIVE_MODE,
-        "pdt_trades_this_week": count_day_trades_this_week() if LIVE_MODE else 0,
-        "daily_trade_count":    daily_trade_count,
-        "macro_blackout":       blackout,
-        "unusual_volume":       unusual_volume[:5],
-        "active_tickers":       active_tickers,
-        "market_regime":        market_regime,
-        "mins_since_open":      mins_since_open(),
-        "mins_until_close":     mins_until_close(),
+        "signal_weights":    signal_weights,
+        "signal_win_rates":  get_signal_win_rates(),
+        "live_mode":         LIVE_MODE,
+        "pdt_rolling_count": pdt_count,
+        "pdt_window_start":  pdt_ws,
+        "pdt_reset_date":    pdt_rd,
+        "daily_trade_count": daily_trade_count,
+        "macro_blackout":    blackout,
+        "unusual_volume":    unusual_volume[:5],
+        "active_tickers":    active_tickers,
+        "market_regime":     market_regime,
+        "mins_since_open":   mins_since_open(),
+        "mins_until_close":  mins_until_close(),
     })
 
 @app.route("/scan/manual", methods=["POST"])
@@ -1743,6 +1815,109 @@ def backtest_run():
 @app.route("/ping")
 def ping(): return "pong", 200
 
+@app.route("/health")
+def health_page():
+    return render_template("health.html")
+
+@app.route("/health/data")
+def health_data():
+    now_ts = time.time()
+    # Max lag (seconds) before each thread is flagged — set generously for infrequent loops
+    THREAD_MAX_LAGS = {
+        "bot_loop":         INTERVAL * 4,   # runs every 30s
+        "premarket_loop":   180,             # runs every 60s
+        "macro_loop":       180,             # runs every 60s
+        "db_snapshot_loop": 600,             # runs every 300s
+        "scanner_loop":     10800,           # runs at 10am/12pm; OK to be idle for hours
+        "prediction_loop":  10800,           # runs at 9am/11am; OK to be idle for hours
+    }
+    threads = {}
+    for name, max_lag in THREAD_MAX_LAGS.items():
+        last = _thread_heartbeats.get(name)
+        lag  = int(now_ts - last) if last else None
+        if last is None:
+            status = "not_started"
+        elif lag < max_lag:
+            status = "ok"
+        elif lag < max_lag * 2:
+            status = "slow"
+        else:
+            status = "dead"
+        threads[name] = {
+            "last_beat":  last,
+            "lag_secs":   lag,
+            "status":     status,
+            "last_error": _thread_errors.get(name),
+        }
+
+    rvol_vals     = list(rvol_cache.values())
+    rvol_zero_pct = round(100 * sum(1 for v in rvol_vals if not v) / max(1, len(rvol_vals)), 1)
+
+    # Per-ticker diagnostics — no API calls, uses cached state only
+    floor   = get_price_floor(DEFAULT_MAX_ACCOUNT)
+    ceiling = get_price_ceiling(DEFAULT_MAX_ACCOUNT)
+    ticker_diag = {}
+    for t in list(active_tickers):
+        ph    = price_history.get(t, [])
+        price = ph[-1] if ph else None
+        rvol  = rvol_cache.get(t)
+        vol   = _vol_check_cache.get(t)
+        blocks = []
+        if price is not None and not (floor <= price <= ceiling):
+            blocks.append(f"price ${price:.2f} outside ${floor:.0f}–${ceiling:.0f}")
+        if rvol is not None and 0.10 < rvol < RVOL_THRESHOLD:
+            blocks.append(f"rvol {rvol:.1f}x below {RVOL_THRESHOLD}x threshold")
+        if vol and not vol[1]:
+            blocks.append("avg daily volume too low")
+        if is_on_cooldown(t):
+            blocks.append(f"cooldown {int(cooldown_remaining(t))}s remaining")
+        ticker_diag[t] = {
+            "price":         round(price, 2) if price is not None else None,
+            "rvol":          round(rvol, 2) if rvol is not None else None,
+            "vol_ok":        vol[1] if vol else None,
+            "price_depth":   len(ph),
+            "blocks":        blocks,
+            "passes":        len(blocks) == 0,
+            "cooldown_secs": int(cooldown_remaining(t)) if is_on_cooldown(t) else 0,
+            "pred_score":    prediction_cache.get(t, {}).get("score"),
+            "pred_conf":     prediction_cache.get(t, {}).get("confidence"),
+            "has_position":  t in open_positions,
+            "pending_order": t in _pending_buy_tickers,
+            "grade":         ticker_grades.get(t, "—"),
+        }
+
+    blackout, blackout_event  = cached_blackout_today()
+    pdt_count, pdt_ws, pdt_rd = count_rolling_day_trades()
+    api_lag = int(now_ts - _api_last_success) if _api_last_success else None
+
+    return jsonify({
+        "uptime_secs":      int(now_ts - _bot_start_time),
+        "threads":          threads,
+        "api_lag_secs":     api_lag,
+        "api_ok":           api_lag is not None and api_lag < 300,
+        "daily_trades":     daily_trade_count,
+        "max_daily_trades": MAX_DAILY_TRADES,
+        "pdt_rolling_count":pdt_count,
+        "pdt_window_start": pdt_ws,
+        "pdt_reset_date":   pdt_rd,
+        "pdt_safe":         pdt_count < MAX_DAILY_TRADES,
+        "open_positions":   len(open_positions),
+        "position_tickers": list(open_positions.keys()),
+        "pending_orders":   len(_pending_orders),
+        "active_tickers":   active_tickers,
+        "market_open":      is_market_open(),
+        "window_open":      in_trading_window(),
+        "blackout":         blackout,
+        "blackout_event":   blackout_event,
+        "market_regime":    market_regime,
+        "rvol_zero_pct":    rvol_zero_pct,
+        "rvol_ticker_count":len(rvol_vals),
+        "last_scan":        scan_results.get("scanned_at"),
+        "live_mode":        LIVE_MODE,
+        "ticker_diag":      ticker_diag,
+        "signal_weights":   signal_weights,
+    })
+
 # ── Startup ───────────────────────────────────────────────────
 
 def reconcile_open_positions():
@@ -1788,26 +1963,27 @@ def reconcile_open_positions():
         print(f"Reconcile error: {e}")
 
 
-def restore_daily_trade_count():
+def restore_pdt_state():
     """
-    Count today's filled buy orders from Alpaca so daily_trade_count survives restarts.
-    Only counts orders where a same-day sell also exists (actual day trades in LIVE mode),
-    or all filled buy orders in paper mode.
+    On startup: warm the rolling PDT cache and restore today's local trade count.
+    The rolling cache is the authoritative gate; the daily counter is a fast
+    race-guard and display aid only.
     """
     global daily_trade_count, daily_trade_date
     try:
-        today = now_et().date()
-        # Use ET midnight as the cutoff
-        midnight_et = datetime.combine(today, datetime.min.time())
-        midnight_et = NY.localize(midnight_et)
+        count, ws, rd = count_rolling_day_trades()
+        print(f"PDT rolling window: {count}/3 day trades "
+              f"(window starts {ws}"
+              + (f", resets {rd}" if rd else "") + ")")
+        today       = now_et().date()
+        midnight_et = NY.localize(datetime.combine(today, datetime.min.time()))
         after_str   = midnight_et.strftime("%Y-%m-%dT%H:%M:%SZ")
-        orders = api.list_orders(status="filled", after=after_str, limit=50, direction="desc")
-        count  = sum(1 for o in orders if o.side == "buy")
-        daily_trade_count = min(count, MAX_DAILY_TRADES)
+        orders      = api.list_orders(status="filled", after=after_str, limit=50, direction="desc")
+        daily_trade_count = sum(1 for o in orders if o.side == "buy")
         daily_trade_date  = today
-        print(f"Restored daily_trade_count: {daily_trade_count} (from Alpaca fills today)")
+        print(f"Restored daily_trade_count: {daily_trade_count} (today's buys)")
     except Exception as e:
-        print(f"restore_daily_trade_count error: {e}")
+        print(f"restore_pdt_state error: {e}")
 
 
 def _start_bot():
@@ -1830,7 +2006,7 @@ def _start_bot():
         update_market_regime()
         validate_fallback_tickers()
         reconcile_open_positions()
-        restore_daily_trade_count()
+        restore_pdt_state()
         try:
             status = get_macro_status(api)
             status["hot_sectors"] = get_hot_sectors(api)

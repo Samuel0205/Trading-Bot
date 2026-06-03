@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Bot Health</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f1117; color: #e8e8e8; padding: 12px; font-size: 14px; }
+h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-transform: uppercase; letter-spacing: .08em; }
+.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; flex-wrap: wrap; gap: 8px; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.nav { display: flex; gap: 6px; flex-wrap: wrap; }
+.nav a { font-size: 12px; text-decoration: none; padding: 5px 10px; border-radius: 8px; }
+
+/* Status pill grid */
+.pill-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 4px; }
+@media (max-width: 480px) { .pill-grid { grid-template-columns: 1fr 1fr; } }
+.pill { background: #1a1d27; border-radius: 10px; padding: 10px 12px; border-left: 3px solid #333; }
+.pill .lbl { font-size: 10px; color: #555; margin-bottom: 3px; text-transform: uppercase; letter-spacing: .05em; }
+.pill .val { font-size: 14px; font-weight: 600; }
+.pill .sub { font-size: 10px; color: #555; margin-top: 2px; }
+.pill-ok   { border-left-color: #1D9E75; }
+.pill-warn { border-left-color: #E9A84C; }
+.pill-bad  { border-left-color: #D85A30; }
+.pill-info { border-left-color: #4a9eff; }
+.ok   { color: #1D9E75; }
+.warn { color: #E9A84C; }
+.bad  { color: #D85A30; }
+.blue { color: #4a9eff; }
+.dim  { color: #555; }
+
+/* Threads */
+.thread-grid { display: flex; flex-direction: column; gap: 6px; }
+.thread-row { background: #1a1d27; border-radius: 8px; padding: 10px 14px; display: flex; align-items: center; gap: 10px; }
+.thread-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.thread-name { font-size: 13px; font-weight: 500; flex: 1; }
+.thread-lag { font-size: 11px; color: #555; }
+.thread-err { font-size: 10px; color: #D85A30; margin-top: 2px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-note { font-size: 10px; color: #444; margin-left: 4px; }
+
+/* Ticker table */
+.ticker-table { width: 100%; border-collapse: collapse; }
+.ticker-table th { font-size: 10px; color: #555; font-weight: 500; text-transform: uppercase; letter-spacing: .05em; padding: 6px 8px; text-align: left; border-bottom: 1px solid #1e2130; }
+.ticker-table td { padding: 8px 8px; border-bottom: 1px solid #1a1d27; font-size: 12px; vertical-align: top; }
+.ticker-table tr:last-child td { border-bottom: none; }
+.pass-badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+.pass-yes  { background: #0F6E5622; color: #1D9E75; }
+.pass-no   { background: #D85A3022; color: #D85A30; }
+.pass-unk  { background: #44444422; color: #888; }
+.block-item { display: block; font-size: 10px; color: #E9A84C; margin-top: 2px; }
+.pos-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; background: #4a9eff22; color: #4a9eff; }
+.pend-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; background: #E9A84C22; color: #E9A84C; }
+
+/* Data quality */
+.dq-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.dq-chip { background: #1a1d27; border-radius: 8px; padding: 8px 12px; font-size: 12px; }
+.dq-chip .lbl { font-size: 10px; color: #555; margin-bottom: 2px; }
+.dq-chip .val { font-weight: 600; }
+
+/* Signal weights */
+.sw-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+.sw-chip { background: #1a1d27; border-radius: 8px; padding: 6px 10px; font-size: 11px; }
+.sw-chip .name { color: #555; font-size: 10px; }
+.sw-chip .wt   { font-weight: 600; color: #4a9eff; }
+
+/* Footer */
+.footer { display: flex; justify-content: space-between; align-items: center; margin-top: 20px; font-size: 11px; color: #333; padding-bottom: 8px; }
+.countdown { font-size: 11px; color: #333; }
+.refresh-now { font-size: 11px; color: #4a9eff; background: none; border: none; cursor: pointer; padding: 0; }
+
+/* Error banner */
+.error-banner { background: #D85A3022; border: 1px solid #D85A3044; border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; font-size: 12px; color: #D85A30; display: none; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Bot Health</h1>
+  <div class="nav">
+    <a href="/" style="color:#555;background:#1a1d27;">Dashboard</a>
+    <a href="/scanner" style="color:#4a9eff;background:#4a9eff11;">Scanner</a>
+    <a href="/predictions" style="color:#E9A84C;background:#E9A84C11;">Predictions</a>
+    <a href="/health" style="color:#C45C8A;background:#C45C8A11;">Health</a>
+  </div>
+</div>
+
+<div class="error-banner" id="errorBanner"></div>
+
+<h2>System Overview</h2>
+<div class="pill-grid" id="overviewPills">
+  <div class="pill"><div class="lbl">Uptime</div><div class="val dim" id="ovUptime">—</div></div>
+  <div class="pill"><div class="lbl">Mode</div><div class="val dim" id="ovMode">—</div></div>
+  <div class="pill"><div class="lbl">Alpaca API</div><div class="val dim" id="ovApi">—</div><div class="sub" id="ovApiSub"></div></div>
+  <div class="pill"><div class="lbl">Market</div><div class="val dim" id="ovMarket">—</div></div>
+  <div class="pill"><div class="lbl">Day Trades (5-day)</div><div class="val dim" id="ovTrades">—</div><div class="sub" id="ovTradesSub"></div></div>
+  <div class="pill"><div class="lbl">Positions / Pending</div><div class="val dim" id="ovPos">—</div></div>
+</div>
+
+<h2>Background Threads</h2>
+<div class="thread-grid" id="threadGrid">
+  <div class="thread-row"><div class="thread-dot" style="background:#333;"></div><div class="thread-name dim">Loading...</div></div>
+</div>
+
+<h2>Active Tickers <span id="tickerCount" style="font-size:11px;color:#555;font-weight:400;"></span></h2>
+<div style="background:#1a1d27;border-radius:10px;padding:4px 0;overflow-x:auto;">
+  <table class="ticker-table" id="tickerTable">
+    <thead><tr>
+      <th>Ticker</th>
+      <th>Price</th>
+      <th>RVOL</th>
+      <th>Volume</th>
+      <th>Pred</th>
+      <th>Status</th>
+      <th>Issues</th>
+    </tr></thead>
+    <tbody id="tickerBody"><tr><td colspan="7" style="color:#555;text-align:center;padding:16px;">Loading...</td></tr></tbody>
+  </table>
+</div>
+
+<h2>Data Quality</h2>
+<div class="dq-row" id="dqRow">
+  <div class="dq-chip"><div class="lbl">RVOL Zero Rate</div><div class="val dim" id="dqRvol">—</div></div>
+  <div class="dq-chip"><div class="lbl">Last Scanner Run</div><div class="val dim" id="dqScan">—</div></div>
+  <div class="dq-chip"><div class="lbl">Market Regime</div><div class="val dim" id="dqRegime">—</div></div>
+  <div class="dq-chip"><div class="lbl">Blackout</div><div class="val dim" id="dqBlackout">—</div></div>
+</div>
+
+<h2>Signal Weights</h2>
+<div class="sw-row" id="swRow">
+  <div class="sw-chip"><div class="name">Loading</div><div class="wt">—</div></div>
+</div>
+
+<div class="footer">
+  <span id="lastRefresh">Never refreshed</span>
+  <div style="display:flex;gap:10px;align-items:center;">
+    <button class="refresh-now" onclick="load()">Refresh now</button>
+    <span class="countdown" id="countdown">next in 15s</span>
+  </div>
+</div>
+
+<script>
+let countdown = 15;
+let countdownTimer;
+
+function fmt_secs(s) {
+  if (s == null) return '—';
+  if (s < 60)    return s + 's';
+  if (s < 3600)  return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h + 'h ' + m + 'm';
+}
+
+function fmt_uptime(s) {
+  if (s == null) return '—';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm ' + (s % 60) + 's';
+}
+
+const THREAD_LABELS = {
+  bot_loop:         { label: 'Bot Loop',         note: 'every 30s — main trading tick' },
+  premarket_loop:   { label: 'Premarket Loop',   note: 'every 60s — RVOL + gap scan' },
+  macro_loop:       { label: 'Macro Loop',        note: 'every 60s — macro/sector refresh' },
+  db_snapshot_loop: { label: 'DB Snapshot Loop', note: 'every 5m — portfolio history' },
+  scanner_loop:     { label: 'Scanner Loop',      note: '10am & 12pm ET — ticker scan' },
+  prediction_loop:  { label: 'Prediction Loop',  note: '9am & 11am ET — model predictions' },
+};
+
+function statusDot(status) {
+  const colors = { ok: '#1D9E75', slow: '#E9A84C', dead: '#D85A30', not_started: '#555' };
+  return colors[status] || '#555';
+}
+
+function statusLabel(status, lag) {
+  if (status === 'ok')          return `<span class="ok">OK</span> <span class="dim">${fmt_secs(lag)} ago</span>`;
+  if (status === 'slow')        return `<span class="warn">SLOW</span> <span class="dim">${fmt_secs(lag)} ago</span>`;
+  if (status === 'dead')        return `<span class="bad">DEAD</span> <span class="dim">${fmt_secs(lag)} ago</span>`;
+  if (status === 'not_started') return `<span class="dim">Not started yet</span>`;
+  return `<span class="dim">Unknown</span>`;
+}
+
+function setPill(id, text, cls) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text;
+  el.className   = 'val ' + (cls || 'dim');
+}
+
+function setPillParent(id, cls) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.parentElement.className = 'pill ' + (cls || '');
+}
+
+function load() {
+  fetch('/health/data').then(r => r.json()).then(render).catch(e => {
+    document.getElementById('errorBanner').textContent = 'Failed to load health data: ' + e;
+    document.getElementById('errorBanner').style.display = 'block';
+  });
+}
+
+function render(d) {
+  document.getElementById('errorBanner').style.display = 'none';
+
+  // ── Overview pills ──────────────────────────────────────────
+  setPill('ovUptime', fmt_uptime(d.uptime_secs), 'dim');
+  setPillParent('ovUptime', 'pill-info');
+
+  const mode = d.live_mode ? '🔴 LIVE' : '📄 Paper';
+  setPill('ovMode', mode, d.live_mode ? 'bad' : 'blue');
+  setPillParent('ovMode', d.live_mode ? 'pill-bad' : 'pill-info');
+
+  if (d.api_ok) {
+    setPill('ovApi', 'Connected', 'ok');
+    setPillParent('ovApi', 'pill-ok');
+    document.getElementById('ovApiSub').textContent = d.api_lag_secs != null ? d.api_lag_secs + 's ago' : '';
+  } else if (d.api_lag_secs != null) {
+    setPill('ovApi', 'Stale', 'warn');
+    setPillParent('ovApi', 'pill-warn');
+    document.getElementById('ovApiSub').textContent = fmt_secs(d.api_lag_secs) + ' ago';
+  } else {
+    setPill('ovApi', 'No call yet', 'dim');
+    setPillParent('ovApi', '');
+    document.getElementById('ovApiSub').textContent = 'Will connect on first tick';
+  }
+
+  const marketOk = d.market_open && d.window_open && !d.blackout;
+  const marketLabel = d.blackout ? 'Blackout' : !d.market_open ? 'Market Closed' : !d.window_open ? 'Window Closed' : 'Open';
+  setPill('ovMarket', marketLabel, marketOk ? 'ok' : 'dim');
+  setPillParent('ovMarket', marketOk ? 'pill-ok' : '');
+
+  const pdtCount = d.pdt_rolling_count ?? d.daily_trades ?? 0;
+  const tradeColor = pdtCount >= d.max_daily_trades ? 'bad' : pdtCount >= d.max_daily_trades - 1 ? 'warn' : 'ok';
+  setPill('ovTrades', `${pdtCount} / ${d.max_daily_trades}`, tradeColor);
+  setPillParent('ovTrades', 'pill-' + tradeColor);
+  const subEl = document.getElementById('ovTradesSub');
+  if (subEl) {
+    subEl.textContent = d.pdt_reset_date ? `resets ${d.pdt_reset_date}` : 'rolling 5-day window';
+    subEl.style.color = pdtCount >= 2 ? '#E9A84C' : '#555';
+  }
+
+  const posLabel = d.open_positions + ' open' + (d.pending_orders ? ', ' + d.pending_orders + ' pending' : '');
+  setPill('ovPos', posLabel, d.open_positions > 0 ? 'blue' : 'dim');
+  setPillParent('ovPos', d.open_positions > 0 ? 'pill-info' : '');
+
+  // ── Threads ──────────────────────────────────────────────────
+  const threadOrder = ['bot_loop','premarket_loop','macro_loop','db_snapshot_loop','scanner_loop','prediction_loop'];
+  document.getElementById('threadGrid').innerHTML = threadOrder.map(name => {
+    const t    = d.threads[name] || { status: 'not_started' };
+    const info = THREAD_LABELS[name] || { label: name, note: '' };
+    const dot  = statusDot(t.status);
+    const errHtml = t.last_error
+      ? `<div class="thread-err" title="${t.last_error}">Last error: ${t.last_error}</div>`
+      : '';
+    return `<div class="thread-row">
+      <div class="thread-dot" style="background:${dot};${t.status==='ok'?'box-shadow:0 0 6px '+dot+'66;':''}"></div>
+      <div style="flex:1;">
+        <div style="display:flex;align-items:center;gap:6px;">
+          <span class="thread-name">${info.label}</span>
+          <span class="thread-note">${info.note}</span>
+        </div>
+        ${errHtml}
+      </div>
+      <div class="thread-lag">${statusLabel(t.status, t.lag_secs)}</div>
+    </div>`;
+  }).join('');
+
+  // ── Tickers ──────────────────────────────────────────────────
+  const tickers = Object.keys(d.ticker_diag || {});
+  document.getElementById('tickerCount').textContent = '(' + tickers.length + ')';
+  if (!tickers.length) {
+    document.getElementById('tickerBody').innerHTML =
+      '<tr><td colspan="7" style="color:#555;text-align:center;padding:16px;">No active tickers</td></tr>';
+  } else {
+    document.getElementById('tickerBody').innerHTML = tickers.map(t => {
+      const td      = d.ticker_diag[t];
+      const price   = td.price != null ? '$' + td.price.toFixed(2) : '<span class="dim">—</span>';
+      const rvol    = td.rvol != null
+        ? `<span style="color:${td.rvol>=2?'#1D9E75':td.rvol>=1.2?'#4a9eff':'#E9A84C'};">${td.rvol}x</span>`
+        : '<span class="dim">—</span>';
+      const volOk   = td.vol_ok === true  ? '<span class="ok">OK</span>'
+                    : td.vol_ok === false ? '<span class="bad">LOW</span>'
+                    : '<span class="dim">—</span>';
+      const pred    = td.pred_score != null
+        ? `<span style="color:${td.pred_score>40?'#1D9E75':td.pred_score>0?'#4a9eff':td.pred_score>-20?'#E9A84C':'#D85A30'};">${td.pred_score>0?'+':''}${td.pred_score}</span>`
+        : '<span class="dim">—</span>';
+
+      let statusBadges = '';
+      if (td.has_position)  statusBadges += '<span class="pos-badge">IN POSITION</span> ';
+      if (td.pending_order) statusBadges += '<span class="pend-badge">ORDER PENDING</span> ';
+      if (!statusBadges)    statusBadges  = '<span class="dim" style="font-size:10px;">watching</span>';
+
+      const passBadge = td.passes
+        ? '<span class="pass-badge pass-yes">PASSES</span>'
+        : `<span class="pass-badge pass-no">BLOCKED</span>`;
+      const blockItems = td.blocks.map(b => `<span class="block-item">• ${b}</span>`).join('');
+      const depth = td.price_depth || 0;
+      const depthColor = depth < 5 ? '#D85A30' : depth < 20 ? '#E9A84C' : '#555';
+
+      return `<tr>
+        <td style="font-weight:600;">${t}<br><span style="font-size:10px;color:#555;">depth: <span style="color:${depthColor};">${depth}</span></span></td>
+        <td>${price}</td>
+        <td>${rvol}</td>
+        <td>${volOk}</td>
+        <td>${pred}</td>
+        <td>${statusBadges}</td>
+        <td>${passBadge}${blockItems}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // ── Data quality ─────────────────────────────────────────────
+  const rvolPct = d.rvol_zero_pct || 0;
+  const rvolEl  = document.getElementById('dqRvol');
+  rvolEl.textContent = rvolPct + '% zero';
+  rvolEl.className   = 'val ' + (rvolPct > 50 ? 'warn' : rvolPct > 25 ? 'blue' : 'ok');
+
+  document.getElementById('dqScan').textContent   = d.last_scan || 'Not yet run';
+  document.getElementById('dqScan').className     = 'val ' + (d.last_scan ? 'dim' : 'warn');
+
+  const regimeColors = { trending_up: 'ok', trending_down: 'bad', ranging: 'warn', unknown: 'dim' };
+  const regimeEl = document.getElementById('dqRegime');
+  regimeEl.textContent = (d.market_regime || 'unknown').replace('_', ' ');
+  regimeEl.className   = 'val ' + (regimeColors[d.market_regime] || 'dim');
+
+  const blackoutEl = document.getElementById('dqBlackout');
+  blackoutEl.textContent = d.blackout ? (d.blackout_event || 'Active') : 'None';
+  blackoutEl.className   = 'val ' + (d.blackout ? 'bad' : 'ok');
+
+  // ── Signal weights ────────────────────────────────────────────
+  const weights = d.signal_weights || {};
+  const swNames = { 'MA Crossover': 'MA', 'RSI': 'RSI', 'Bollinger': 'BB', 'VWAP': 'VWAP', 'MACD': 'MACD', 'Mean Reversion': 'MR' };
+  document.getElementById('swRow').innerHTML = Object.entries(weights).map(([k, w]) => {
+    const name = swNames[k] || k;
+    const color = w >= 1.3 ? '#1D9E75' : w >= 1.0 ? '#4a9eff' : '#888';
+    return `<div class="sw-chip">
+      <div class="name">${name}</div>
+      <div class="wt" style="color:${color};">${w.toFixed(1)}</div>
+    </div>`;
+  }).join('');
+
+  // ── Footer ────────────────────────────────────────────────────
+  document.getElementById('lastRefresh').textContent = 'Refreshed ' + new Date().toLocaleTimeString();
+  resetCountdown();
+}
+
+function resetCountdown() {
+  clearInterval(countdownTimer);
+  countdown = 15;
+  countdownTimer = setInterval(() => {
+    countdown--;
+    document.getElementById('countdown').textContent = 'next in ' + countdown + 's';
+    if (countdown <= 0) { load(); }
+  }, 1000);
+}
+
+load();
+</script>
+</body>
+</html>

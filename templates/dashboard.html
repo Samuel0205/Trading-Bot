@@ -118,6 +118,7 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
     <a href="/scanner" style="font-size:12px;color:#4a9eff;text-decoration:none;background:#4a9eff11;padding:5px 10px;border-radius:8px;">Scanner</a>
     <a href="/predictions" style="font-size:12px;color:#E9A84C;text-decoration:none;background:#E9A84C11;padding:5px 10px;border-radius:8px;">Predictions</a>
     <a href="/backtest" style="font-size:12px;color:#1D9E75;text-decoration:none;background:#1D9E7511;padding:5px 10px;border-radius:8px;">Backtest</a>
+    <a href="/health" style="font-size:12px;color:#C45C8A;text-decoration:none;background:#C45C8A11;padding:5px 10px;border-radius:8px;">Health</a>
     <div style="display:flex;align-items:center;gap:6px;">
       <div class="dot" id="dot"></div>
       <span id="statusTxt" style="font-size:12px;color:#555;">Connecting...</span>
@@ -141,8 +142,9 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
 <!-- PDT counter + next macro event + time gate -->
 <div class="info-row">
   <div class="info-pill">
-    <div class="lbl">Day trades (PDT)</div>
+    <div class="lbl">Day trades (5-day)</div>
     <div class="val" id="pdtCount">—/3</div>
+    <div id="pdtReset" style="font-size:9px;color:#555;margin-top:2px;"></div>
   </div>
   <div class="info-pill">
     <div class="lbl">Next event</div>
@@ -432,9 +434,16 @@ function renderAccount(acct) {
   if (!window._lastStatsFetch || now - window._lastStatsFetch > 300000) {
     window._lastStatsFetch = now;
     fetch('/stats').then(r=>r.json()).then(s => {
-      const pdt = s.pdt_trades_this_week ?? s.daily_trade_count ?? 0;
+      const pdt = s.pdt_rolling_count ?? s.pdt_trades_this_week ?? s.daily_trade_count ?? 0;
       document.getElementById('pdtCount').textContent = `${pdt}/3`;
       document.getElementById('pdtCount').style.color = pdt>=3?'#D85A30':pdt>=2?'#E9A84C':'#1D9E75';
+      const resetEl = document.getElementById('pdtReset');
+      if (s.pdt_reset_date) {
+        resetEl.textContent = `resets ${s.pdt_reset_date}`;
+        resetEl.style.color = pdt>=2 ? '#E9A84C' : '#555';
+      } else {
+        resetEl.textContent = 'rolling 5-day window';
+      }
       if (s.unusual_volume && s.unusual_volume.length) renderUnusualVolume(s.unusual_volume);
 
       // Time gate status
