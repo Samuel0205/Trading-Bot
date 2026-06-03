@@ -93,7 +93,7 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
   <div class="pill"><div class="lbl">Mode</div><div class="val dim" id="ovMode">—</div></div>
   <div class="pill"><div class="lbl">Alpaca API</div><div class="val dim" id="ovApi">—</div><div class="sub" id="ovApiSub"></div></div>
   <div class="pill"><div class="lbl">Market</div><div class="val dim" id="ovMarket">—</div></div>
-  <div class="pill"><div class="lbl">Daily Trades</div><div class="val dim" id="ovTrades">—</div></div>
+  <div class="pill"><div class="lbl">Day Trades (5-day)</div><div class="val dim" id="ovTrades">—</div><div class="sub" id="ovTradesSub"></div></div>
   <div class="pill"><div class="lbl">Positions / Pending</div><div class="val dim" id="ovPos">—</div></div>
 </div>
 
@@ -232,9 +232,15 @@ function render(d) {
   setPill('ovMarket', marketLabel, marketOk ? 'ok' : 'dim');
   setPillParent('ovMarket', marketOk ? 'pill-ok' : '');
 
-  const tradeColor = d.daily_trades >= d.max_daily_trades ? 'bad' : d.daily_trades >= d.max_daily_trades - 1 ? 'warn' : 'ok';
-  setPill('ovTrades', `${d.daily_trades} / ${d.max_daily_trades}`, tradeColor);
+  const pdtCount = d.pdt_rolling_count ?? d.daily_trades ?? 0;
+  const tradeColor = pdtCount >= d.max_daily_trades ? 'bad' : pdtCount >= d.max_daily_trades - 1 ? 'warn' : 'ok';
+  setPill('ovTrades', `${pdtCount} / ${d.max_daily_trades}`, tradeColor);
   setPillParent('ovTrades', 'pill-' + tradeColor);
+  const subEl = document.getElementById('ovTradesSub');
+  if (subEl) {
+    subEl.textContent = d.pdt_reset_date ? `resets ${d.pdt_reset_date}` : 'rolling 5-day window';
+    subEl.style.color = pdtCount >= 2 ? '#E9A84C' : '#555';
+  }
 
   const posLabel = d.open_positions + ' open' + (d.pending_orders ? ', ' + d.pending_orders + ' pending' : '');
   setPill('ovPos', posLabel, d.open_positions > 0 ? 'blue' : 'dim');
