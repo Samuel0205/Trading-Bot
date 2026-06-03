@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trade Review — Trading Bot</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', sans-serif;
+         font-size: 13px; }
+
+  /* ── Nav ── */
+  .nav { display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+         background: #161b22; border-bottom: 1px solid #30363d; flex-wrap: wrap; }
+  .nav .brand { font-weight: 700; font-size: 14px; color: #e6edf3; }
+  .nav a { color: #8b949e; text-decoration: none; font-size: 12px; padding: 4px 8px;
+            border-radius: 4px; transition: background .15s; }
+  .nav a:hover { background: #21262d; color: #e6edf3; }
+  .nav a.active { background: #21262d; color: #58a6ff; }
+  .nav .spacer { flex: 1; }
+  .nav .updated { font-size: 11px; color: #484f58; }
+
+  /* ── Layout ── */
+  .page { max-width: 1000px; margin: 0 auto; padding: 16px; }
+
+  /* ── Section headers ── */
+  h2 { font-size: 13px; font-weight: 600; color: #8b949e; text-transform: uppercase;
+       letter-spacing: .08em; margin-bottom: 10px; margin-top: 20px; }
+  h2:first-child { margin-top: 0; }
+
+  /* ── Summary pills ── */
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .pill { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+          padding: 8px 14px; min-width: 110px; }
+  .pill .label { font-size: 10px; color: #8b949e; text-transform: uppercase;
+                 letter-spacing: .06em; margin-bottom: 3px; }
+  .pill .value { font-size: 18px; font-weight: 700; }
+  .pill .value.pos { color: #3fb950; }
+  .pill .value.neg { color: #f85149; }
+  .pill .value.neu { color: #e6edf3; }
+
+  /* ── Suggestions ── */
+  .suggestion { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+                padding: 12px 14px; margin-bottom: 8px; }
+  .suggestion .header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 10px;
+           text-transform: uppercase; }
+  .badge.HIGH   { background: #3d1a1a; color: #f85149; border: 1px solid #f85149; }
+  .badge.MEDIUM { background: #2d2a16; color: #d29922; border: 1px solid #d29922; }
+  .badge.LOW    { background: #1a2d1a; color: #3fb950; border: 1px solid #3fb950; }
+  .badge.ERROR  { background: #3d1a1a; color: #f85149; border: 1px solid #f85149; }
+  .area-label { font-weight: 600; font-size: 12px; color: #e6edf3; }
+  .finding { color: #8b949e; margin-bottom: 4px; line-height: 1.5; }
+  .action  { color: #58a6ff; line-height: 1.5; font-size: 12px; }
+  .action::before { content: "→ "; }
+
+  /* ── Tables ── */
+  .table-wrap { overflow-x: auto; margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; padding: 6px 10px; color: #8b949e; font-weight: 500;
+       border-bottom: 1px solid #21262d; font-size: 11px; }
+  td { padding: 6px 10px; border-bottom: 1px solid #21262d; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #161b22; }
+  .wr-bar { display: inline-block; height: 8px; border-radius: 4px; vertical-align: middle; margin-right: 6px; }
+  .pnl.pos { color: #3fb950; }
+  .pnl.neg { color: #f85149; }
+
+  /* ── Hour heatmap ── */
+  .hour-grid { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 16px; }
+  .hour-cell { flex: 1; min-width: 44px; background: #161b22; border: 1px solid #30363d;
+               border-radius: 4px; padding: 6px 4px; text-align: center; }
+  .hour-cell .h-label { font-size: 10px; color: #8b949e; }
+  .hour-cell .h-wr    { font-size: 13px; font-weight: 700; }
+  .hour-cell .h-trades{ font-size: 10px; color: #484f58; }
+
+  /* ── Loading ── */
+  .loading { text-align: center; padding: 40px; color: #484f58; }
+  .spinner { display: inline-block; width: 20px; height: 20px; border: 2px solid #30363d;
+             border-top-color: #58a6ff; border-radius: 50%;
+             animation: spin .8s linear infinite; margin-bottom: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Chop events ── */
+  .chop-item { background: #2d1b1b; border: 1px solid #5a2020; border-radius: 6px;
+               padding: 8px 12px; margin-bottom: 6px; font-size: 12px;
+               display: flex; align-items: center; gap: 12px; }
+  .chop-item .ticker { font-weight: 700; color: #f85149; min-width: 50px; }
+  .chop-item .date   { color: #8b949e; }
+  .chop-item .count  { color: #d29922; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <span class="brand">Trading Bot</span>
+  <a href="/">Dashboard</a>
+  <a href="/scanner">Scanner</a>
+  <a href="/predictions">Predictions</a>
+  <a href="/backtest">Backtest</a>
+  <a href="/health">Health</a>
+  <a href="/review" class="active" style="color:#58a6ff">Review</a>
+  <div class="spacer"></div>
+  <span class="updated" id="updatedAt">loading...</span>
+</div>
+
+<div class="page">
+  <div id="content">
+    <div class="loading">
+      <div class="spinner"></div><br>Analyzing trade history...
+    </div>
+  </div>
+</div>
+
+<script>
+function pnlClass(v) { return v > 0 ? 'pos' : v < 0 ? 'neg' : 'neu'; }
+function wrColor(wr) {
+  if (wr >= 55) return '#3fb950';
+  if (wr >= 40) return '#d29922';
+  return '#f85149';
+}
+
+function render(data) {
+  if (data.error) {
+    document.getElementById('content').innerHTML =
+      `<div class="suggestion"><div class="header"><span class="badge ERROR">ERROR</span></div>
+       <div class="finding">${data.error}</div></div>`;
+    return;
+  }
+
+  const s   = data.summary || {};
+  const ts  = data.ticker_stats || {};
+  const hs  = data.hour_stats || {};
+  const rs  = data.reason_stats || {};
+  const hld = data.hold_stats || {};
+
+  let html = '';
+
+  // ── Summary pills ──────────────────────────────────────────
+  html += '<h2>Summary — last 30 days</h2><div class="pills">';
+  const pills = [
+    { label:'Closed Trades', value: s.total ?? '—',   cls:'neu' },
+    { label:'Win Rate',       value: s.total ? s.win_rate+'%' : '—',
+      cls: s.win_rate >= 50 ? 'pos' : 'neg' },
+    { label:'Total P&L',      value: s.total_pnl != null ? '$'+s.total_pnl.toFixed(2) : '—',
+      cls: pnlClass(s.total_pnl) },
+    { label:'Avg Win',        value: s.avg_win  != null ? '$'+s.avg_win.toFixed(2)  : '—', cls:'pos' },
+    { label:'Avg Loss',       value: s.avg_loss != null ? '$'+s.avg_loss.toFixed(2) : '—', cls:'neg' },
+    { label:'R:R Ratio',      value: s.rr_ratio != null ? s.rr_ratio.toFixed(2) : '—',
+      cls: s.rr_ratio >= 1 ? 'pos' : 'neg' },
+    { label:'Avg Win Hold',   value: s.avg_hold_win_h  != null ? s.avg_hold_win_h+'h'  : '—', cls:'neu' },
+    { label:'Avg Loss Hold',  value: s.avg_hold_loss_h != null ? s.avg_hold_loss_h+'h' : '—', cls:'neu' },
+  ];
+  pills.forEach(p => {
+    html += `<div class="pill"><div class="label">${p.label}</div>
+             <div class="value ${p.cls}">${p.value}</div></div>`;
+  });
+  html += '</div>';
+
+  // ── Suggestions ────────────────────────────────────────────
+  const suggs = data.suggestions || [];
+  if (suggs.length) {
+    html += '<h2>Improvement Suggestions</h2>';
+    suggs.forEach(sg => {
+      const pri = typeof sg === 'string' ? 'LOW' : sg.priority;
+      const area = typeof sg === 'string' ? 'Note' : sg.area;
+      const finding = typeof sg === 'string' ? sg : sg.finding;
+      const action  = typeof sg === 'string' ? '' : sg.action;
+      html += `<div class="suggestion">
+        <div class="header">
+          <span class="badge ${pri}">${pri}</span>
+          <span class="area-label">${area}</span>
+        </div>
+        <div class="finding">${finding}</div>
+        ${action ? `<div class="action">${action}</div>` : ''}
+      </div>`;
+    });
+  }
+
+  // ── Chop events ────────────────────────────────────────────
+  const chops = data.chop_events || [];
+  if (chops.length) {
+    html += '<h2>Whipsaw Events (3+ entries same ticker same day)</h2>';
+    chops.forEach(c => {
+      html += `<div class="chop-item">
+        <span class="ticker">${c.ticker}</span>
+        <span class="date">${c.date}</span>
+        <span class="count">${c.entries} entries</span>
+      </div>`;
+    });
+  }
+
+  // ── Per-ticker breakdown ───────────────────────────────────
+  const tickers = Object.entries(ts).sort((a,b) => b[1].total_pnl - a[1].total_pnl);
+  if (tickers.length) {
+    html += '<h2>Per-Ticker Performance</h2><div class="table-wrap"><table>';
+    html += '<tr><th>Ticker</th><th>Trades</th><th>Win Rate</th><th>Wins</th><th>Losses</th><th>Total P&L</th><th>Avg P&L</th></tr>';
+    tickers.forEach(([sym, d]) => {
+      const wr = d.win_rate;
+      html += `<tr>
+        <td><strong>${sym}</strong></td>
+        <td>${d.trades}</td>
+        <td>
+          <span class="wr-bar" style="width:${wr}px;background:${wrColor(wr)}"></span>
+          <span style="color:${wrColor(wr)}">${wr}%</span>
+        </td>
+        <td style="color:#3fb950">${d.wins}</td>
+        <td style="color:#f85149">${d.losses}</td>
+        <td class="pnl ${pnlClass(d.total_pnl)}">$${d.total_pnl.toFixed(2)}</td>
+        <td class="pnl ${pnlClass(d.avg_pnl)}">$${d.avg_pnl.toFixed(2)}</td>
+      </tr>`;
+    });
+    html += '</table></div>';
+  }
+
+  // ── Hour of day heatmap ────────────────────────────────────
+  const hours = Object.entries(hs).sort((a,b) => +a[0] - +b[0]);
+  if (hours.length) {
+    html += '<h2>Win Rate by Hour (ET)</h2><div class="hour-grid">';
+    hours.forEach(([h, d]) => {
+      html += `<div class="hour-cell">
+        <div class="h-label">${d.label}</div>
+        <div class="h-wr" style="color:${wrColor(d.win_rate)}">${d.win_rate}%</div>
+        <div class="h-trades">${d.trades} trades</div>
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  // ── Exit reason breakdown ──────────────────────────────────
+  const reasons = Object.entries(rs).sort((a,b) => b[1].count - a[1].count);
+  if (reasons.length) {
+    html += '<h2>Exit Reason Breakdown</h2><div class="table-wrap"><table>';
+    html += '<tr><th>Reason</th><th>Count</th><th>Win Rate</th><th>Total P&L</th><th>Avg P&L</th></tr>';
+    reasons.forEach(([r, d]) => {
+      html += `<tr>
+        <td>${r}</td>
+        <td>${d.count}</td>
+        <td style="color:${wrColor(d.win_rate)}">${d.win_rate}%</td>
+        <td class="pnl ${pnlClass(d.total_pnl)}">$${d.total_pnl.toFixed(2)}</td>
+        <td class="pnl ${pnlClass(d.avg_pnl)}">$${d.avg_pnl.toFixed(2)}</td>
+      </tr>`;
+    });
+    html += '</table></div>';
+  }
+
+  document.getElementById('content').innerHTML = html;
+  document.getElementById('updatedAt').textContent = 'Analyzed: ' + (data.analyzed_at || '—');
+}
+
+function load() {
+  fetch('/review/data')
+    .then(r => r.json())
+    .then(render)
+    .catch(e => {
+      document.getElementById('content').innerHTML =
+        `<div class="loading" style="color:#f85149">Failed to load: ${e.message}</div>`;
+    });
+}
+
+load();
+setInterval(load, 120_000);  // auto-refresh every 2 minutes
+</script>
+</body>
+</html>

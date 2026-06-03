@@ -43,6 +43,14 @@ def get_backtester():
         print(f"Backtester import error: {e}")
         return None
 
+def get_catalyst_tracker():
+    try:
+        from catalyst_tracker import get_catalyst_score, get_catalyst_tickers, get_edgar_scores
+        return get_catalyst_score, get_catalyst_tickers, get_edgar_scores
+    except Exception as e:
+        print(f"Catalyst tracker import error: {e}")
+        return None, None, None
+
 # ── API ───────────────────────────────────────────────────────
 API_KEY    = os.environ.get("APCA_API_KEY_ID")
 SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
@@ -82,8 +90,14 @@ MIN_PROFIT_PCT       = 0.04
 MAX_DAILY_TRADES     = 3
 GAP_MIN_PCT          = 2.0
 GAP_MAX_PCT          = 15.0
-GAP_MIN_RVOL         = 1.5
-RVOL_THRESHOLD       = 1.2
+GAP_MIN_RVOL          = 1.5
+GAP_GO_MIN_PCT        = 5.0    # min gap% to trigger gap-and-go entry
+GAP_ENTRY_WINDOW_MINS = 90     # don't enter gap plays after 90 min post-open
+TRAILING_STOP_GAP_PCT = 0.03   # trail stop 3% below highest price for gap plays
+BREAKEVEN_TRIGGER_PCT = 0.08   # move stop to breakeven when up 8%
+TRAILING_TRIGGER_PCT  = 0.15   # activate 3% trail once up 15%
+RVOL_THRESHOLD        = 1.2
+CHOP_BLOCK_THRESHOLD  = 2      # stop a ticker for rest of day after this many stop losses
 RVOL_PROMOTE_MIN     = 2.5   # NEW: promote ticker to active list if rvol exceeds this
 BASE_BUY_THRESHOLD   = 2.0
 BASE_SELL_THRESHOLD  = 2.0
@@ -124,7 +138,9 @@ market_regime     = "ranging"
 cooldowns         = {}
 ticker_grades     = {}
 gap_candidates    = {}
+catalyst_cache    = {}
 rvol_cache        = {}
+_daily_stop_counts = {}   # ticker → {date_str: count}  (anti-chop gate)
 unusual_volume    = []
 daily_trade_count = 0
 daily_trade_date  = None
@@ -655,6 +671,11 @@ def passes_filters(ticker, price, account_size=None):
     if rvol is not None and rvol > 0.10 and rvol < RVOL_THRESHOLD:
         print(f"  {ticker} rvol {rvol:.2f}x low"); return False
 
+    # Gap plays with strong intraday RVOL bypass the historical daily volume check
+    if (gap_candidates.get(ticker, {}).get("direction") == "up" and
+            (rvol_cache.get(ticker) or 0) >= 2.0):
+        return True
+
     # Volume check — cached per day to avoid hitting Alpaca on every 30s tick
     today_str = now_et().strftime("%Y-%m-%d")
     cached_vol = _vol_check_cache.get(ticker)
@@ -684,16 +705,19 @@ def passes_filters(ticker, price, account_size=None):
 
 # ── Position sizing ───────────────────────────────────────────
 
-def position_size(price, account_size=None, pred_score=0, rvol=1.0):
+def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=False):
     try:
         if account_size is None: account_size = get_account_size()
         usable = get_available_cash()
         if usable <= 0: return 0
-        if   pred_score >= PRED_STRONG_BUY: pct = 0.60
+        if is_gap_play:
+            pct = 0.65   # larger allocation for catalyst-driven gap plays
+        elif pred_score >= PRED_STRONG_BUY: pct = 0.60
         elif pred_score >= 0:               pct = MAX_TRADE_PCT
         else:                               pct = 0.30
-        if   rvol >= 3.0: pct = min(pct*1.15, 0.65)
-        elif rvol >= 2.0: pct = min(pct*1.05, 0.55)
+        if not is_gap_play:
+            if   rvol >= 3.0: pct = min(pct*1.15, 0.65)
+            elif rvol >= 2.0: pct = min(pct*1.05, 0.55)
         if   price < 1.00: pct *= 0.80
         elif price < 2.00: pct *= 0.90
         max_spend = usable * pct
@@ -712,7 +736,11 @@ def check_stops(ticker, price):
     entry         = pos["entry"]
     gain_pct      = (price - entry) / entry
 
-    # NEW: partial exit — sell half at PARTIAL_EXIT_PCT gain, let rest run
+    # Track highest price for gap play trailing stops
+    if pos.get("is_gap_play") and price > pos.get("highest_price", entry):
+        open_positions[ticker]["highest_price"] = price
+
+    # partial exit — sell half at PARTIAL_EXIT_PCT gain, let rest run
     if not pos.get("partial_done") and gain_pct >= PARTIAL_EXIT_PCT:
         half_qty = max(1, pos["qty"] // 2)
         try:
@@ -742,12 +770,25 @@ def check_stops(ticker, price):
             print(f"  Partial exit error {ticker}: {e}")
         return
 
-    # Trailing stop: once up 5%, move stop to entry+1%
-    if gain_pct > 0.05:
-        new_stop = max(pos["stop"], round(entry * 1.01, 3))
-        if new_stop > pos["stop"]:
-            open_positions[ticker]["stop"] = new_stop
-            print(f"  Trail stop {ticker} → ${new_stop:.3f}")
+    if pos.get("is_gap_play"):
+        highest = pos.get("highest_price", price)
+        if gain_pct >= TRAILING_TRIGGER_PCT:
+            trail_stop = round(highest * (1 - TRAILING_STOP_GAP_PCT), 3)
+            if trail_stop > pos["stop"]:
+                open_positions[ticker]["stop"] = trail_stop
+                print(f"  GAP trail {ticker} → ${trail_stop:.3f} (high=${highest:.2f})")
+        elif gain_pct >= BREAKEVEN_TRIGGER_PCT:
+            be_stop = round(entry * 1.005, 3)
+            if be_stop > pos["stop"]:
+                open_positions[ticker]["stop"] = be_stop
+                print(f"  GAP breakeven {ticker} → ${be_stop:.3f}")
+    else:
+        # Standard trailing stop: once up 5%, move stop to entry+1%
+        if gain_pct > 0.05:
+            new_stop = max(pos["stop"], round(entry * 1.01, 3))
+            if new_stop > pos["stop"]:
+                open_positions[ticker]["stop"] = new_stop
+                print(f"  Trail stop {ticker} → ${new_stop:.3f}")
 
     if   price <= pos["stop"]:   force_sell(ticker, price, reason="stop_loss")
     elif price >= pos["target"]: force_sell(ticker, price, reason="take_profit")
@@ -793,6 +834,18 @@ def force_sell(ticker, price, reason="stop_loss"):
         with _positions_lock:
             open_positions.pop(ticker, None)
         set_cooldown(ticker, reason)
+
+        # Anti-chop gate: count stop losses per ticker per day
+        if reason == "stop_loss":
+            today_str = now_et().strftime("%Y-%m-%d")
+            _daily_stop_counts.setdefault(ticker, {})
+            _daily_stop_counts[ticker][today_str] = (
+                _daily_stop_counts[ticker].get(today_str, 0) + 1
+            )
+            stops_today = _daily_stop_counts[ticker][today_str]
+            if stops_today >= CHOP_BLOCK_THRESHOLD:
+                print(f"  CHOP BLOCK: {ticker} stopped out {stops_today}x today — "
+                      f"blocked for the rest of the day")
 
         wr   = get_trade_stats_from_db().get("win_rate", 0)
         mode = "🔴 LIVE" if LIVE_MODE else "PAPER"
@@ -842,8 +895,21 @@ def make_decision(ticker, signals, price):
     bt *= conf_mult
     st *= conf_mult
 
-    if is_gap and gap_candidates.get(ticker, {}).get("direction") == "up":
-        bt = max(1.0, bt-0.3)
+    gap_data = gap_candidates.get(ticker, {})
+    if is_gap and gap_data.get("direction") == "up":
+        gap_pct_val = abs(gap_data.get("gap_pct", 0))
+        if (gap_pct_val >= GAP_GO_MIN_PCT and
+                mins_since_open() <= GAP_ENTRY_WINDOW_MINS):
+            cat     = catalyst_cache.get(ticker, {})
+            vwap_ok = any(s["name"] == "VWAP" and s["action"] == "buy" for s in signals)
+            if cat.get("score", 0) >= 5 and vwap_ok:
+                bt = max(1.2, bt - 0.8)
+                print(f"  GAP-AND-GO {ticker}: gap={gap_pct_val:.1f}% "
+                      f"cat={cat.get('score',0)} vwap_ok")
+            else:
+                bt = max(1.0, bt - 0.3)
+        else:
+            bt = max(1.0, bt - 0.3)
     if rvol >= 2.0:
         bt = max(1.0, bt-0.2); st = max(1.0, st-0.2)
     if tf_bias == -1:
@@ -890,6 +956,7 @@ def _register_filled_order(order_id, fill_price):
     active_sigs = pdata["active_signals"]
     pred_score  = pdata["pred_score"]
     rvol        = pdata["rvol"]
+    is_gap_play = pdata.get("is_gap_play", False)
     ts          = int(time.time() * 1000)
 
     with _positions_lock:
@@ -898,7 +965,8 @@ def _register_filled_order(order_id, fill_price):
         open_positions[ticker] = {
             "entry": fill_price, "stop": stop, "target": target,
             "qty": qty, "atr": atr, "active_signals": active_sigs,
-            "partial_done": False,
+            "partial_done": False, "is_gap_play": is_gap_play,
+            "highest_price": fill_price,
         }
 
     try:
@@ -973,6 +1041,12 @@ def execute(ticker, action, price, signals, reason="signal"):
             if is_on_cooldown(ticker):
                 print(f"  {ticker} cooldown {cooldown_remaining(ticker)}s"); return
 
+            # Anti-chop gate: block re-entry if stopped out CHOP_BLOCK_THRESHOLD times today
+            today_str = now_et().strftime("%Y-%m-%d")
+            stops_today = _daily_stop_counts.get(ticker, {}).get(today_str, 0)
+            if stops_today >= CHOP_BLOCK_THRESHOLD:
+                print(f"  CHOP BLOCK: {ticker} stopped out {stops_today}x today"); return
+
             blackout, event_name = cached_blackout_today()
             if blackout:
                 print(f"  MACRO BLACKOUT: {event_name} — no trades today"); return
@@ -1004,9 +1078,12 @@ def execute(ticker, action, price, signals, reason="signal"):
             if not passes_filters(ticker, price, acct_size):
                 return
 
-            pred_score = prediction_cache.get(ticker, {}).get("score", 0)
-            rvol       = rvol_cache.get(ticker, 1.0)
-            qty        = position_size(price, acct_size, pred_score, rvol)
+            pred_score  = prediction_cache.get(ticker, {}).get("score", 0)
+            rvol        = rvol_cache.get(ticker, 1.0)
+            is_gap_play = (ticker in gap_candidates and
+                           gap_candidates.get(ticker, {}).get("direction") == "up" and
+                           abs(gap_candidates.get(ticker, {}).get("gap_pct", 0)) >= GAP_GO_MIN_PCT)
+            qty         = position_size(price, acct_size, pred_score, rvol, is_gap_play)
             if qty == 0:
                 print(f"  {ticker} qty 0"); return
 
@@ -1020,6 +1097,8 @@ def execute(ticker, action, price, signals, reason="signal"):
                                                         STOP_LOSS_PCT, TAKE_PROFIT_PCT)
             except: pass
 
+            if is_gap_play:
+                target = round(price * 2.0, 3)   # gap-and-go: target 100% gain (let momentum run)
             if (target-price)/price < MIN_PROFIT_PCT:
                 print(f"  {ticker} profit too low"); return
 
@@ -1069,6 +1148,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                     "price":         price,
                     "pred_score":    pred_score,
                     "rvol":          rvol,
+                    "is_gap_play":   is_gap_play,
                     "submitted_at":  time.time(),
                     "ts":            int(time.time() * 1000),
                 }
@@ -1239,9 +1319,29 @@ def run_gap_scan():
                 print(f"  GAP {ticker} {gap_pct:+.1f}% rvol={rvol:.1f}x")
             time.sleep(0.2)
         except: continue
+    # Score each candidate with catalyst tracker (EDGAR batch-cached, very fast)
+    _get_cat, _, _ = get_catalyst_tracker()
+    if _get_cat:
+        for t, c in candidates.items():
+            try:
+                cat = _get_cat(t)
+                c["catalyst_score"]    = cat.get("score", 0)
+                c["catalyst_headline"] = cat.get("headline", "")
+                c["catalyst_kw"]       = cat.get("kw", "")
+                catalyst_cache[t]      = cat
+            except Exception as e:
+                c["catalyst_score"] = 0
+                print(f"  Catalyst error {t}: {e}")
+
     gap_candidates = candidates
     if candidates:
-        gap_tickers = [t for t in candidates if candidates[t]["direction"]=="up"][:3]
+        up_tickers = [t for t in candidates if candidates[t]["direction"]=="up"]
+        # Prioritize: catalyst quality first, then RVOL
+        up_tickers.sort(
+            key=lambda t: (candidates[t].get("catalyst_score", 0), candidates[t]["rvol"]),
+            reverse=True,
+        )
+        gap_tickers = up_tickers[:3]
         current     = [t for t in active_tickers if t not in gap_tickers]
         active_tickers = (gap_tickers + current)[:5]
         for t in gap_tickers:
@@ -1553,24 +1653,28 @@ def bot_loop():
                     n_b  = sum(1 for s in sigs if s["action"]=="buy")
                     n_s  = sum(1 for s in sigs if s["action"]=="sell")
                     n_v  = sum(1 for s in sigs if s.get("veto"))
+                    cat = catalyst_cache.get(ticker, {})
                     state["tickers"][ticker] = {
-                        "price":       round(price, 2),
-                        "signals":     sigs,
-                        "action":      action,
-                        "buy_weight":  buy_w,
-                        "sell_weight": sell_w,
-                        "stop":        pos["stop"]    if pos else None,
-                        "target":      pos["target"]  if pos else None,
-                        "partial_done":pos.get("partial_done", False) if pos else False,
-                        "cooldown":    cd,
-                        "grade":       ticker_grades.get(ticker, "—"),
-                        "pred_score":  pred.get("score",  None),
-                        "pred_label":  pred.get("label",  "—"),
-                        "pred_conf":   pred.get("confidence","—"),
-                        "tf_bias":     pred.get("tf_bias", 0),
-                        "rvol":        rvol_cache.get(ticker, None),
-                        "is_gap":      ticker in gap_candidates,
-                        "veto_count":  n_v,
+                        "price":              round(price, 2),
+                        "signals":            sigs,
+                        "action":             action,
+                        "buy_weight":         buy_w,
+                        "sell_weight":        sell_w,
+                        "stop":               pos["stop"]    if pos else None,
+                        "target":             pos["target"]  if pos else None,
+                        "partial_done":       pos.get("partial_done", False) if pos else False,
+                        "cooldown":           cd,
+                        "grade":              ticker_grades.get(ticker, "—"),
+                        "pred_score":         pred.get("score",  None),
+                        "pred_label":         pred.get("label",  "—"),
+                        "pred_conf":          pred.get("confidence","—"),
+                        "tf_bias":            pred.get("tf_bias", 0),
+                        "rvol":               rvol_cache.get(ticker, None),
+                        "is_gap":             ticker in gap_candidates,
+                        "veto_count":         n_v,
+                        "catalyst_score":     cat.get("score"),
+                        "catalyst_headline":  cat.get("headline", ""),
+                        "is_gap_play":        pos.get("is_gap_play", False) if pos else False,
                     }
                     print(f"  {ticker}: ${price:.2f} | {action} | "
                           f"v={n_b}b/{n_s}s veto={n_v} w={buy_w:.1f}/{sell_w:.1f} | "
@@ -1633,6 +1737,7 @@ def on_connect():
                     action, reason, buy_w, sell_w = make_decision(ticker, sigs, price)
                     pos   = open_positions.get(ticker)
                     pred  = prediction_cache.get(ticker, {})
+                    cat = catalyst_cache.get(ticker, {})
                     state["tickers"][ticker] = {
                         "price":round(price,2),"signals":sigs,
                         "action":action,"buy_weight":buy_w,"sell_weight":sell_w,
@@ -1648,6 +1753,9 @@ def on_connect():
                         "rvol":rvol_cache.get(ticker,None),
                         "is_gap":ticker in gap_candidates,
                         "veto_count":sum(1 for s in sigs if s.get("veto")),
+                        "catalyst_score":    cat.get("score"),
+                        "catalyst_headline": cat.get("headline", ""),
+                        "is_gap_play":       pos.get("is_gap_play", False) if pos else False,
                     }
                 except Exception as e:
                     print(f"on_connect {ticker}: {e}")
@@ -1811,6 +1919,20 @@ def backtest_run():
             socketio.emit("backtest_status", {"status":"error","message":str(e)})
     threading.Thread(target=run, daemon=True).start()
     return jsonify({"status":"started"}), 202
+
+@app.route("/review")
+def review_page():
+    return render_template("review.html")
+
+@app.route("/review/data")
+def review_data():
+    try:
+        from trade_reviewer import get_trade_review
+        trades = get_recent_trades(days=30)
+        return jsonify(get_trade_review(trades))
+    except Exception as e:
+        return jsonify({"error": str(e), "suggestions": [{"priority":"ERROR","area":"System",
+                        "finding": str(e), "action":"Check server logs"}]})
 
 @app.route("/ping")
 def ping(): return "pong", 200
