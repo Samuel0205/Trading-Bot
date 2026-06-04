@@ -84,7 +84,8 @@ TRADING_END_M        = 30
 NO_NEW_ENTRY_MINS    = 20    # NEW: no new buys in first 20 min (9:35–9:55)
 EOD_TIGHTEN_MINS     = 30   # NEW: tighter thresholds last 30 min (3:00–3:30)
 SCAN_HOURS           = [10, 12]
-PRED_HOURS           = [9, 11]
+PRED_HOURS           = [9, 10, 11, 12, 13, 14]   # refresh every hour during trading day
+PRED_MAX_AGE_SECS    = 5400                        # 90 min — treat stale prediction as neutral
 MACRO_REFRESH_HOURS  = [8, 12]
 MIN_PROFIT_PCT       = 0.04
 MAX_DAILY_TRADES     = 3
@@ -877,6 +878,13 @@ def make_decision(ticker, signals, price):
     rvol    = rvol_cache.get(ticker, 1.0)
     is_gap  = ticker in gap_candidates
 
+    # Staleness gate: if prediction is >90 min old, treat as neutral before allowing buys.
+    # This prevents buying against an hours-old bullish score when price has reversed.
+    pred_age = time.time() - pred.get("fetched_at", 0)
+    if pred_age > PRED_MAX_AGE_SECS and pscore > 0:
+        print(f"  {ticker}: prediction stale ({pred_age/60:.0f}min old) — capping score to 0")
+        pscore = 0
+
     if pscore <= PRED_SKIP:
         return "hold", f"pred_skip({pscore})", buy_w, sell_w
 
@@ -1077,6 +1085,18 @@ def execute(ticker, action, price, signals, reason="signal"):
             acct_size = get_account_size()
             if not passes_filters(ticker, price, acct_size):
                 return
+
+            # Real-time trend check: if price is below the 20-bar MA and prediction
+            # isn't strongly bullish, skip the buy. Catches downtrends early without
+            # waiting for the next prediction cycle.
+            ph = price_history.get(ticker, [])
+            if len(ph) >= 10:
+                ma20 = sum(ph[-20:]) / min(len(ph), 20)
+                pred_score_rt = prediction_cache.get(ticker, {}).get("score", 0)
+                if price < ma20 * 0.995 and pred_score_rt < PRED_STRONG_BUY:
+                    print(f"  {ticker} below MA20 (${ma20:.2f}) + pred not strong "
+                          f"({pred_score_rt:+.0f}) — skipping buy")
+                    return
 
             pred_score  = prediction_cache.get(ticker, {}).get("score", 0)
             rvol        = rvol_cache.get(ticker, 1.0)

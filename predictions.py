@@ -381,6 +381,7 @@ def predict_ticker(api, ticker, regime="ranging"):
         "signals":    [],
         "tf_bias":    0,
         "tf_detail":  "",
+        "fetched_at": time.time(),
         "timestamp":  datetime.now(NY).strftime("%I:%M %p ET"),
     }
     try:
@@ -483,6 +484,7 @@ def predict_ticker(api, ticker, regime="ranging"):
             "confidence": confidence,
             "tf_bias":    tf_bias,
             "tf_detail":  tf_detail,
+            "fetched_at": time.time(),
             "components": {
                 "sentiment_trend":    {"score": sent_score,         "direction": sent_dir, "daily": sent_daily},
                 "price_direction":    {"score": dir_score,          "confidence": dir_conf, "signals": dir_sigs},
