@@ -334,13 +334,14 @@ def get_account_state():
 
 def get_price_ceiling(account_size=None):
     if account_size is None: account_size = get_account_size()
+    if account_size > 50_000: return min(account_size * 0.45, 50.00)
+    if account_size > 10_000: return min(account_size * 0.45, 25.00)
     return max(min(account_size * 0.45, 10.00), 0.60)
 
 def get_price_floor(account_size=None):
     if account_size is None: account_size = get_account_size()
-    if account_size > 2000: return 5.00
-    if account_size > 500:  return 2.00
-    if account_size > 100:  return 1.00
+    if account_size > 100: return 2.00
+    if account_size > 20:  return 1.00
     return 0.50
 
 def get_min_volume(account_size=None):
@@ -397,7 +398,8 @@ def count_rolling_day_trades():
         buys  = set()
         sells = set()
         for o in orders:
-            d = o.filled_at[:10] if o.filled_at else ""
+            fa = o.filled_at
+            d  = fa.strftime("%Y-%m-%d") if hasattr(fa, "strftime") else (fa[:10] if fa else "")
             k = (o.symbol, d)
             if o.side == "buy":  buys.add(k)
             if o.side == "sell": sells.add(k)
