@@ -721,6 +721,16 @@ def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=
             elif rvol >= 2.0: pct = min(pct*1.05, 0.55)
         if   price < 1.00: pct *= 0.80
         elif price < 2.00: pct *= 0.90
+        # Hard cap on single-position concentration as account grows.
+        # Small accounts need concentration to afford stocks; large accounts
+        # don't — a 45% position in a $100k account is $45k in one volatile stock.
+        if is_gap_play:
+            if   account_size > 10_000: pct = min(pct, 0.15)
+            elif account_size > 1_000:  pct = min(pct, 0.30)
+        else:
+            if   account_size > 10_000: pct = min(pct, 0.10)
+            elif account_size > 1_000:  pct = min(pct, 0.20)
+            elif account_size > 100:    pct = min(pct, 0.35)
         max_spend = usable * pct
         if max_spend < price:
             print(f"  Can't afford ${price:.2f} (max ${max_spend:.2f})"); return 0
@@ -861,6 +871,15 @@ def force_sell(ticker, price, reason="stop_loss"):
         print(f"Force sell error {ticker}: {e}")
 
 def close_all_positions_eod():
+    # Cancel pending limit orders first so they don't fill after close
+    try:
+        api.cancel_all_orders()
+        with _pending_lock:
+            _pending_orders.clear()
+            _pending_buy_tickers.clear()
+        print("EOD: pending orders cancelled")
+    except Exception as e:
+        print(f"EOD cancel orders error: {e}")
     try:
         for pos in api.list_positions():
             force_sell(pos.symbol, float(pos.current_price), reason="eod_close")
@@ -1995,9 +2014,10 @@ def health_data():
     rvol_vals     = list(rvol_cache.values())
     rvol_zero_pct = round(100 * sum(1 for v in rvol_vals if not v) / max(1, len(rvol_vals)), 1)
 
-    # Per-ticker diagnostics — no API calls, uses cached state only
-    floor   = get_price_floor(DEFAULT_MAX_ACCOUNT)
-    ceiling = get_price_ceiling(DEFAULT_MAX_ACCOUNT)
+    # Per-ticker diagnostics — use real account size for accurate floor/ceiling
+    _diag_acct = get_account_size()
+    floor      = get_price_floor(_diag_acct)
+    ceiling    = get_price_ceiling(_diag_acct)
     ticker_diag = {}
     for t in list(active_tickers):
         ph    = price_history.get(t, [])
@@ -2088,7 +2108,8 @@ def reconcile_open_positions():
                 open_positions[ticker] = {
                     "entry": entry, "stop": stop, "target": target,
                     "qty": qty, "atr": None, "active_signals": [],
-                    "partial_done": False,
+                    "partial_done": False, "is_gap_play": False,
+                    "highest_price": entry,
                 }
             price_history.setdefault(ticker, [])
             volume_history.setdefault(ticker, [])
@@ -2149,6 +2170,37 @@ def _start_bot():
         validate_fallback_tickers()
         reconcile_open_positions()
         restore_pdt_state()
+        # Cancel any Alpaca orders left open from before this session.
+        # On paper accounts, orphaned limit orders accumulate and can fill
+        # at stale prices after a restart.
+        try:
+            api.cancel_all_orders()
+            print("Startup: cancelled any leftover open orders from previous session")
+        except Exception as e:
+            print(f"Startup cancel orders error: {e}")
+        # Warm the anti-chop gate from today's filled orders so a mid-day restart
+        # doesn't wipe the stop-loss counter and re-open blocked tickers.
+        try:
+            today_str   = now_et().strftime("%Y-%m-%d")
+            midnight_et = NY.localize(datetime.combine(now_et().date(), datetime.min.time()))
+            recent_orders = api.list_orders(
+                status="filled", after=midnight_et.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                limit=100, direction="asc"
+            )
+            for o in recent_orders:
+                if o.side == "sell" and getattr(o, "order_type", "") in ("market", ""):
+                    sym = o.symbol
+                    _daily_stop_counts.setdefault(sym, {})
+                    _daily_stop_counts[sym][today_str] = (
+                        _daily_stop_counts[sym].get(today_str, 0) + 1
+                    )
+            blocked = [s for s, d in _daily_stop_counts.items()
+                       if d.get(today_str, 0) >= CHOP_BLOCK_THRESHOLD]
+            if blocked:
+                print(f"Startup anti-chop: restored stop counts, "
+                      f"blocking {blocked} for today")
+        except Exception as e:
+            print(f"Startup anti-chop restore error: {e}")
         try:
             status = get_macro_status(api)
             status["hot_sectors"] = get_hot_sectors(api)
