@@ -84,7 +84,8 @@ TRADING_END_M        = 30
 NO_NEW_ENTRY_MINS    = 20    # NEW: no new buys in first 20 min (9:35–9:55)
 EOD_TIGHTEN_MINS     = 30   # NEW: tighter thresholds last 30 min (3:00–3:30)
 SCAN_HOURS           = [10, 12]
-PRED_HOURS           = [9, 11]
+PRED_HOURS           = [9, 10, 11, 12, 13, 14]   # refresh every hour during trading day
+PRED_MAX_AGE_SECS    = 5400                        # 90 min — treat stale prediction as neutral
 MACRO_REFRESH_HOURS  = [8, 12]
 MIN_PROFIT_PCT       = 0.04
 MAX_DAILY_TRADES     = 3
@@ -333,13 +334,14 @@ def get_account_state():
 
 def get_price_ceiling(account_size=None):
     if account_size is None: account_size = get_account_size()
+    if account_size > 50_000: return min(account_size * 0.45, 50.00)
+    if account_size > 10_000: return min(account_size * 0.45, 25.00)
     return max(min(account_size * 0.45, 10.00), 0.60)
 
 def get_price_floor(account_size=None):
     if account_size is None: account_size = get_account_size()
-    if account_size > 2000: return 5.00
-    if account_size > 500:  return 2.00
-    if account_size > 100:  return 1.00
+    if account_size > 100: return 2.00
+    if account_size > 20:  return 1.00
     return 0.50
 
 def get_min_volume(account_size=None):
@@ -396,7 +398,8 @@ def count_rolling_day_trades():
         buys  = set()
         sells = set()
         for o in orders:
-            d = o.filled_at[:10] if o.filled_at else ""
+            fa = o.filled_at
+            d  = fa.strftime("%Y-%m-%d") if hasattr(fa, "strftime") else (fa[:10] if fa else "")
             k = (o.symbol, d)
             if o.side == "buy":  buys.add(k)
             if o.side == "sell": sells.add(k)
@@ -720,6 +723,16 @@ def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=
             elif rvol >= 2.0: pct = min(pct*1.05, 0.55)
         if   price < 1.00: pct *= 0.80
         elif price < 2.00: pct *= 0.90
+        # Hard cap on single-position concentration as account grows.
+        # Small accounts need concentration to afford stocks; large accounts
+        # don't — a 45% position in a $100k account is $45k in one volatile stock.
+        if is_gap_play:
+            if   account_size > 10_000: pct = min(pct, 0.15)
+            elif account_size > 1_000:  pct = min(pct, 0.30)
+        else:
+            if   account_size > 10_000: pct = min(pct, 0.10)
+            elif account_size > 1_000:  pct = min(pct, 0.20)
+            elif account_size > 100:    pct = min(pct, 0.35)
         max_spend = usable * pct
         if max_spend < price:
             print(f"  Can't afford ${price:.2f} (max ${max_spend:.2f})"); return 0
@@ -860,6 +873,15 @@ def force_sell(ticker, price, reason="stop_loss"):
         print(f"Force sell error {ticker}: {e}")
 
 def close_all_positions_eod():
+    # Cancel pending limit orders first so they don't fill after close
+    try:
+        api.cancel_all_orders()
+        with _pending_lock:
+            _pending_orders.clear()
+            _pending_buy_tickers.clear()
+        print("EOD: pending orders cancelled")
+    except Exception as e:
+        print(f"EOD cancel orders error: {e}")
     try:
         for pos in api.list_positions():
             force_sell(pos.symbol, float(pos.current_price), reason="eod_close")
@@ -876,6 +898,13 @@ def make_decision(ticker, signals, price):
     tf_bias = pred.get("tf_bias", 0)
     rvol    = rvol_cache.get(ticker, 1.0)
     is_gap  = ticker in gap_candidates
+
+    # Staleness gate: if prediction is >90 min old, treat as neutral before allowing buys.
+    # This prevents buying against an hours-old bullish score when price has reversed.
+    pred_age = time.time() - pred.get("fetched_at", 0)
+    if pred_age > PRED_MAX_AGE_SECS and pscore > 0:
+        print(f"  {ticker}: prediction stale ({pred_age/60:.0f}min old) — capping score to 0")
+        pscore = 0
 
     if pscore <= PRED_SKIP:
         return "hold", f"pred_skip({pscore})", buy_w, sell_w
@@ -1077,6 +1106,18 @@ def execute(ticker, action, price, signals, reason="signal"):
             acct_size = get_account_size()
             if not passes_filters(ticker, price, acct_size):
                 return
+
+            # Real-time trend check: if price is below the 20-bar MA and prediction
+            # isn't strongly bullish, skip the buy. Catches downtrends early without
+            # waiting for the next prediction cycle.
+            ph = price_history.get(ticker, [])
+            if len(ph) >= 10:
+                ma20 = sum(ph[-20:]) / min(len(ph), 20)
+                pred_score_rt = prediction_cache.get(ticker, {}).get("score", 0)
+                if price < ma20 * 0.995 and pred_score_rt < PRED_STRONG_BUY:
+                    print(f"  {ticker} below MA20 (${ma20:.2f}) + pred not strong "
+                          f"({pred_score_rt:+.0f}) — skipping buy")
+                    return
 
             pred_score  = prediction_cache.get(ticker, {}).get("score", 0)
             rvol        = rvol_cache.get(ticker, 1.0)
@@ -1975,9 +2016,10 @@ def health_data():
     rvol_vals     = list(rvol_cache.values())
     rvol_zero_pct = round(100 * sum(1 for v in rvol_vals if not v) / max(1, len(rvol_vals)), 1)
 
-    # Per-ticker diagnostics — no API calls, uses cached state only
-    floor   = get_price_floor(DEFAULT_MAX_ACCOUNT)
-    ceiling = get_price_ceiling(DEFAULT_MAX_ACCOUNT)
+    # Per-ticker diagnostics — use real account size for accurate floor/ceiling
+    _diag_acct = get_account_size()
+    floor      = get_price_floor(_diag_acct)
+    ceiling    = get_price_ceiling(_diag_acct)
     ticker_diag = {}
     for t in list(active_tickers):
         ph    = price_history.get(t, [])
@@ -2068,7 +2110,8 @@ def reconcile_open_positions():
                 open_positions[ticker] = {
                     "entry": entry, "stop": stop, "target": target,
                     "qty": qty, "atr": None, "active_signals": [],
-                    "partial_done": False,
+                    "partial_done": False, "is_gap_play": False,
+                    "highest_price": entry,
                 }
             price_history.setdefault(ticker, [])
             volume_history.setdefault(ticker, [])
@@ -2129,6 +2172,37 @@ def _start_bot():
         validate_fallback_tickers()
         reconcile_open_positions()
         restore_pdt_state()
+        # Cancel any Alpaca orders left open from before this session.
+        # On paper accounts, orphaned limit orders accumulate and can fill
+        # at stale prices after a restart.
+        try:
+            api.cancel_all_orders()
+            print("Startup: cancelled any leftover open orders from previous session")
+        except Exception as e:
+            print(f"Startup cancel orders error: {e}")
+        # Warm the anti-chop gate from today's filled orders so a mid-day restart
+        # doesn't wipe the stop-loss counter and re-open blocked tickers.
+        try:
+            today_str   = now_et().strftime("%Y-%m-%d")
+            midnight_et = NY.localize(datetime.combine(now_et().date(), datetime.min.time()))
+            recent_orders = api.list_orders(
+                status="filled", after=midnight_et.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                limit=100, direction="asc"
+            )
+            for o in recent_orders:
+                if o.side == "sell" and getattr(o, "order_type", "") in ("market", ""):
+                    sym = o.symbol
+                    _daily_stop_counts.setdefault(sym, {})
+                    _daily_stop_counts[sym][today_str] = (
+                        _daily_stop_counts[sym].get(today_str, 0) + 1
+                    )
+            blocked = [s for s, d in _daily_stop_counts.items()
+                       if d.get(today_str, 0) >= CHOP_BLOCK_THRESHOLD]
+            if blocked:
+                print(f"Startup anti-chop: restored stop counts, "
+                      f"blocking {blocked} for today")
+        except Exception as e:
+            print(f"Startup anti-chop restore error: {e}")
         try:
             status = get_macro_status(api)
             status["hot_sectors"] = get_hot_sectors(api)

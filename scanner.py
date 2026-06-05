@@ -100,12 +100,13 @@ def _get_account_size(api):
         return MAX_ACCOUNT
 
 def _price_floor(account_size):
-    if account_size > 2000: return 5.00
-    if account_size > 500:  return 2.00
-    if account_size > 100:  return 1.00
+    if account_size > 100: return 2.00
+    if account_size > 20:  return 1.00
     return 0.50
 
 def _price_ceiling(account_size):
+    if account_size > 50_000: return min(account_size * 0.45, 50.00)
+    if account_size > 10_000: return min(account_size * 0.45, 25.00)
     return max(min(account_size * 0.45, 10.00), 0.60)
 
 def _min_volume(account_size):
@@ -361,9 +362,10 @@ def run_scan(api, universe, days_back=1, account_size=20):
             pd = get_price_data(api, ticker)
             if not pd:
                 continue
-            # Use the same ceiling formula as bot.py passes_filters to avoid
-            # promoting tickers that will be immediately rejected at entry.
-            if pd["price"] <= 0 or pd["price"] > max_price:
+            # Apply same floor+ceiling as bot.py passes_filters so scan results
+            # only contain stocks that will actually pass the entry gate.
+            min_price = _price_floor(account_size)
+            if pd["price"] <= 0 or pd["price"] > max_price or pd["price"] < min_price:
                 continue
             headlines         = get_headlines(api, ticker, days_back=days_back)
             sentiment, method = finbert_score(headlines)
