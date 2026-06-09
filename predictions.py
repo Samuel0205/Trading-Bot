@@ -17,14 +17,11 @@ Output: prediction_score (-100 to +100) per ticker
 """
 
 import time, os
-import requests as req
 from datetime import datetime, timedelta
 import pytz
+from finbert_client import finbert_score, keyword_score as _fb_kw, calls_remaining
 
-NY         = pytz.timezone("America/New_York")
-HF_TOKEN   = os.environ.get("HUGGINGFACE_TOKEN")
-HF_URL     = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
-HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+NY = pytz.timezone("America/New_York")
 
 # ── Helpers ───────────────────────────────────────────────────
 
@@ -112,7 +109,10 @@ def multi_timeframe_analysis(api, ticker):
 # ── Feature 2: 3-day news sentiment trend ────────────────────
 
 def news_sentiment_trend(api, ticker):
-    daily_scores = []
+    # Fetch headlines for the past 3 days separately so we can measure the trend.
+    # FinBERT budget: one call batches ALL days' headlines together, preserving the
+    # per-day breakdown via keyword scores scaled to FinBERT magnitude.
+    day_headlines = []
     for days_ago in [3, 2, 1]:
         try:
             end   = datetime.now(pytz.utc) - timedelta(days=days_ago - 1)
@@ -120,27 +120,31 @@ def news_sentiment_trend(api, ticker):
             news  = api.get_news(ticker,
                         start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                         end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        limit=10)
-            headlines = [n.headline for n in news] if news else []
-            if not headlines:
-                daily_scores.append(0)
-                continue
-            if HF_TOKEN:
-                try:
-                    payload = {"inputs": headlines[:5], "options": {"wait_for_model": True}}
-                    resp    = req.post(HF_URL, headers=HF_HEADERS, json=payload, timeout=12)
-                    if resp.status_code == 200:
-                        total = 0
-                        for result in resp.json():
-                            sm     = {r["label"]: r["score"] for r in result}
-                            total += sm.get("positive", 0) - sm.get("negative", 0)
-                        daily_scores.append(round(total, 3))
-                        continue
-                except:
-                    pass
-            daily_scores.append(sum(keyword_score(h) for h in headlines))
+                        limit=5)
+            day_headlines.append([n.headline for n in news] if news else [])
         except:
-            daily_scores.append(0)
+            day_headlines.append([])
+
+    # Per-day keyword scores (always computed — used as trend backbone)
+    kw_scores = [sum(_fb_kw(h) for h in day) for day in day_headlines]
+
+    # One FinBERT call: batch all days' top headlines together.
+    # Scale keyword per-day scores by FinBERT's total for better calibration.
+    all_h = [h for day in day_headlines for h in day[:3]]
+    if all_h:
+        fb_total, method = finbert_score(all_h)
+        kw_total = sum(kw_scores)
+        if method == "finbert" and kw_total != 0:
+            scale = fb_total / kw_total
+            daily_scores = [round(s * scale, 3) for s in kw_scores]
+        elif method == "finbert":
+            # All keyword scores were 0 — split FinBERT total evenly
+            daily_scores = [round(fb_total / 3, 3)] * 3
+        else:
+            daily_scores = kw_scores
+    else:
+        daily_scores = [0, 0, 0]
+        method = "no_news"
 
     if len(daily_scores) < 2:
         return 0, "neutral", daily_scores

@@ -406,6 +406,20 @@ def save_partial_exit(ticker, qty, entry_price, exit_price, pnl, ts):
         conn.commit()
         conn.close()
 
+# ── Position stop/target lookup ──────────────────────────────
+
+def get_open_position_stops(ticker):
+    """Return (stop_price, target_price) for the most recent open trade, or (None, None)."""
+    with _db_lock:
+        conn = get_conn()
+        row  = conn.execute("""
+            SELECT stop_price, target_price FROM trades
+            WHERE ticker=? AND side='BUY' AND pnl IS NULL
+            ORDER BY entry_ts DESC LIMIT 1
+        """, (ticker,)).fetchone()
+        conn.close()
+    return (row["stop_price"], row["target_price"]) if row else (None, None)
+
 # ── Scan history ──────────────────────────────────────────────
 
 def save_scan_result(tickers, scores):

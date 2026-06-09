@@ -12,7 +12,8 @@ from database import (
     get_recent_trades, get_trade_stats_from_db, save_signal_performance,
     get_signal_win_rates, save_portfolio_snapshot, get_portfolio_history,
     save_alert, get_alerts, acknowledge_alerts, save_price_history,
-    load_price_history, save_scan_result, is_macro_blackout
+    load_price_history, save_scan_result, is_macro_blackout,
+    get_open_position_stops
 )
 from macro import (
     seed_macro_calendar, check_earnings_risk, is_macro_blackout_today,
@@ -2106,8 +2107,9 @@ def reconcile_open_positions():
             qty    = int(pos.qty)
             if qty <= 0:
                 continue  # skip short or zero positions; bot only manages longs
-            stop   = round(entry * (1 - STOP_LOSS_PCT), 3)
-            target = round(entry * (1 + TAKE_PROFIT_PCT), 3)
+            db_stop, db_target = get_open_position_stops(ticker)
+            stop   = db_stop   if db_stop   else round(entry * (1 - STOP_LOSS_PCT), 3)
+            target = db_target if db_target else round(entry * (1 + TAKE_PROFIT_PCT), 3)
             with _positions_lock:
                 if ticker in open_positions:
                     continue  # already tracked; atomic check-then-skip inside lock
@@ -2172,6 +2174,20 @@ def _start_bot():
 
     def startup():
         time.sleep(3)
+
+        if LIVE_MODE:
+            try:
+                acct   = api.get_account()
+                equity = float(acct.equity)
+                cash   = float(acct.cash)
+                print(f"=== LIVE PRE-FLIGHT: equity=${equity:,.2f}  cash=${cash:,.2f} ===")
+                if equity < 5:
+                    raise RuntimeError(f"Live account equity ${equity:.2f} is too low to trade safely.")
+            except RuntimeError:
+                raise
+            except Exception as e:
+                print(f"Live pre-flight check error: {e}")
+
         update_market_regime()
         validate_fallback_tickers()
         reconcile_open_positions()
