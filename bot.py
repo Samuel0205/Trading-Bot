@@ -669,10 +669,12 @@ def passes_filters(ticker, price, account_size=None):
     if grade and grade not in MIN_GRADE:
         print(f"  {ticker} grade {grade} excluded"); return False
 
-    # rvol check — skip if 0.0/None (means bar.v was 0 from IEX, not real data)
+    # rvol check — block if below threshold. None means no data yet → allow through.
+    # The old condition (rvol > 0.10 and rvol < threshold) accidentally let stocks
+    # with near-zero rvol (e.g. 0.02x from a quiet IEX bar) bypass this gate.
     rvol = rvol_cache.get(ticker)
-    if rvol is not None and rvol > 0.10 and rvol < RVOL_THRESHOLD:
-        print(f"  {ticker} rvol {rvol:.2f}x low"); return False
+    if rvol is not None and rvol < RVOL_THRESHOLD:
+        print(f"  {ticker} rvol {rvol:.2f}x low (< {RVOL_THRESHOLD}x)"); return False
 
     # Gap plays with strong intraday RVOL bypass the historical daily volume check
     if (gap_candidates.get(ticker, {}).get("direction") == "up" and
@@ -694,6 +696,7 @@ def passes_filters(ticker, price, account_size=None):
                     end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     limit=5, feed="iex").df
         if bars is None or bars.empty:
+            print(f"  {ticker} volume check: IEX returned no bars — low volume assumed")
             _vol_check_cache[ticker] = (today_str, False); return False
         if hasattr(bars.index,'levels'):
             if ticker in bars.index.get_level_values(0): bars=bars.loc[ticker]
@@ -1065,6 +1068,7 @@ def execute(ticker, action, price, signals, reason="signal"):
         if action == "buy" and ticker not in open_positions:
             # Block if there's already a pending limit order for this ticker
             if ticker in _pending_buy_tickers:
+                print(f"  {ticker} pending limit order in flight — skipping")
                 return
 
             if is_on_cooldown(ticker):
@@ -1105,7 +1109,7 @@ def execute(ticker, action, price, signals, reason="signal"):
 
             acct_size = get_account_size()
             if not passes_filters(ticker, price, acct_size):
-                return
+                return  # passes_filters already prints its reason
 
             # Real-time trend check: if price is below the 20-bar MA and prediction
             # isn't strongly bullish, skip the buy. Catches downtrends early without
