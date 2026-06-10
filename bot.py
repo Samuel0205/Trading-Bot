@@ -1416,16 +1416,21 @@ def update_rvol():
             today_vol = float(latest.v)
             now       = now_et()
             mins_open = max(1,(now.hour-9)*60+now.minute-30)
-            # IEX sometimes returns v=0 for low-volume tickers — fall back to history
+            # IEX sometimes returns v=0 for stocks that trade on NASDAQ/NYSE,
+            # not IEX. Fall back to volume history, but if that's also near-zero
+            # it means IEX has no coverage — don't cache anything (gate treats
+            # None as unknown and allows the trade through).
             if today_vol <= 0:
                 vols = volume_history.get(ticker, [])
                 if vols: today_vol = sum(vols[-10:]) * (390 / mins_open / 10)
-            projected = today_vol*(390/mins_open) if mins_open<390 else today_vol
-            rvol      = projected/avg_vol if avg_vol>0 else 1.0
-            # Only store if it looks real (not another zero)
-            if rvol > 0:
-                rvol_cache[ticker] = round(rvol, 2)
-                print(f"  rvol {ticker}: {rvol:.2f}x")
+            if today_vol < 500:
+                # No real IEX volume data — leave rvol_cache[ticker] as None
+                time.sleep(0.2)
+                continue
+            projected = today_vol * (390 / mins_open) if mins_open < 390 else today_vol
+            rvol      = projected / avg_vol if avg_vol > 0 else 1.0
+            rvol_cache[ticker] = round(rvol, 2)
+            print(f"  rvol {ticker}: {rvol:.2f}x")
             time.sleep(0.2)
         except Exception as e: print(f"  update_rvol {ticker}: {e}")
 
