@@ -36,13 +36,13 @@ def get_headlines(api, ticker, days_back=1):
 
 SEED_UNIVERSE = [
     "SIRI","TELL","CLOV","NKLA","MVIS","SOFI","HOOD","NIO","MARA","RIOT",
-    "PLTR","RIVN","LCID","BITI","HBAN","KEY","VALE","ITUB","PBR","GOLD",
-    "KGC","HL","CDE","AG","EGO","BTG","NGD","PAAS","SILV","GPL",
-    "AFRM","OPEN","DKNG","CHPT","WKHS","GOEV","FSR","HYLN","SNDL","ACB",
-    "CGC","TLRY","CRON","OGI","VFF","HEXO","CWEB","SPCE","MAXN","ARRY",
-    "STEM","NOVA","SHLS","SUNW","IDEX","GNUS","EXPR","AMC","BB","NOK",
-    "XELA","MARA","MVIS","TELL","SIRI","OCGN","TIGR","XPEV","LI",
-    "F","BAC","AAL","CCL","SNAP","WISH","NAKD","KOSS",
+    "PLTR","RIVN","LCID","HBAN","KEY","VALE","ITUB","PBR","GOLD",
+    "KGC","HL","CDE","AG","EGO","BTG","NGD","PAAS","SILV",
+    "AFRM","OPEN","DKNG","CHPT","WKHS","HYLN","SNDL","ACB",
+    "CGC","TLRY","CRON","CWEB","SPCE","MAXN","ARRY",
+    "STEM","NOVA","SHLS","IDEX","AMC","BB","NOK",
+    "OCGN","TIGR","XPEV","LI","JOBY","PTON","CLSK","BITF",
+    "F","BAC","AAL","CCL","SNAP","KOSS","RIG","CLF",
 ]
 SEED_UNIVERSE = list(dict.fromkeys(SEED_UNIVERSE))  # deduplicate, preserve order
 

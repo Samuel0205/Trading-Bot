@@ -29,18 +29,20 @@ NEGATIVE_WORDS = [
     "bankruptcy","debt","warning","risk","halt","delisted","investigation",
 ]
 
-_counter = {"date": None, "n": 0}
+# _state tracks daily call count and whether the API host is reachable.
+# reachable resets to True each new day so we retry once after a network outage.
+_state = {"date": None, "n": 0, "reachable": True}
 
 
 def _reset_if_new_day():
     today = date.today()
-    if _counter["date"] != today:
-        _counter.update({"date": today, "n": 0})
+    if _state["date"] != today:
+        _state.update({"date": today, "n": 0, "reachable": True})
 
 
 def calls_remaining() -> int:
     _reset_if_new_day()
-    return max(0, FINBERT_DAILY_LIMIT - _counter["n"])
+    return max(0, FINBERT_DAILY_LIMIT - _state["n"])
 
 
 def keyword_score(text: str) -> float:
@@ -70,7 +72,10 @@ def finbert_score(headlines: list) -> tuple:
         return kw, "keyword"
 
     _reset_if_new_day()
-    if _counter["n"] >= FINBERT_DAILY_LIMIT:
+    if _state["n"] >= FINBERT_DAILY_LIMIT:
+        return kw, "keyword"
+
+    if not _state["reachable"]:
         return kw, "keyword"
 
     try:
@@ -80,8 +85,8 @@ def finbert_score(headlines: list) -> tuple:
             print(f"  FinBERT HTTP {resp.status_code} — keyword fallback")
             return kw, "keyword_fallback"
 
-        _counter["n"] += 1
-        remaining = FINBERT_DAILY_LIMIT - _counter["n"]
+        _state["n"] += 1
+        remaining = FINBERT_DAILY_LIMIT - _state["n"]
         print(f"  FinBERT: scored {len(headlines)} headlines "
               f"({remaining} call{'s' if remaining != 1 else ''} remaining today)")
 
@@ -91,6 +96,10 @@ def finbert_score(headlines: list) -> tuple:
             total += sm.get("positive", 0) - sm.get("negative", 0)
         return round(total, 3), "finbert"
 
+    except req.exceptions.ConnectionError:
+        _state["reachable"] = False
+        print("  FinBERT unreachable (network) — keyword scoring for remainder of day")
+        return kw, "keyword_fallback"
     except Exception as e:
         print(f"  FinBERT error: {e}")
         return kw, "keyword_fallback"
