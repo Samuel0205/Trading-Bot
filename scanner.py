@@ -12,53 +12,13 @@ Account sizing parameters are passed INTO run_full_scan rather than
 imported from app.py, which would cause a circular import.
 """
 
-import time, os, requests as req
+import time, os
 from datetime import datetime, timedelta
 import pytz
-
-HF_TOKEN   = os.environ.get("HUGGINGFACE_TOKEN")
-HF_URL     = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
-HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+from finbert_client import finbert_score, keyword_score
 
 NY          = pytz.timezone("America/New_York")
 MAX_ACCOUNT = float(os.environ.get("MAX_ACCOUNT", "30.00"))
-
-# ── Sentiment ─────────────────────────────────────────────────
-
-POSITIVE_WORDS = [
-    "surge","soar","rally","beat","record","upgrade","buy","bullish","growth",
-    "profit","revenue","partnership","launch","breakthrough","strong","exceed",
-    "outperform","raise","acquire","expansion","dividend","momentum","breakout"
-]
-NEGATIVE_WORDS = [
-    "crash","plunge","drop","miss","downgrade","sell","bearish","loss","decline",
-    "lawsuit","recall","layoff","cut","weak","disappoint","probe","fraud",
-    "bankruptcy","debt","warning","risk","halt","delisted","investigation"
-]
-
-def keyword_score(text):
-    t = text.lower()
-    return (sum(1 for w in POSITIVE_WORDS if w in t) -
-            sum(1 for w in NEGATIVE_WORDS if w in t))
-
-def finbert_score(headlines):
-    if not headlines:
-        return 0, "no_news"
-    if not HF_TOKEN:
-        return sum(keyword_score(h) for h in headlines), "keyword"
-    try:
-        payload = {"inputs": headlines[:5], "options": {"wait_for_model": True}}
-        resp    = req.post(HF_URL, headers=HF_HEADERS, json=payload, timeout=15)
-        if resp.status_code != 200:
-            return sum(keyword_score(h) for h in headlines), "keyword_fallback"
-        total = 0
-        for result in resp.json():
-            sm     = {r["label"]: r["score"] for r in result}
-            total += sm.get("positive", 0) - sm.get("negative", 0)
-        return round(total, 3), "finbert"
-    except Exception as e:
-        print(f"  FinBERT error: {e}")
-        return sum(keyword_score(h) for h in headlines), "keyword_fallback"
 
 def get_headlines(api, ticker, days_back=1):
     try:
@@ -76,13 +36,13 @@ def get_headlines(api, ticker, days_back=1):
 
 SEED_UNIVERSE = [
     "SIRI","TELL","CLOV","NKLA","MVIS","SOFI","HOOD","NIO","MARA","RIOT",
-    "PLTR","RIVN","LCID","BITI","HBAN","KEY","VALE","ITUB","PBR","GOLD",
-    "KGC","HL","CDE","AG","EGO","BTG","NGD","PAAS","SILV","GPL",
-    "AFRM","OPEN","DKNG","CHPT","WKHS","GOEV","FSR","HYLN","SNDL","ACB",
-    "CGC","TLRY","CRON","OGI","VFF","HEXO","CWEB","SPCE","MAXN","ARRY",
-    "STEM","NOVA","SHLS","SUNW","IDEX","GNUS","EXPR","AMC","BB","NOK",
-    "XELA","MARA","MVIS","TELL","SIRI","OCGN","TIGR","XPEV","LI",
-    "F","BAC","AAL","CCL","SNAP","WISH","NAKD","KOSS",
+    "PLTR","RIVN","LCID","HBAN","KEY","VALE","ITUB","PBR","GOLD",
+    "KGC","HL","CDE","AG","EGO","BTG","NGD","PAAS","SILV",
+    "AFRM","OPEN","DKNG","CHPT","WKHS","HYLN","SNDL","ACB",
+    "CGC","TLRY","CRON","CWEB","SPCE","MAXN","ARRY",
+    "STEM","NOVA","SHLS","IDEX","AMC","BB","NOK",
+    "OCGN","TIGR","XPEV","LI","JOBY","PTON","CLSK","BITF",
+    "F","BAC","AAL","CCL","SNAP","KOSS","RIG","CLF",
 ]
 SEED_UNIVERSE = list(dict.fromkeys(SEED_UNIVERSE))  # deduplicate, preserve order
 
