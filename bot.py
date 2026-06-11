@@ -670,11 +670,13 @@ def passes_filters(ticker, price, account_size=None):
     if grade and grade not in MIN_GRADE:
         print(f"  {ticker} grade {grade} excluded"); return False
 
-    # rvol check — block if below threshold. None means no data yet → allow through.
-    # The old condition (rvol > 0.10 and rvol < threshold) accidentally let stocks
-    # with near-zero rvol (e.g. 0.02x from a quiet IEX bar) bypass this gate.
+    # rvol check — only gate if we have a meaningful reading (>= 0.10x).
+    # IEX free tier only covers ~2-3% of NASDAQ/NYSE volume, so liquid stocks
+    # like XPEV or CLF often show 0.01-0.04x — that's IEX noise, not real low volume.
+    # Below 0.10x → treat as no data (same as None → allow through).
+    # 0.10x–RVOL_THRESHOLD → genuinely thin stock → block.
     rvol = rvol_cache.get(ticker)
-    if rvol is not None and rvol < RVOL_THRESHOLD:
+    if rvol is not None and rvol >= 0.10 and rvol < RVOL_THRESHOLD:
         print(f"  {ticker} rvol {rvol:.2f}x low (< {RVOL_THRESHOLD}x)"); return False
 
     # Gap plays with strong intraday RVOL bypass the historical daily volume check
