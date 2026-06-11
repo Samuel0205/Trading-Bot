@@ -13,7 +13,9 @@ import requests as req
 from datetime import date
 
 HF_TOKEN   = os.environ.get("HUGGINGFACE_TOKEN")
-HF_URL     = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
+# api-inference.huggingface.co was decommissioned by HuggingFace (DNS no longer
+# resolves — the Errno -5 in the logs). The Inference API now lives behind the router.
+HF_URL     = "https://router.huggingface.co/hf-inference/models/ProsusAI/finbert"
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
 FINBERT_DAILY_LIMIT = 3   # free tier — 3 calls per day

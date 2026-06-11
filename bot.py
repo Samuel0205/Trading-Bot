@@ -347,10 +347,13 @@ def get_price_floor(account_size=None):
 
 def get_min_volume(account_size=None):
     if account_size is None: account_size = get_account_size()
-    if account_size > 5000: return 1_000_000
-    if account_size > 1000: return 500_000
-    if account_size > 200:  return 250_000
-    return 100_000
+    # Calibrated for IEX exchange feed (2-3% of consolidated NASDAQ/NYSE volume).
+    # IEX shows ~10k shares/day for stocks that trade 500k-1M real shares/day.
+    # The prediction score and RVOL gates handle real liquidity filtering.
+    if account_size > 5000: return 2_000
+    if account_size > 1000: return 1_000
+    if account_size > 200:  return 500
+    return 200
 
 # ── PDT compliance ────────────────────────────────────────────
 
@@ -531,8 +534,10 @@ def get_signals(ticker, price):
     vwap      = calc_vwap(hist[-78:], vols[-78:])
     macd_line = calc_macd(hist)
     z         = (price-mean)/max((upper-mean), 0.01)
-    ok_buy    = market_regime in ("trending_up","ranging")
-    ok_sell   = market_regime in ("trending_down","ranging")
+    # Regime no longer hard-gates buys/sells — threshold multipliers in make_decision
+    # handle it instead. Strong individual stocks can always be bought or sold.
+    ok_buy  = True
+    ok_sell = True
     ma_conf   = min(1.0, n/20)
 
     # NEW: veto conditions — hard blocks independent of vote weights
@@ -618,13 +623,16 @@ def weighted_vote(signals):
 
 def update_market_regime():
     global market_regime
-    RTICKERS = ["SIRI","TELL","NIO","MARA","SOFI","AMC","BB","NOK"]
+    # Use broad market ETFs — NOT individual meme stocks which are almost always
+    # in a downtrend regardless of the broader market, causing ok_buy=False every day.
+    RTICKERS = ["SPY", "QQQ"]
     try:
         end   = datetime.now(pytz.utc) - timedelta(minutes=20)
         start = end - timedelta(days=15)
         ss    = start.strftime("%Y-%m-%dT%H:%M:%SZ")
         es    = end.strftime("%Y-%m-%dT%H:%M:%SZ")
         closes = None
+        regime_src = None
         for ticker in RTICKERS:
             try:
                 bars = api.get_bars(ticker,"1Day",start=ss,end=es,limit=12,feed="iex").df
@@ -633,7 +641,7 @@ def update_market_regime():
                     if ticker in bars.index.get_level_values(0): bars=bars.loc[ticker]
                     else: continue
                 if len(bars)>=5:
-                    closes=list(bars["close"]); break
+                    closes=list(bars["close"]); regime_src=ticker; break
             except: continue
         if closes is None:
             all_p=[p for t in active_tickers for p in price_history.get(t,[])[-10:]]
@@ -647,7 +655,7 @@ def update_market_regime():
             if   ma5>ma10*1.005 and latest>ma5: market_regime="trending_up"
             elif ma5<ma10*0.995 and latest<ma5: market_regime="trending_down"
             else:                               market_regime="ranging"
-        print(f"Regime: {market_regime}")
+        print(f"Regime: {market_regime} (source: {regime_src}, ma5={ma5:.2f} ma10={ma10:.2f})")
     except Exception as e:
         print(f"Regime error: {e}")
 
@@ -960,13 +968,22 @@ def make_decision(ticker, signals, price):
         # 2+ signals vetoed means the setup is compromised — require stronger vote
         bt = min(bt * 1.3, 5.0)
 
-    if   buy_w  >= bt: action = "buy"
-    elif sell_w >= st: action = "sell"
-    else:              action = "hold"
+    # Regime-based threshold scaling — never blocks trading outright, just adjusts conviction.
+    # Trending down: buy is 1.5× harder + must have strong individual setup (pred >= PRED_STRONG_BUY).
+    # Trending up:   buy is 0.85× easier; sell is 1.3× harder (let winners run).
+    # Ranging:       neutral.
+    bt *= {"trending_up": 0.85, "ranging": 1.0, "trending_down": 1.5}.get(market_regime, 1.0)
+    st *= {"trending_up": 1.3,  "ranging": 1.0, "trending_down": 0.8}.get(market_regime, 1.0)
+    bt  = min(bt, 5.0); st = min(st, 5.0)
 
-    reason = (f"bw={buy_w:.1f}>={bt:.1f}" if action=="buy"
-              else f"sw={sell_w:.1f}>={st:.1f}" if action=="sell"
-              else f"hold(b={buy_w:.1f},s={sell_w:.1f})")
+    if buy_w >= bt and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY):
+        action = "buy";  reason = f"bw={buy_w:.1f}>={bt:.1f}"
+    elif sell_w >= st:
+        action = "sell"; reason = f"sw={sell_w:.1f}>={st:.1f}"
+    elif buy_w >= bt and market_regime == "trending_down":
+        action = "hold"; reason = f"downtrend:pred({pscore:+.0f})<{PRED_STRONG_BUY}"
+    else:
+        action = "hold"; reason = f"hold(b={buy_w:.1f},s={sell_w:.1f})"
     return action, reason, buy_w, sell_w
 
 # ── Trade execution ───────────────────────────────────────────
