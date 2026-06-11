@@ -1532,6 +1532,9 @@ def prediction_loop():
                     run_predictions, _ = get_predictor()
                     if run_predictions:
                         results = run_predictions(api, tickers, market_regime)
+                        # Remove stale entries for tickers no longer being watched
+                        for stale in [t for t in list(prediction_cache) if t not in tickers]:
+                            del prediction_cache[stale]
                         prediction_cache.update(results)
                         summary = [(t,f"{r.get('score',0):+.0f}") for t,r in results.items()]
                         print(f"Predictions: {summary}")

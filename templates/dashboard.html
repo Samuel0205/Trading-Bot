@@ -367,10 +367,10 @@ socket.on('alerts', (alerts) => {
   renderAlerts(alerts);
 });
 
-// FIX: handle predictions on dashboard (pred data was in state but never displayed)
-socket.on('predictions', (data) => {
-  renderPredictionChips(data);
-});
+// Predictions arrive via the state socket (active tickers only).
+// The separate 'predictions' event carries the full prediction_cache including
+// stale tickers — we deliberately ignore it here to avoid showing stale data.
+socket.on('predictions', (_data) => { /* handled by renderPredFromState */ });
 
 // FIX: handle unusual volume (was emitted from backend, never shown)
 socket.on('rvol', (data) => {
