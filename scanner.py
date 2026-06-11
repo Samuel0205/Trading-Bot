@@ -70,10 +70,14 @@ def _price_ceiling(account_size):
     return max(min(account_size * 0.45, 10.00), 0.60)
 
 def _min_volume(account_size):
-    if account_size > 5000: return 1_000_000
-    if account_size > 1000: return 500_000
-    if account_size > 200:  return 250_000
-    return 100_000
+    # Calibrated for IEX exchange feed (2-3% of consolidated NASDAQ/NYSE volume).
+    # The old 1M threshold meant only stocks trading 50M+ real shares/day passed,
+    # which biased the universe toward perpetually-downtrending meme stocks.
+    # Matches get_min_volume in bot.py.
+    if account_size > 5000: return 2_000
+    if account_size > 1000: return 1_000
+    if account_size > 200:  return 500
+    return 200
 
 # ── Bar fetching helpers ──────────────────────────────────────
 
