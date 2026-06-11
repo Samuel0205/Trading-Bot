@@ -18,7 +18,7 @@ HF_TOKEN   = os.environ.get("HUGGINGFACE_TOKEN")
 HF_URL     = "https://router.huggingface.co/hf-inference/models/ProsusAI/finbert"
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
-FINBERT_DAILY_LIMIT = 3   # free tier — 3 calls per day
+FINBERT_DAILY_LIMIT = 20  # free tier allows ~30 calls/day; keep headroom
 
 POSITIVE_WORDS = [
     "surge","soar","rally","beat","record","upgrade","buy","bullish","growth",
@@ -82,7 +82,7 @@ def finbert_score(headlines: list) -> tuple:
 
     try:
         payload = {"inputs": headlines[:5], "options": {"wait_for_model": True}}
-        resp    = req.post(HF_URL, headers=HF_HEADERS, json=payload, timeout=15)
+        resp    = req.post(HF_URL, headers=HF_HEADERS, json=payload, timeout=45)
         if resp.status_code != 200:
             print(f"  FinBERT HTTP {resp.status_code} — keyword fallback")
             return kw, "keyword_fallback"
