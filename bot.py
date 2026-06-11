@@ -347,10 +347,13 @@ def get_price_floor(account_size=None):
 
 def get_min_volume(account_size=None):
     if account_size is None: account_size = get_account_size()
-    if account_size > 5000: return 1_000_000
-    if account_size > 1000: return 500_000
-    if account_size > 200:  return 250_000
-    return 100_000
+    # Calibrated for IEX exchange feed (2-3% of consolidated NASDAQ/NYSE volume).
+    # IEX shows ~10k shares/day for stocks that trade 500k-1M real shares/day.
+    # The prediction score and RVOL gates handle real liquidity filtering.
+    if account_size > 5000: return 2_000
+    if account_size > 1000: return 1_000
+    if account_size > 200:  return 500
+    return 200
 
 # ── PDT compliance ────────────────────────────────────────────
 
@@ -618,13 +621,16 @@ def weighted_vote(signals):
 
 def update_market_regime():
     global market_regime
-    RTICKERS = ["SIRI","TELL","NIO","MARA","SOFI","AMC","BB","NOK"]
+    # Use broad market ETFs — NOT individual meme stocks which are almost always
+    # in a downtrend regardless of the broader market, causing ok_buy=False every day.
+    RTICKERS = ["SPY", "QQQ"]
     try:
         end   = datetime.now(pytz.utc) - timedelta(minutes=20)
         start = end - timedelta(days=15)
         ss    = start.strftime("%Y-%m-%dT%H:%M:%SZ")
         es    = end.strftime("%Y-%m-%dT%H:%M:%SZ")
         closes = None
+        regime_src = None
         for ticker in RTICKERS:
             try:
                 bars = api.get_bars(ticker,"1Day",start=ss,end=es,limit=12,feed="iex").df
@@ -633,7 +639,7 @@ def update_market_regime():
                     if ticker in bars.index.get_level_values(0): bars=bars.loc[ticker]
                     else: continue
                 if len(bars)>=5:
-                    closes=list(bars["close"]); break
+                    closes=list(bars["close"]); regime_src=ticker; break
             except: continue
         if closes is None:
             all_p=[p for t in active_tickers for p in price_history.get(t,[])[-10:]]
@@ -647,7 +653,7 @@ def update_market_regime():
             if   ma5>ma10*1.005 and latest>ma5: market_regime="trending_up"
             elif ma5<ma10*0.995 and latest<ma5: market_regime="trending_down"
             else:                               market_regime="ranging"
-        print(f"Regime: {market_regime}")
+        print(f"Regime: {market_regime} (source: {regime_src}, ma5={ma5:.2f} ma10={ma10:.2f})")
     except Exception as e:
         print(f"Regime error: {e}")
 
