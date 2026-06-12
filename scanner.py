@@ -35,14 +35,28 @@ def get_headlines(api, ticker, days_back=1):
 # ── Seed universe ─────────────────────────────────────────────
 
 SEED_UNIVERSE = [
-    "SIRI","TELL","CLOV","NKLA","MVIS","SOFI","HOOD","NIO","MARA","RIOT",
-    "PLTR","RIVN","LCID","HBAN","KEY","VALE","ITUB","PBR","GOLD",
-    "KGC","HL","CDE","AG","EGO","BTG","NGD","PAAS","SILV",
-    "AFRM","OPEN","DKNG","CHPT","WKHS","HYLN","SNDL","ACB",
-    "CGC","TLRY","CRON","CWEB","SPCE","MAXN","ARRY",
-    "STEM","NOVA","SHLS","IDEX","AMC","BB","NOK",
-    "OCGN","TIGR","XPEV","LI","JOBY","PTON","CLSK","BITF",
-    "F","BAC","AAL","CCL","SNAP","KOSS","RIG","CLF",
+    # Fintech / growth
+    "SOFI","HOOD","AFRM","OPEN","DKNG","UPST","PSFE",
+    # EV / clean energy
+    "NIO","XPEV","LI","RIVN","LCID","JOBY","PTON","NOVA","ARRY","MAXN",
+    # Crypto / blockchain
+    "MARA","RIOT","CLSK","BITF","CIFR",
+    # Tech momentum
+    "PLTR","SNAP","KOSS",
+    # Mining / metals (high-beta)
+    "GOLD","KGC","HL","CDE","AG","BTG","PAAS","SILV","EGO","NGD",
+    # Commodities / energy
+    "VALE","ITUB","PBR","RIG","CLF",
+    # Banks / macro
+    "BAC","HBAN","KEY",
+    # Legacy high-volume (still liquid, real companies)
+    "AMC","BB","NOK","SIRI",
+    # Healthcare / biotech
+    "OCGN","STEM","SHLS",
+    # Travel / consumer
+    "AAL","CCL","F",
+    # Asia equities
+    "TIGR",
 ]
 SEED_UNIVERSE = list(dict.fromkeys(SEED_UNIVERSE))  # deduplicate, preserve order
 
@@ -438,8 +452,8 @@ def run_full_scan(api):
     if not universe:
         print("Universe empty — using fallback")
         universe = [{"symbol": s, "price": 1.0, "volume": 500_000}
-                    for s in ["SIRI","TELL","CLOV","NKLA","MVIS",
-                               "SOFI","HOOD","NIO","MARA","RIOT"]]
+                    for s in ["SOFI","HOOD","NIO","MARA","RIOT",
+                               "PLTR","AFRM","DKNG","SNAP","RIVN"]]
 
     today     = run_scan(api, universe, days_back=1, account_size=account_size)
     yesterday = run_scan(api, universe, days_back=2, account_size=account_size)

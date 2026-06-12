@@ -89,7 +89,7 @@ PRED_HOURS           = [9, 10, 11, 12, 13, 14]   # refresh every hour during tra
 PRED_MAX_AGE_SECS    = 5400                        # 90 min — treat stale prediction as neutral
 MACRO_REFRESH_HOURS  = [8, 12]
 MIN_PROFIT_PCT       = 0.04
-MAX_DAILY_TRADES     = 3
+MAX_DAILY_TRADES     = 10
 GAP_MIN_PCT          = 2.0
 GAP_MAX_PCT          = 15.0
 GAP_MIN_RVOL          = 1.5
@@ -124,7 +124,7 @@ BASE_SIGNAL_WEIGHTS = {
     "Mean Reversion": 0.8,
 }
 
-FALLBACK_TICKERS = ["SIRI","TELL","AMC","BB","NOK","MVIS","NIO","MARA","SOFI","CLOV"]
+FALLBACK_TICKERS = ["SOFI","HOOD","NIO","MARA","RIOT","PLTR","AFRM","DKNG","SNAP","RIVN"]
 
 # ── State ─────────────────────────────────────────────────────
 price_history     = {}
@@ -341,8 +341,9 @@ def get_price_ceiling(account_size=None):
 
 def get_price_floor(account_size=None):
     if account_size is None: account_size = get_account_size()
-    if account_size > 100: return 2.00
-    if account_size > 20:  return 1.00
+    if account_size > 10_000: return 3.00
+    if account_size > 100:    return 2.00
+    if account_size > 20:     return 1.00
     return 0.50
 
 def get_min_volume(account_size=None):
@@ -1124,7 +1125,7 @@ def execute(ticker, action, price, signals, reason="signal"):
 
             dt_count, _, dt_reset = count_rolling_day_trades()
             if dt_count >= MAX_DAILY_TRADES:
-                print(f"  PDT limit: {dt_count}/3 day trades in rolling 5-day window"
+                print(f"  PDT limit: {dt_count}/{MAX_DAILY_TRADES} day trades in rolling 5-day window"
                       + (f" — resets {dt_reset}" if dt_reset else "")); return
 
             acct_size = get_account_size()
@@ -1258,7 +1259,7 @@ def validate_fallback_tickers():
                 print(f"  {ticker} out of range @ ${price:.2f}")
         except Exception as e:
             print(f"  {ticker} error: {e}")
-    active_tickers = valid if valid else ["SIRI","TELL","AMC","BB","NOK"]
+    active_tickers = valid if valid else ["SOFI","NIO","MARA","PLTR","DKNG"]
     print(f"Active tickers: {active_tickers}")
 
 def apply_scan_results(results_today, acct_size=None):
@@ -1571,17 +1572,25 @@ def prediction_loop():
 
 def scanner_loop():
     global scan_results, active_tickers, market_regime
-    scan_done = set(); scan_day = None
+    scan_done = set(); scan_day = None; startup_scanned = False
     print("Scanner loop started")
     while True:
         try:
             _hb("scanner_loop")
             now  = now_et(); hour = now.hour; day = now.date()
-            if day != scan_day: scan_done.clear(); scan_day = day
-            if (now.weekday()<5 and hour in SCAN_HOURS
-                    and hour not in scan_done and in_trading_window()):
-                scan_done.add(hour)
-                print(f"Scanner at {now.strftime('%H:%M')} ET...")
+            if day != scan_day:
+                scan_done.clear(); scan_day = day; startup_scanned = False
+            # Run immediately on the first market-hours iteration so a mid-day
+            # deploy doesn't leave active_tickers empty until the next SCAN_HOURS slot.
+            need_startup = (not startup_scanned and now.weekday() < 5
+                            and is_market_open() and in_trading_window())
+            need_hourly  = (now.weekday() < 5 and hour in SCAN_HOURS
+                            and hour not in scan_done and in_trading_window())
+            if need_startup or need_hourly:
+                startup_scanned = True
+                if need_hourly: scan_done.add(hour)
+                tag = " (startup)" if need_startup and not need_hourly else ""
+                print(f"Scanner at {now.strftime('%H:%M')} ET{tag}...")
                 try:
                     update_market_regime()
                     acct_size = get_account_size()
@@ -2170,7 +2179,7 @@ def restore_pdt_state():
     global daily_trade_count, daily_trade_date
     try:
         count, ws, rd = count_rolling_day_trades()
-        print(f"PDT rolling window: {count}/3 day trades "
+        print(f"PDT rolling window: {count}/{MAX_DAILY_TRADES} day trades "
               f"(window starts {ws}"
               + (f", resets {rd}" if rd else "") + ")")
         today       = now_et().date()
