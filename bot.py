@@ -89,7 +89,7 @@ PRED_HOURS           = [9, 10, 11, 12, 13, 14]   # refresh every hour during tra
 PRED_MAX_AGE_SECS    = 5400                        # 90 min — treat stale prediction as neutral
 MACRO_REFRESH_HOURS  = [8, 12]
 MIN_PROFIT_PCT       = 0.04
-MAX_DAILY_TRADES     = 3
+MAX_DAILY_TRADES     = 10
 GAP_MIN_PCT          = 2.0
 GAP_MAX_PCT          = 15.0
 GAP_MIN_RVOL          = 1.5
@@ -1124,7 +1124,7 @@ def execute(ticker, action, price, signals, reason="signal"):
 
             dt_count, _, dt_reset = count_rolling_day_trades()
             if dt_count >= MAX_DAILY_TRADES:
-                print(f"  PDT limit: {dt_count}/3 day trades in rolling 5-day window"
+                print(f"  PDT limit: {dt_count}/{MAX_DAILY_TRADES} day trades in rolling 5-day window"
                       + (f" — resets {dt_reset}" if dt_reset else "")); return
 
             acct_size = get_account_size()
@@ -2170,7 +2170,7 @@ def restore_pdt_state():
     global daily_trade_count, daily_trade_date
     try:
         count, ws, rd = count_rolling_day_trades()
-        print(f"PDT rolling window: {count}/3 day trades "
+        print(f"PDT rolling window: {count}/{MAX_DAILY_TRADES} day trades "
               f"(window starts {ws}"
               + (f", resets {rd}" if rd else "") + ")")
         today       = now_et().date()
