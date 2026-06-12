@@ -7,6 +7,8 @@ import alpaca_trade_api as tradeapi
 from flask import Flask, render_template, jsonify
 from flask_socketio import SocketIO
 
+from ops_reviewer import _ops_stats, build_ops_findings, analyze_with_claude as _ai_analyze
+
 from database import (
     init_db, save_trade_open, save_trade_close, save_partial_exit,
     get_recent_trades, get_trade_stats_from_db, save_signal_performance,
@@ -174,6 +176,24 @@ _bot_start_time    = time.time()
 _api_last_success  = 0.0
 
 NY = pytz.timezone("America/New_York")
+
+
+def _reset_ops_stats_if_new_day():
+    """Reset _ops_stats at the start of each new trading day."""
+    try:
+        today = now_et().date()
+        if _ops_stats["date"] != today:
+            _ops_stats.update({
+                "date":                today,
+                "daily_limit_hits":    {},
+                "filter_blocks":       {},
+                "finbert_errors":      0,
+                "finbert_method":      None,
+                "scan_tickers":        [],
+                "blocked_buy_tickers": set(),
+            })
+    except Exception:
+        pass
 
 # ── Time helpers ──────────────────────────────────────────────
 
@@ -674,7 +694,12 @@ def passes_filters(ticker, price, account_size=None):
     ceiling = get_price_ceiling(account_size)
     min_vol = get_min_volume(account_size)
     if not(floor<=price<=ceiling):
-        print(f"  {ticker} ${price:.2f} outside range ${floor}–${ceiling}"); return False
+        print(f"  {ticker} ${price:.2f} outside range ${floor}–${ceiling}")
+        try:
+            _ops_stats["filter_blocks"]["price_range"] = _ops_stats["filter_blocks"].get("price_range", 0) + 1
+        except Exception:
+            pass
+        return False
     grade = ticker_grades.get(ticker)
     if grade and grade not in MIN_GRADE:
         print(f"  {ticker} grade {grade} excluded"); return False
@@ -686,7 +711,12 @@ def passes_filters(ticker, price, account_size=None):
     # 0.10x–RVOL_THRESHOLD → genuinely thin stock → block.
     rvol = rvol_cache.get(ticker)
     if rvol is not None and rvol >= 0.10 and rvol < RVOL_THRESHOLD:
-        print(f"  {ticker} rvol {rvol:.2f}x low (< {RVOL_THRESHOLD}x)"); return False
+        print(f"  {ticker} rvol {rvol:.2f}x low (< {RVOL_THRESHOLD}x)")
+        try:
+            _ops_stats["filter_blocks"]["rvol"] = _ops_stats["filter_blocks"].get("rvol", 0) + 1
+        except Exception:
+            pass
+        return False
 
     # Gap plays with strong intraday RVOL bypass the historical daily volume check
     if (gap_candidates.get(ticker, {}).get("direction") == "up" and
@@ -698,7 +728,12 @@ def passes_filters(ticker, price, account_size=None):
     cached_vol = _vol_check_cache.get(ticker)
     if cached_vol and cached_vol[0] == today_str:
         if not cached_vol[1]:
-            print(f"  {ticker} low volume (cached)"); return False
+            print(f"  {ticker} low volume (cached)")
+            try:
+                _ops_stats["filter_blocks"]["volume"] = _ops_stats["filter_blocks"].get("volume", 0) + 1
+            except Exception:
+                pass
+            return False
         return True
     try:
         end   = datetime.now(pytz.utc) - timedelta(minutes=20)
@@ -709,14 +744,30 @@ def passes_filters(ticker, price, account_size=None):
                     limit=5, feed="iex").df
         if bars is None or bars.empty:
             print(f"  {ticker} volume check: IEX returned no bars — low volume assumed")
-            _vol_check_cache[ticker] = (today_str, False); return False
+            _vol_check_cache[ticker] = (today_str, False)
+            try:
+                _ops_stats["filter_blocks"]["volume"] = _ops_stats["filter_blocks"].get("volume", 0) + 1
+            except Exception:
+                pass
+            return False
         if hasattr(bars.index,'levels'):
             if ticker in bars.index.get_level_values(0): bars=bars.loc[ticker]
-            else: _vol_check_cache[ticker] = (today_str, False); return False
+            else:
+                _vol_check_cache[ticker] = (today_str, False)
+                try:
+                    _ops_stats["filter_blocks"]["volume"] = _ops_stats["filter_blocks"].get("volume", 0) + 1
+                except Exception:
+                    pass
+                return False
         passed = float(bars["volume"].mean()) >= min_vol
         _vol_check_cache[ticker] = (today_str, passed)
         if not passed:
-            print(f"  {ticker} low volume"); return False
+            print(f"  {ticker} low volume")
+            try:
+                _ops_stats["filter_blocks"]["volume"] = _ops_stats["filter_blocks"].get("volume", 0) + 1
+            except Exception:
+                pass
+            return False
         return True
     except Exception as e:
         print(f"  Filter error {ticker}: {e}"); return False
@@ -1173,7 +1224,14 @@ def execute(ticker, action, price, signals, reason="signal"):
                 if daily_trade_date != today:
                     daily_trade_count = 0; daily_trade_date = today
                 if daily_trade_count >= MAX_DAILY_TRADES:
-                    print(f"  Daily limit reached (race)"); return
+                    print(f"  Daily limit reached (race)")
+                    try:
+                        _reset_ops_stats_if_new_day()
+                        _ops_stats["daily_limit_hits"][ticker] = _ops_stats["daily_limit_hits"].get(ticker, 0) + 1
+                        _ops_stats["blocked_buy_tickers"].add(ticker)
+                    except Exception:
+                        pass
+                    return
                 daily_trade_count += 1
                 current_count = daily_trade_count
 
@@ -1278,6 +1336,10 @@ def apply_scan_results(results_today, acct_size=None):
             volume_history[t] = vh if vh else []
         active_tickers = new_tickers
         print(f"Active tickers updated: {active_tickers}")
+        try:
+            _ops_stats["scan_tickers"] = new_tickers
+        except Exception:
+            pass
         try:
             scores = {s["ticker"]:s["score"] for s in affordable[:5]}
             save_scan_result(new_tickers, scores)
@@ -2011,10 +2073,51 @@ def review_data():
     try:
         from trade_reviewer import get_trade_review
         trades = get_recent_trades(days=30)
-        return jsonify(get_trade_review(trades))
+        trade_rev = get_trade_review(trades)
+
+        ops_findings = build_ops_findings(
+            _ops_stats, rvol_cache, prediction_cache,
+            active_tickers, market_regime
+        )
+
+        return jsonify({
+            **trade_rev,
+            "ops_findings": ops_findings,
+            "ops_snapshot": {
+                "daily_limit_hits": dict(_ops_stats.get("daily_limit_hits", {})),
+                "filter_blocks":    dict(_ops_stats.get("filter_blocks", {})),
+                "finbert_method":   _ops_stats.get("finbert_method"),
+                "scan_tickers":     _ops_stats.get("scan_tickers", []),
+                "blocked_buys":     list(_ops_stats.get("blocked_buy_tickers", set())),
+                "active_tickers":   list(active_tickers),
+                "regime":           market_regime,
+                "rvol_zero_pct":    round(
+                    sum(1 for v in rvol_cache.values() if not v) /
+                    max(len(rvol_cache), 1) * 100, 1
+                ),
+            }
+        })
     except Exception as e:
         return jsonify({"error": str(e), "suggestions": [{"priority":"ERROR","area":"System",
                         "finding": str(e), "action":"Check server logs"}]})
+
+@app.route("/review/ai")
+def review_ai():
+    try:
+        from trade_reviewer import get_trade_review
+        trades = get_recent_trades(days=7)
+        trade_rev = get_trade_review(trades)
+        ops_snap = {
+            "daily_limit_hits": dict(_ops_stats.get("daily_limit_hits", {})),
+            "filter_blocks": dict(_ops_stats.get("filter_blocks", {})),
+            "finbert_method": _ops_stats.get("finbert_method"),
+            "active_tickers": list(active_tickers),
+            "regime": market_regime,
+        }
+        findings = _ai_analyze(ops_snap, trade_rev.get("summary", {}))
+        return jsonify({"findings": findings, "has_key": bool(os.environ.get("ANTHROPIC_API_KEY"))})
+    except Exception as e:
+        return jsonify({"findings": None, "error": str(e)})
 
 @app.route("/ping")
 def ping(): return "pong", 200
