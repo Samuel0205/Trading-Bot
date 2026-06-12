@@ -92,6 +92,8 @@ PRED_MAX_AGE_SECS    = 5400                        # 90 min — treat stale pred
 MACRO_REFRESH_HOURS  = [8, 12]
 MIN_PROFIT_PCT       = 0.04
 MAX_DAILY_TRADES     = 10
+TRADE_WINDOW_SECS    = 7200   # 2-hour rolling window for trade spreading
+MAX_WINDOW_TRADES    = 4      # max new entries in any 2-hour window
 GAP_MIN_PCT          = 2.0
 GAP_MAX_PCT          = 15.0
 GAP_MIN_RVOL          = 1.5
@@ -148,6 +150,7 @@ _daily_stop_counts = {}   # ticker → {date_str: count}  (anti-chop gate)
 unusual_volume    = []
 daily_trade_count = 0
 daily_trade_date  = None
+_trade_window_times  = []     # buy timestamps in rolling window (guarded by _trade_count_lock)
 last_db_snapshot  = 0
 signal_weights    = dict(BASE_SIGNAL_WEIGHTS)
 
@@ -1122,6 +1125,7 @@ def check_pending_orders():
                 if removed:
                     with _trade_count_lock:
                         daily_trade_count = max(0, daily_trade_count - 1)
+                        if _trade_window_times: _trade_window_times.pop()
                     print(f"  Limit order {status}: {removed['ticker']} — count rolled back")
 
             elif time.time() - pdata["submitted_at"] > ORDER_FILL_TIMEOUT:
@@ -1232,8 +1236,18 @@ def execute(ticker, action, price, signals, reason="signal"):
                     except Exception:
                         pass
                     return
+                # Rolling 2-hour window throttle — spread entries across the trading day
+                # so the full daily budget isn't consumed in the first session
+                _now_ts = time.time()
+                _trade_window_times[:] = [t for t in _trade_window_times
+                                          if t >= _now_ts - TRADE_WINDOW_SECS]
+                if len(_trade_window_times) >= MAX_WINDOW_TRADES:
+                    print(f"  Window limit: {len(_trade_window_times)}/{MAX_WINDOW_TRADES} "
+                          f"trades in last {TRADE_WINDOW_SECS//60}min")
+                    return
                 daily_trade_count += 1
                 current_count = daily_trade_count
+                _trade_window_times.append(_now_ts)
 
             # Final race check — roll back count if position appeared concurrently
             with _positions_lock:
@@ -1241,6 +1255,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                     print(f"  {ticker} position opened concurrently, skipping")
                     with _trade_count_lock:
                         daily_trade_count = max(0, daily_trade_count - 1)
+                        if _trade_window_times: _trade_window_times.pop()
                     return
 
             # Submit as limit order at 0.3% above current price.
@@ -1259,6 +1274,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                 print(f"  Order failed {ticker}: {order_err}")
                 with _trade_count_lock:
                     daily_trade_count = max(0, daily_trade_count - 1)
+                    if _trade_window_times: _trade_window_times.pop()
                 return
 
             with _pending_lock:
