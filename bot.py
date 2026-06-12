@@ -92,6 +92,8 @@ PRED_MAX_AGE_SECS    = 5400                        # 90 min — treat stale pred
 MACRO_REFRESH_HOURS  = [8, 12]
 MIN_PROFIT_PCT       = 0.04
 MAX_DAILY_TRADES     = 10
+PDT_MAX              = 3      # PDT rule: max 3 day trades per rolling 5-business-day window
+PDT_ACCOUNT_LIMIT    = 25_000 # PDT only applies to accounts below this equity threshold
 TRADE_WINDOW_SECS    = 7200   # 2-hour rolling window for trade spreading
 MAX_WINDOW_TRADES    = 4      # max new entries in any 2-hour window
 GAP_MIN_PCT          = 2.0
@@ -146,7 +148,8 @@ ticker_grades     = {}
 gap_candidates    = {}
 catalyst_cache    = {}
 rvol_cache        = {}
-_daily_stop_counts = {}   # ticker → {date_str: count}  (anti-chop gate)
+_daily_stop_counts     = {}   # ticker → {date_str: count}  (anti-chop gate)
+_daily_ticker_dt_counts = {}  # ticker → {date_str: count}  (day trades per ticker per day)
 unusual_volume    = []
 daily_trade_count = 0
 daily_trade_date  = None
@@ -929,6 +932,15 @@ def force_sell(ticker, price, reason="stop_loss"):
                 print(f"  CHOP BLOCK: {ticker} stopped out {stops_today}x today — "
                       f"blocked for the rest of the day")
 
+        # Track per-ticker day trades (opened and closed same calendar day)
+        if reason != "eod_close":
+            today_str = now_et().strftime("%Y-%m-%d")
+            if pos_data.get("opened_date") == today_str:
+                _daily_ticker_dt_counts.setdefault(ticker, {})
+                _daily_ticker_dt_counts[ticker][today_str] = (
+                    _daily_ticker_dt_counts[ticker].get(today_str, 0) + 1
+                )
+
         wr   = get_trade_stats_from_db().get("win_rate", 0)
         mode = "🔴 LIVE" if LIVE_MODE else "PAPER"
         print(f"{mode} SELL {qty}x {ticker} @ ${price:.2f} "
@@ -1074,6 +1086,7 @@ def _register_filled_order(order_id, fill_price):
             "qty": qty, "atr": atr, "active_signals": active_sigs,
             "partial_done": False, "is_gap_play": is_gap_play,
             "highest_price": fill_price,
+            "opened_date": now_et().strftime("%Y-%m-%d"),
         }
 
     try:
@@ -1178,12 +1191,20 @@ def execute(ticker, action, price, signals, reason="signal"):
             if earn_risk == "high":
                 print(f"  {ticker} earnings risk HIGH — skipping"); return
 
-            dt_count, _, dt_reset = count_rolling_day_trades()
-            if dt_count >= MAX_DAILY_TRADES:
-                print(f"  PDT limit: {dt_count}/{MAX_DAILY_TRADES} day trades in rolling 5-day window"
-                      + (f" — resets {dt_reset}" if dt_reset else "")); return
-
             acct_size = get_account_size()
+            dt_count = 0
+            if acct_size < PDT_ACCOUNT_LIMIT:
+                dt_count, _, dt_reset = count_rolling_day_trades()
+                if dt_count >= PDT_MAX:
+                    print(f"  PDT limit: {dt_count}/{PDT_MAX} day trades in rolling 5-day window"
+                          + (f" — resets {dt_reset}" if dt_reset else "")); return
+
+            # Per-ticker day trade gate: one complete round-trip per ticker per day
+            today_str = now_et().strftime("%Y-%m-%d")
+            ticker_dts = _daily_ticker_dt_counts.get(ticker, {}).get(today_str, 0)
+            if ticker_dts >= 1:
+                print(f"  {ticker} already day-traded today — skipping re-entry")
+                return
             if not passes_filters(ticker, price, acct_size):
                 return  # passes_filters already prints its reason
 
@@ -1299,7 +1320,8 @@ def execute(ticker, action, price, signals, reason="signal"):
             mode = "🔴 LIVE" if LIVE_MODE else "PAPER"
             print(f"{mode} LIMIT ORDER {qty}x {ticker} @ ${limit_price:.3f} "
                   f"SL${stop} TP${target} pred={pred_score:+.0f} "
-                  f"#{current_count}/{MAX_DAILY_TRADES} PDT:{dt_count+1}/3")
+                  f"#{current_count}/{MAX_DAILY_TRADES}"
+                  + (f" PDT:{dt_count+1}/{PDT_MAX}" if acct_size < PDT_ACCOUNT_LIMIT else ""))
 
         elif action == "sell" and ticker in open_positions:
             force_sell(ticker, price, reason=reason or "signal")

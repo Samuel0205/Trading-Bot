@@ -74,8 +74,9 @@ def _get_account_size(api):
         return MAX_ACCOUNT
 
 def _price_floor(account_size):
-    if account_size > 100: return 2.00
-    if account_size > 20:  return 1.00
+    if account_size > 10_000: return 3.00   # matches bot.py get_price_floor()
+    if account_size > 100:    return 2.00
+    if account_size > 20:     return 1.00
     return 0.50
 
 def _price_ceiling(account_size):
