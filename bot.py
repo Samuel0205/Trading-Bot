@@ -7,6 +7,8 @@ import alpaca_trade_api as tradeapi
 from flask import Flask, render_template, jsonify
 from flask_socketio import SocketIO
 
+from ops_reviewer import _ops_stats, build_ops_findings, analyze_with_claude as _ai_analyze
+
 from database import (
     init_db, save_trade_open, save_trade_close, save_partial_exit,
     get_recent_trades, get_trade_stats_from_db, save_signal_performance,
@@ -90,6 +92,10 @@ PRED_MAX_AGE_SECS    = 5400                        # 90 min — treat stale pred
 MACRO_REFRESH_HOURS  = [8, 12]
 MIN_PROFIT_PCT       = 0.04
 MAX_DAILY_TRADES     = 10
+PDT_MAX              = 3      # PDT rule: max 3 day trades per rolling 5-business-day window
+PDT_ACCOUNT_LIMIT    = 25_000 # PDT only applies to accounts below this equity threshold
+TRADE_WINDOW_SECS    = 7200   # 2-hour rolling window for trade spreading
+MAX_WINDOW_TRADES    = 4      # max new entries in any 2-hour window
 GAP_MIN_PCT          = 2.0
 GAP_MAX_PCT          = 15.0
 GAP_MIN_RVOL          = 1.5
@@ -142,10 +148,12 @@ ticker_grades     = {}
 gap_candidates    = {}
 catalyst_cache    = {}
 rvol_cache        = {}
-_daily_stop_counts = {}   # ticker → {date_str: count}  (anti-chop gate)
+_daily_stop_counts     = {}   # ticker → {date_str: count}  (anti-chop gate)
+_daily_ticker_dt_counts = {}  # ticker → {date_str: count}  (day trades per ticker per day)
 unusual_volume    = []
 daily_trade_count = 0
 daily_trade_date  = None
+_trade_window_times  = []     # buy timestamps in rolling window (guarded by _trade_count_lock)
 last_db_snapshot  = 0
 signal_weights    = dict(BASE_SIGNAL_WEIGHTS)
 
@@ -174,6 +182,24 @@ _bot_start_time    = time.time()
 _api_last_success  = 0.0
 
 NY = pytz.timezone("America/New_York")
+
+
+def _reset_ops_stats_if_new_day():
+    """Reset _ops_stats at the start of each new trading day."""
+    try:
+        today = now_et().date()
+        if _ops_stats["date"] != today:
+            _ops_stats.update({
+                "date":                today,
+                "daily_limit_hits":    {},
+                "filter_blocks":       {},
+                "finbert_errors":      0,
+                "finbert_method":      None,
+                "scan_tickers":        [],
+                "blocked_buy_tickers": set(),
+            })
+    except Exception:
+        pass
 
 # ── Time helpers ──────────────────────────────────────────────
 
@@ -674,7 +700,12 @@ def passes_filters(ticker, price, account_size=None):
     ceiling = get_price_ceiling(account_size)
     min_vol = get_min_volume(account_size)
     if not(floor<=price<=ceiling):
-        print(f"  {ticker} ${price:.2f} outside range ${floor}–${ceiling}"); return False
+        print(f"  {ticker} ${price:.2f} outside range ${floor}–${ceiling}")
+        try:
+            _ops_stats["filter_blocks"]["price_range"] = _ops_stats["filter_blocks"].get("price_range", 0) + 1
+        except Exception:
+            pass
+        return False
     grade = ticker_grades.get(ticker)
     if grade and grade not in MIN_GRADE:
         print(f"  {ticker} grade {grade} excluded"); return False
@@ -686,7 +717,12 @@ def passes_filters(ticker, price, account_size=None):
     # 0.10x–RVOL_THRESHOLD → genuinely thin stock → block.
     rvol = rvol_cache.get(ticker)
     if rvol is not None and rvol >= 0.10 and rvol < RVOL_THRESHOLD:
-        print(f"  {ticker} rvol {rvol:.2f}x low (< {RVOL_THRESHOLD}x)"); return False
+        print(f"  {ticker} rvol {rvol:.2f}x low (< {RVOL_THRESHOLD}x)")
+        try:
+            _ops_stats["filter_blocks"]["rvol"] = _ops_stats["filter_blocks"].get("rvol", 0) + 1
+        except Exception:
+            pass
+        return False
 
     # Gap plays with strong intraday RVOL bypass the historical daily volume check
     if (gap_candidates.get(ticker, {}).get("direction") == "up" and
@@ -698,7 +734,12 @@ def passes_filters(ticker, price, account_size=None):
     cached_vol = _vol_check_cache.get(ticker)
     if cached_vol and cached_vol[0] == today_str:
         if not cached_vol[1]:
-            print(f"  {ticker} low volume (cached)"); return False
+            print(f"  {ticker} low volume (cached)")
+            try:
+                _ops_stats["filter_blocks"]["volume"] = _ops_stats["filter_blocks"].get("volume", 0) + 1
+            except Exception:
+                pass
+            return False
         return True
     try:
         end   = datetime.now(pytz.utc) - timedelta(minutes=20)
@@ -709,14 +750,30 @@ def passes_filters(ticker, price, account_size=None):
                     limit=5, feed="iex").df
         if bars is None or bars.empty:
             print(f"  {ticker} volume check: IEX returned no bars — low volume assumed")
-            _vol_check_cache[ticker] = (today_str, False); return False
+            _vol_check_cache[ticker] = (today_str, False)
+            try:
+                _ops_stats["filter_blocks"]["volume"] = _ops_stats["filter_blocks"].get("volume", 0) + 1
+            except Exception:
+                pass
+            return False
         if hasattr(bars.index,'levels'):
             if ticker in bars.index.get_level_values(0): bars=bars.loc[ticker]
-            else: _vol_check_cache[ticker] = (today_str, False); return False
+            else:
+                _vol_check_cache[ticker] = (today_str, False)
+                try:
+                    _ops_stats["filter_blocks"]["volume"] = _ops_stats["filter_blocks"].get("volume", 0) + 1
+                except Exception:
+                    pass
+                return False
         passed = float(bars["volume"].mean()) >= min_vol
         _vol_check_cache[ticker] = (today_str, passed)
         if not passed:
-            print(f"  {ticker} low volume"); return False
+            print(f"  {ticker} low volume")
+            try:
+                _ops_stats["filter_blocks"]["volume"] = _ops_stats["filter_blocks"].get("volume", 0) + 1
+            except Exception:
+                pass
+            return False
         return True
     except Exception as e:
         print(f"  Filter error {ticker}: {e}"); return False
@@ -875,6 +932,15 @@ def force_sell(ticker, price, reason="stop_loss"):
                 print(f"  CHOP BLOCK: {ticker} stopped out {stops_today}x today — "
                       f"blocked for the rest of the day")
 
+        # Track per-ticker day trades (opened and closed same calendar day)
+        if reason != "eod_close":
+            today_str = now_et().strftime("%Y-%m-%d")
+            if pos_data.get("opened_date") == today_str:
+                _daily_ticker_dt_counts.setdefault(ticker, {})
+                _daily_ticker_dt_counts[ticker][today_str] = (
+                    _daily_ticker_dt_counts[ticker].get(today_str, 0) + 1
+                )
+
         wr   = get_trade_stats_from_db().get("win_rate", 0)
         mode = "🔴 LIVE" if LIVE_MODE else "PAPER"
         print(f"{mode} SELL {qty}x {ticker} @ ${price:.2f} "
@@ -1020,6 +1086,7 @@ def _register_filled_order(order_id, fill_price):
             "qty": qty, "atr": atr, "active_signals": active_sigs,
             "partial_done": False, "is_gap_play": is_gap_play,
             "highest_price": fill_price,
+            "opened_date": now_et().strftime("%Y-%m-%d"),
         }
 
     try:
@@ -1071,6 +1138,7 @@ def check_pending_orders():
                 if removed:
                     with _trade_count_lock:
                         daily_trade_count = max(0, daily_trade_count - 1)
+                        if _trade_window_times: _trade_window_times.pop()
                     print(f"  Limit order {status}: {removed['ticker']} — count rolled back")
 
             elif time.time() - pdata["submitted_at"] > ORDER_FILL_TIMEOUT:
@@ -1123,12 +1191,20 @@ def execute(ticker, action, price, signals, reason="signal"):
             if earn_risk == "high":
                 print(f"  {ticker} earnings risk HIGH — skipping"); return
 
-            dt_count, _, dt_reset = count_rolling_day_trades()
-            if dt_count >= MAX_DAILY_TRADES:
-                print(f"  PDT limit: {dt_count}/{MAX_DAILY_TRADES} day trades in rolling 5-day window"
-                      + (f" — resets {dt_reset}" if dt_reset else "")); return
-
             acct_size = get_account_size()
+            dt_count = 0
+            if acct_size < PDT_ACCOUNT_LIMIT:
+                dt_count, _, dt_reset = count_rolling_day_trades()
+                if dt_count >= PDT_MAX:
+                    print(f"  PDT limit: {dt_count}/{PDT_MAX} day trades in rolling 5-day window"
+                          + (f" — resets {dt_reset}" if dt_reset else "")); return
+
+            # Per-ticker day trade gate: one complete round-trip per ticker per day
+            today_str = now_et().strftime("%Y-%m-%d")
+            ticker_dts = _daily_ticker_dt_counts.get(ticker, {}).get(today_str, 0)
+            if ticker_dts >= 1:
+                print(f"  {ticker} already day-traded today — skipping re-entry")
+                return
             if not passes_filters(ticker, price, acct_size):
                 return  # passes_filters already prints its reason
 
@@ -1173,9 +1249,26 @@ def execute(ticker, action, price, signals, reason="signal"):
                 if daily_trade_date != today:
                     daily_trade_count = 0; daily_trade_date = today
                 if daily_trade_count >= MAX_DAILY_TRADES:
-                    print(f"  Daily limit reached (race)"); return
+                    print(f"  Daily limit reached (race)")
+                    try:
+                        _reset_ops_stats_if_new_day()
+                        _ops_stats["daily_limit_hits"][ticker] = _ops_stats["daily_limit_hits"].get(ticker, 0) + 1
+                        _ops_stats["blocked_buy_tickers"].add(ticker)
+                    except Exception:
+                        pass
+                    return
+                # Rolling 2-hour window throttle — spread entries across the trading day
+                # so the full daily budget isn't consumed in the first session
+                _now_ts = time.time()
+                _trade_window_times[:] = [t for t in _trade_window_times
+                                          if t >= _now_ts - TRADE_WINDOW_SECS]
+                if len(_trade_window_times) >= MAX_WINDOW_TRADES:
+                    print(f"  Window limit: {len(_trade_window_times)}/{MAX_WINDOW_TRADES} "
+                          f"trades in last {TRADE_WINDOW_SECS//60}min")
+                    return
                 daily_trade_count += 1
                 current_count = daily_trade_count
+                _trade_window_times.append(_now_ts)
 
             # Final race check — roll back count if position appeared concurrently
             with _positions_lock:
@@ -1183,6 +1276,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                     print(f"  {ticker} position opened concurrently, skipping")
                     with _trade_count_lock:
                         daily_trade_count = max(0, daily_trade_count - 1)
+                        if _trade_window_times: _trade_window_times.pop()
                     return
 
             # Submit as limit order at 0.3% above current price.
@@ -1201,6 +1295,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                 print(f"  Order failed {ticker}: {order_err}")
                 with _trade_count_lock:
                     daily_trade_count = max(0, daily_trade_count - 1)
+                    if _trade_window_times: _trade_window_times.pop()
                 return
 
             with _pending_lock:
@@ -1225,7 +1320,8 @@ def execute(ticker, action, price, signals, reason="signal"):
             mode = "🔴 LIVE" if LIVE_MODE else "PAPER"
             print(f"{mode} LIMIT ORDER {qty}x {ticker} @ ${limit_price:.3f} "
                   f"SL${stop} TP${target} pred={pred_score:+.0f} "
-                  f"#{current_count}/{MAX_DAILY_TRADES} PDT:{dt_count+1}/3")
+                  f"#{current_count}/{MAX_DAILY_TRADES}"
+                  + (f" PDT:{dt_count+1}/{PDT_MAX}" if acct_size < PDT_ACCOUNT_LIMIT else ""))
 
         elif action == "sell" and ticker in open_positions:
             force_sell(ticker, price, reason=reason or "signal")
@@ -1269,8 +1365,8 @@ def apply_scan_results(results_today, acct_size=None):
                   if get_price_floor(acct_size)<=s["price"]<=get_price_ceiling(acct_size)
                   and s.get("grade","F") in MIN_GRADE]
     if affordable:
-        new_tickers = [s["ticker"] for s in affordable[:5]]
-        for s in affordable[:5]:
+        new_tickers = [s["ticker"] for s in affordable[:8]]
+        for s in affordable[:8]:
             ticker_grades[s["ticker"]] = s.get("grade","C")
         for t in new_tickers:
             ph, vh = load_price_history(t)
@@ -1279,7 +1375,11 @@ def apply_scan_results(results_today, acct_size=None):
         active_tickers = new_tickers
         print(f"Active tickers updated: {active_tickers}")
         try:
-            scores = {s["ticker"]:s["score"] for s in affordable[:5]}
+            _ops_stats["scan_tickers"] = new_tickers
+        except Exception:
+            pass
+        try:
+            scores = {s["ticker"]:s["score"] for s in affordable[:8]}
             save_scan_result(new_tickers, scores)
         except: pass
 
@@ -1338,7 +1438,7 @@ def promote_rvol_tickers():
             t = p["ticker"]
             if t not in active_tickers:
                 # Replace last ticker in list (lowest priority)
-                if len(active_tickers) >= 5:
+                if len(active_tickers) >= 8:
                     removed = active_tickers[-1]
                     active_tickers = active_tickers[:-1]
                     print(f"  Swapped {removed} → {t} (rvol {p['rvol']}x)")
@@ -2011,10 +2111,51 @@ def review_data():
     try:
         from trade_reviewer import get_trade_review
         trades = get_recent_trades(days=30)
-        return jsonify(get_trade_review(trades))
+        trade_rev = get_trade_review(trades)
+
+        ops_findings = build_ops_findings(
+            _ops_stats, rvol_cache, prediction_cache,
+            active_tickers, market_regime
+        )
+
+        return jsonify({
+            **trade_rev,
+            "ops_findings": ops_findings,
+            "ops_snapshot": {
+                "daily_limit_hits": dict(_ops_stats.get("daily_limit_hits", {})),
+                "filter_blocks":    dict(_ops_stats.get("filter_blocks", {})),
+                "finbert_method":   _ops_stats.get("finbert_method"),
+                "scan_tickers":     _ops_stats.get("scan_tickers", []),
+                "blocked_buys":     list(_ops_stats.get("blocked_buy_tickers", set())),
+                "active_tickers":   list(active_tickers),
+                "regime":           market_regime,
+                "rvol_zero_pct":    round(
+                    sum(1 for v in rvol_cache.values() if not v) /
+                    max(len(rvol_cache), 1) * 100, 1
+                ),
+            }
+        })
     except Exception as e:
         return jsonify({"error": str(e), "suggestions": [{"priority":"ERROR","area":"System",
                         "finding": str(e), "action":"Check server logs"}]})
+
+@app.route("/review/ai")
+def review_ai():
+    try:
+        from trade_reviewer import get_trade_review
+        trades = get_recent_trades(days=7)
+        trade_rev = get_trade_review(trades)
+        ops_snap = {
+            "daily_limit_hits": dict(_ops_stats.get("daily_limit_hits", {})),
+            "filter_blocks": dict(_ops_stats.get("filter_blocks", {})),
+            "finbert_method": _ops_stats.get("finbert_method"),
+            "active_tickers": list(active_tickers),
+            "regime": market_regime,
+        }
+        findings = _ai_analyze(ops_snap, trade_rev.get("summary", {}))
+        return jsonify({"findings": findings, "has_key": bool(os.environ.get("ANTHROPIC_API_KEY"))})
+    except Exception as e:
+        return jsonify({"findings": None, "error": str(e)})
 
 @app.route("/ping")
 def ping(): return "pong", 200

@@ -60,6 +60,44 @@ SEED_UNIVERSE = [
 ]
 SEED_UNIVERSE = list(dict.fromkeys(SEED_UNIVERSE))  # deduplicate, preserve order
 
+# ── Extended universe — sectors not covered by SEED ───────────
+# Sub-$50 liquid stocks covering missed opportunity categories.
+# Must NOT duplicate SEED_UNIVERSE entries (checked at build time via `seen` set).
+
+EXTENDED_UNIVERSE = [
+    # Space / launch
+    "RKLB", "ASTS", "LUNR", "RDW", "ACHR",
+    # AI / data
+    "AI", "SOUN", "BBAI", "IONQ",
+    # Biotech catalysts
+    "NVAX", "RCKT", "NTLA", "BHVN",
+    # Crypto mining (beyond SEED)
+    "HIVE", "BTBT", "WULF",
+    # Affordable semis
+    "WOLF", "SITM", "FORM",
+    # Consumer momentum
+    "GME", "BYND", "HIMS",
+    # EV charging
+    "BLNK", "EVGO", "BEEM",
+]
+EXTENDED_UNIVERSE = [t for t in dict.fromkeys(EXTENDED_UNIVERSE)
+                     if t not in set(SEED_UNIVERSE)]
+
+# ── Sector groups — for peer injection ───────────────────────
+
+SECTOR_GROUPS = {
+    "ev":      ["NIO","XPEV","LI","RIVN","LCID","JOBY","ACHR"],
+    "crypto":  ["MARA","RIOT","CLSK","BITF","CIFR","HIVE","BTBT","WULF"],
+    "fintech": ["SOFI","HOOD","AFRM","UPST","DKNG","PSFE"],
+    "space":   ["RKLB","ASTS","LUNR","RDW"],
+    "ai":      ["PLTR","AI","SOUN","BBAI","IONQ"],
+    "metals":  ["GOLD","KGC","HL","AG","PAAS","SILV","EGO","CDE"],
+    "biotech": ["OCGN","NVAX","RCKT","NTLA","BHVN"],
+    "clean":   ["NOVA","ARRY","MAXN","SHLS","STEM","ENPH"],
+}
+# Reverse map: ticker → sector group name
+TICKER_SECTOR = {t: g for g, tickers in SECTOR_GROUPS.items() for t in tickers}
+
 # ── Account sizing (no import from app — avoids circular import) ──
 
 def _get_account_size(api):
@@ -74,8 +112,9 @@ def _get_account_size(api):
         return MAX_ACCOUNT
 
 def _price_floor(account_size):
-    if account_size > 100: return 2.00
-    if account_size > 20:  return 1.00
+    if account_size > 10_000: return 3.00   # matches bot.py get_price_floor()
+    if account_size > 100:    return 2.00
+    if account_size > 20:     return 1.00
     return 0.50
 
 def _price_ceiling(account_size):
@@ -124,6 +163,104 @@ def extract_sym(bars_df, sym):
     except:
         return None
 
+# ── News-driven universe builder ─────────────────────────────
+
+def get_news_universe(api):
+    """
+    Fetch recent market-wide news, count ticker mentions, and return
+    the top mentioned tickers that have verifiable price data.
+    Returns list of {symbol, price, volume} dicts.
+    """
+    try:
+        end   = datetime.now(pytz.utc)
+        start = end - timedelta(days=1)
+        ss    = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        es    = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        news = None
+        for sym_arg in [None, "", []]:
+            try:
+                if sym_arg is None:
+                    news = api.get_news(None, start=ss, end=es, limit=100)
+                elif sym_arg == "":
+                    news = api.get_news("", start=ss, end=es, limit=100)
+                else:
+                    news = api.get_news(sym_arg, start=ss, end=es, limit=100)
+                if news is not None:
+                    break
+            except Exception:
+                continue
+
+        if not news:
+            return []
+
+        # Count ticker mentions across all articles
+        mention_counts = {}
+        for article in news:
+            for sym in getattr(article, "symbols", []) or []:
+                if not isinstance(sym, str):
+                    continue
+                sym = sym.upper().strip()
+                # Filter: 1–5 chars, all uppercase letters only
+                if 1 <= len(sym) <= 5 and sym.isalpha() and sym.isupper():
+                    mention_counts[sym] = mention_counts.get(sym, 0) + 1
+
+        # Keep symbols mentioned >= 2 times, sort by count descending
+        filtered = [(sym, cnt) for sym, cnt in mention_counts.items() if cnt >= 2]
+        filtered.sort(key=lambda x: x[1], reverse=True)
+        top_syms = [sym for sym, _ in filtered[:30]]
+
+        # Verify price data exists for each candidate
+        result = []
+        if top_syms:
+            bars = safe_get_bars(api, top_syms, days_back=3, limit=3)
+            for sym in top_syms:
+                try:
+                    sym_bars = extract_sym(bars, sym) if bars is not None else None
+                    if sym_bars is None or len(sym_bars) < 1:
+                        continue
+                    price   = float(sym_bars.iloc[-1]["close"])
+                    avg_vol = float(sym_bars["volume"].mean())
+                    if price > 0:
+                        result.append({
+                            "symbol":  sym,
+                            "price":   round(price, 2),
+                            "volume":  int(avg_vol),
+                        })
+                except Exception:
+                    continue
+
+        print(f"  News-trending tickers ({len(result)} with data): "
+              f"{[r['symbol'] for r in result[:8]]}")
+        return result
+    except Exception as e:
+        print(f"  get_news_universe error: {e}")
+        return []
+
+
+# ── Sector peer injection ─────────────────────────────────────
+
+def get_sector_peers(tickers_in_scan):
+    """
+    Given tickers already in the universe scan, find sector peers
+    from SECTOR_GROUPS that are NOT already in tickers_in_scan.
+    Returns a flat list of unique peer ticker symbols.
+    """
+    try:
+        in_scan = set(tickers_in_scan)
+        peers   = set()
+        for ticker in tickers_in_scan:
+            group_name = TICKER_SECTOR.get(ticker)
+            if group_name:
+                for peer in SECTOR_GROUPS.get(group_name, []):
+                    if peer not in in_scan:
+                        peers.add(peer)
+        return list(peers)
+    except Exception as e:
+        print(f"  get_sector_peers error: {e}")
+        return []
+
+
 # ── Universe builder ──────────────────────────────────────────
 
 def build_universe(api, max_price, min_price=0.50, min_volume=100_000):
@@ -160,7 +297,32 @@ def build_universe(api, max_price, min_price=0.50, min_volume=100_000):
 
     print(f"  Seed scan: {len(universe)} stocks")
 
-    # Step 2 — expand if needed
+    # Step 2 — always scan EXTENDED_UNIVERSE (not conditional on seed count)
+    added_extended = 0
+    for i in range(0, len(EXTENDED_UNIVERSE), batch_size):
+        batch = EXTENDED_UNIVERSE[i:i+batch_size]
+        bars  = safe_get_bars(api, batch)
+        if bars is None:
+            continue
+        for sym in batch:
+            if sym in seen:
+                continue
+            sym_bars = extract_sym(bars, sym)
+            if sym_bars is None or len(sym_bars) < 2:
+                continue
+            try:
+                price   = float(sym_bars.iloc[-1]["close"])
+                avg_vol = float(sym_bars["volume"].mean())
+                if min_price <= price <= max_price and avg_vol >= min_volume:
+                    universe.append({"symbol": sym, "price": round(price, 2), "volume": int(avg_vol)})
+                    seen.add(sym)
+                    added_extended += 1
+            except:
+                continue
+        time.sleep(0.3)
+    print(f"  Extended scan: {added_extended} additional stocks")
+
+    # Step 3 — expand if still needed
     if len(universe) < 15:
         print("  Expanding with asset list (up to 300)...")
         try:
@@ -243,7 +405,7 @@ def get_price_data(api, ticker):
 
 def composite_score(pd, sentiment, news_count, account_size,
                     politician_score=0, social_score=0, short_score=0, insider_score=0,
-                    catalyst_score=0):
+                    catalyst_score=0, gap_pct=0):
     s  = abs(pd["change_pct"]) * 2.5
     s += abs(pd["rs_5d"])      * 1.5
     vr = pd["vol_ratio"]
@@ -277,6 +439,10 @@ def composite_score(pd, sentiment, news_count, account_size,
         s += insider_score * 2.5  # 0 to +50 at max, capped below
     if catalyst_score != 0:
         s += catalyst_score * 2.0  # EDGAR/news catalyst quality boost
+    # Gap bonus — a stock gapping >5% is a high-priority event play
+    if gap_pct >= 10: s += 30
+    elif gap_pct >= 5: s += 15
+    elif gap_pct >= 3: s += 8
     return round(s, 2)
 
 def risk_grade(pd):
@@ -360,6 +526,7 @@ def run_scan(api, universe, days_back=1, account_size=20):
                 short_score=short_score,
                 insider_score=insider_score,
                 catalyst_score=cat_score,
+                gap_pct=abs(pd["change_pct"]),
             )
             grade             = risk_grade(pd)
             results.append({
@@ -388,9 +555,9 @@ def run_scan(api, universe, days_back=1, account_size=20):
             continue
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    top5 = results[:5]
-    print(f"=== Top 5 ({label}): {[(r['ticker'], r['grade'], r['score']) for r in top5]} ===")
-    return top5
+    top8 = results[:8]
+    print(f"=== Top 8 ({label}): {[(r['ticker'], r['grade'], r['score']) for r in top8]} ===")
+    return top8
 
 # ── Full scan entry point — called by app.py ─────────────────
 
@@ -448,6 +615,27 @@ def run_full_scan(api):
             print(f"  Catalyst-tracked tickers added to universe: {added_cat[:10]}")
     except Exception as e:
         print(f"  catalyst_tracker expand error: {e}")
+
+    # News-driven universe — always injected regardless of seed list
+    existing = {s["symbol"] for s in universe}
+    news_tickers = get_news_universe(api)
+    news_added = 0
+    for t in news_tickers:
+        if t["symbol"] not in existing and min_price <= t["price"] <= max_price:
+            universe.append(t)
+            existing.add(t["symbol"])
+            news_added += 1
+    if news_added:
+        print(f"  News injection: {news_added} tickers added to universe")
+
+    # Sector peer injection — when a sector member is in the universe, add its peers
+    sector_peers = get_sector_peers([s["symbol"] for s in universe])
+    for sym in sector_peers:
+        if sym not in existing:
+            universe.append({"symbol": sym, "price": 0.0, "volume": 0})
+            existing.add(sym)
+    if sector_peers:
+        print(f"  Sector peers injected: {sector_peers[:10]}")
 
     if not universe:
         print("Universe empty — using fallback")

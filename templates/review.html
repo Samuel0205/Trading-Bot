@@ -88,6 +88,23 @@
   .chop-item .ticker { font-weight: 700; color: #f85149; min-width: 50px; }
   .chop-item .date   { color: #8b949e; }
   .chop-item .count  { color: #d29922; }
+
+  /* ── Operational health ── */
+  .ops-ok { background: #1a2d1a; border: 1px solid #3fb950; border-radius: 8px;
+            padding: 10px 14px; color: #3fb950; font-size: 12px; margin-bottom: 8px; }
+
+  /* ── AI Diagnosis section ── */
+  .ai-section { border-left: 3px solid #1f6feb; padding-left: 12px; margin-bottom: 8px; }
+  .ai-note { font-size: 11px; color: #484f58; margin-top: 6px; }
+  .ai-btn { background: #1f6feb22; border: 1px solid #1f6feb; color: #58a6ff;
+            border-radius: 6px; padding: 6px 14px; font-size: 12px; cursor: pointer;
+            font-family: inherit; transition: background .15s; }
+  .ai-btn:hover { background: #1f6feb44; }
+  .ai-btn:disabled { opacity: .5; cursor: default; }
+  .ai-spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #30363d;
+                border-top-color: #58a6ff; border-radius: 50%;
+                animation: spin .8s linear infinite; vertical-align: middle; margin-right: 6px; }
+  .ai-no-key { color: #8b949e; font-size: 12px; padding: 8px 0; }
 </style>
 </head>
 <body>
@@ -157,10 +174,41 @@ function render(data) {
   });
   html += '</div>';
 
-  // ── Suggestions ────────────────────────────────────────────
+  // ── Operational Health ─────────────────────────────────────
+  const opsFindings = data.ops_findings || [];
+  html += '<h2>Operational Health</h2>';
+  if (opsFindings.length === 0) {
+    html += '<div class="ops-ok">✓ No issues detected today</div>';
+  } else {
+    opsFindings.forEach(sg => {
+      const pri     = sg.priority || 'LOW';
+      const area    = sg.area    || '';
+      const finding = sg.finding || '';
+      const action  = sg.action  || '';
+      html += `<div class="suggestion">
+        <div class="header">
+          <span class="badge ${pri}">${pri}</span>
+          <span class="area-label">${area}</span>
+        </div>
+        <div class="finding">${finding}</div>
+        ${action ? `<div class="action">${action}</div>` : ''}
+      </div>`;
+    });
+  }
+
+  // ── AI Diagnosis ───────────────────────────────────────────
+  html += '<h2>AI Diagnosis</h2>';
+  html += `<div class="ai-section">
+    <div id="ai-content">
+      <button class="ai-btn" id="ai-btn" onclick="runAI()">Analyze with AI →</button>
+    </div>
+    <div class="ai-note">Powered by Claude — refreshes hourly</div>
+  </div>`;
+
+  // ── Trade Performance Suggestions ─────────────────────────
   const suggs = data.suggestions || [];
   if (suggs.length) {
-    html += '<h2>Improvement Suggestions</h2>';
+    html += '<h2>Trade Performance Suggestions</h2>';
     suggs.forEach(sg => {
       const pri = typeof sg === 'string' ? 'LOW' : sg.priority;
       const area = typeof sg === 'string' ? 'Note' : sg.area;
@@ -246,6 +294,45 @@ function render(data) {
 
   document.getElementById('content').innerHTML = html;
   document.getElementById('updatedAt').textContent = 'Analyzed: ' + (data.analyzed_at || '—');
+}
+
+function renderFinding(sg) {
+  const pri     = sg.priority || 'LOW';
+  const area    = sg.area    || '';
+  const finding = sg.finding || '';
+  const action  = sg.action  || '';
+  return `<div class="suggestion">
+    <div class="header">
+      <span class="badge ${pri}">${pri}</span>
+      <span class="area-label">${area}</span>
+    </div>
+    <div class="finding">${finding}</div>
+    ${action ? `<div class="action">${action}</div>` : ''}
+  </div>`;
+}
+
+function runAI() {
+  const btn = document.getElementById('ai-btn');
+  const box = document.getElementById('ai-content');
+  if (!btn || !box) return;
+  btn.disabled = true;
+  box.innerHTML = '<span class="ai-spinner"></span> Analyzing with Claude...';
+  fetch('/review/ai')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.has_key) {
+        box.innerHTML = '<div class="ai-no-key">Add ANTHROPIC_API_KEY to Render env vars to enable AI analysis.</div>';
+        return;
+      }
+      if (!data.findings || data.findings.length === 0) {
+        box.innerHTML = '<div class="ai-no-key">No findings returned. Try again later.</div>';
+        return;
+      }
+      box.innerHTML = data.findings.map(renderFinding).join('');
+    })
+    .catch(e => {
+      box.innerHTML = `<div class="ai-no-key" style="color:#f85149">AI analysis failed: ${e.message}</div>`;
+    });
 }
 
 function load() {
