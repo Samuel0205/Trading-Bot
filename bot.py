@@ -1365,8 +1365,8 @@ def apply_scan_results(results_today, acct_size=None):
                   if get_price_floor(acct_size)<=s["price"]<=get_price_ceiling(acct_size)
                   and s.get("grade","F") in MIN_GRADE]
     if affordable:
-        new_tickers = [s["ticker"] for s in affordable[:5]]
-        for s in affordable[:5]:
+        new_tickers = [s["ticker"] for s in affordable[:8]]
+        for s in affordable[:8]:
             ticker_grades[s["ticker"]] = s.get("grade","C")
         for t in new_tickers:
             ph, vh = load_price_history(t)
@@ -1379,7 +1379,7 @@ def apply_scan_results(results_today, acct_size=None):
         except Exception:
             pass
         try:
-            scores = {s["ticker"]:s["score"] for s in affordable[:5]}
+            scores = {s["ticker"]:s["score"] for s in affordable[:8]}
             save_scan_result(new_tickers, scores)
         except: pass
 
@@ -1438,7 +1438,7 @@ def promote_rvol_tickers():
             t = p["ticker"]
             if t not in active_tickers:
                 # Replace last ticker in list (lowest priority)
-                if len(active_tickers) >= 5:
+                if len(active_tickers) >= 8:
                     removed = active_tickers[-1]
                     active_tickers = active_tickers[:-1]
                     print(f"  Swapped {removed} → {t} (rvol {p['rvol']}x)")
