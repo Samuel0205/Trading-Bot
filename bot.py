@@ -898,8 +898,9 @@ def force_sell(ticker, price, reason="stop_loss"):
         pnl     = round((price - entry) * qty, 2)
         api.submit_order(symbol=ticker, qty=qty, side="sell",
                          type="market", time_in_force="day")
-        was_win     = pnl > 0
-        pos_data    = open_positions.get(ticker, {})
+        was_win = pnl > 0
+        with _positions_lock:
+            pos_data = open_positions.pop(ticker, {})
         active_sigs = pos_data.get("active_signals", [])
 
         try:
@@ -916,13 +917,12 @@ def force_sell(ticker, price, reason="stop_loss"):
             "price":round(price,2),"pnl":pnl,"reason":reason,
             "ts":int(time.time()*1000)
         })
-        with _positions_lock:
-            open_positions.pop(ticker, None)
         set_cooldown(ticker, reason)
+
+        today_str = now_et().strftime("%Y-%m-%d")
 
         # Anti-chop gate: count stop losses per ticker per day
         if reason == "stop_loss":
-            today_str = now_et().strftime("%Y-%m-%d")
             _daily_stop_counts.setdefault(ticker, {})
             _daily_stop_counts[ticker][today_str] = (
                 _daily_stop_counts[ticker].get(today_str, 0) + 1
@@ -934,7 +934,6 @@ def force_sell(ticker, price, reason="stop_loss"):
 
         # Track per-ticker day trades (opened and closed same calendar day)
         if reason != "eod_close":
-            today_str = now_et().strftime("%Y-%m-%d")
             if pos_data.get("opened_date") == today_str:
                 _daily_ticker_dt_counts.setdefault(ticker, {})
                 _daily_ticker_dt_counts[ticker][today_str] = (
@@ -1118,6 +1117,7 @@ def check_pending_orders():
     - Canceled/rejected/expired → roll back daily_trade_count
     - Age > ORDER_FILL_TIMEOUT → cancel it (will clean up next tick)
     """
+    global daily_trade_count
     for order_id in list(_pending_orders.keys()):
         pdata = _pending_orders.get(order_id)
         if not pdata:
@@ -1138,7 +1138,12 @@ def check_pending_orders():
                 if removed:
                     with _trade_count_lock:
                         daily_trade_count = max(0, daily_trade_count - 1)
-                        if _trade_window_times: _trade_window_times.pop()
+                        wts = removed.get("window_ts")
+                        if wts is not None:
+                            try: _trade_window_times.remove(wts)
+                            except ValueError: pass
+                        elif _trade_window_times:
+                            _trade_window_times.pop()
                     print(f"  Limit order {status}: {removed['ticker']} — count rolled back")
 
             elif time.time() - pdata["submitted_at"] > ORDER_FILL_TIMEOUT:
@@ -1276,7 +1281,8 @@ def execute(ticker, action, price, signals, reason="signal"):
                     print(f"  {ticker} position opened concurrently, skipping")
                     with _trade_count_lock:
                         daily_trade_count = max(0, daily_trade_count - 1)
-                        if _trade_window_times: _trade_window_times.pop()
+                        try: _trade_window_times.remove(_now_ts)
+                        except ValueError: pass
                     return
 
             # Submit as limit order at 0.3% above current price.
@@ -1295,7 +1301,8 @@ def execute(ticker, action, price, signals, reason="signal"):
                 print(f"  Order failed {ticker}: {order_err}")
                 with _trade_count_lock:
                     daily_trade_count = max(0, daily_trade_count - 1)
-                    if _trade_window_times: _trade_window_times.pop()
+                    try: _trade_window_times.remove(_now_ts)
+                    except ValueError: pass
                 return
 
             with _pending_lock:
@@ -1311,6 +1318,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                     "rvol":          rvol,
                     "is_gap_play":   is_gap_play,
                     "submitted_at":  time.time(),
+                    "window_ts":     _now_ts,
                     "ts":            int(time.time() * 1000),
                 }
                 _pending_buy_tickers.add(ticker)
@@ -2287,6 +2295,19 @@ def reconcile_open_positions():
         if not alpaca_positions:
             print("Reconcile: no open positions in Alpaca")
             return
+        # Build a set of tickers bought today so opened_date can be stamped correctly,
+        # ensuring the per-ticker day-trade gate still fires after a restart.
+        today_str = now_et().strftime("%Y-%m-%d")
+        bought_today: set = set()
+        try:
+            today_dt  = now_et().date()
+            midnight  = NY.localize(datetime.combine(today_dt, datetime.min.time()))
+            after_str = midnight.strftime("%Y-%m-%dT%H:%M:%SZ")
+            todays_orders = api.list_orders(status="filled", after=after_str,
+                                            limit=100, direction="desc")
+            bought_today = {o.symbol for o in todays_orders if o.side == "buy"}
+        except Exception as e:
+            print(f"  Reconcile: could not fetch today's orders for opened_date: {e}")
         restored = 0
         for pos in alpaca_positions:
             ticker = pos.symbol
@@ -2305,6 +2326,7 @@ def reconcile_open_positions():
                     "qty": qty, "atr": None, "active_signals": [],
                     "partial_done": False, "is_gap_play": False,
                     "highest_price": entry,
+                    "opened_date": today_str if ticker in bought_today else None,
                 }
             price_history.setdefault(ticker, [])
             volume_history.setdefault(ticker, [])
