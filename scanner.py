@@ -513,6 +513,12 @@ def run_scan(api, universe, days_back=1, account_size=20):
                 continue
             headlines         = get_headlines(api, ticker, days_back=days_back)
             sentiment, method = finbert_score(headlines)
+            try:
+                from ops_reviewer import _ops_stats as _ops
+                if method in ("finbert", "keyword", "keyword_fallback"):
+                    _ops["finbert_method"] = method
+            except Exception:
+                pass
             pol_score         = pol_scores.get(ticker, 0)
             insider_score     = insider_scores.get(ticker, 0)
             soc               = social_data.get(ticker, {})
