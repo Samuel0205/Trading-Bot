@@ -24,8 +24,8 @@ from macro import (
 
 def get_scanner():
     try:
-        from scanner import run_full_scan, SEED_UNIVERSE
-        return run_full_scan, SEED_UNIVERSE
+        from scanner import run_full_scan, SEED_UNIVERSE, EXTENDED_UNIVERSE
+        return run_full_scan, list(dict.fromkeys(SEED_UNIVERSE + EXTENDED_UNIVERSE))
     except Exception as e:
         print(f"Scanner import error: {e}")
         return None, []
@@ -1743,6 +1743,7 @@ def bot_loop():
     while True:
         try:
             _hb("bot_loop")
+            _reset_ops_stats_if_new_day()
             now         = now_et()
             market_open = is_market_open()
             window_open = in_trading_window()
@@ -1782,19 +1783,28 @@ def bot_loop():
                     last_blackout = now.strftime("%Y-%m-%d")
                 socketio.emit("state", {"tickers":{},"account":get_account_state(),
                     "trades":trade_log[:40],"market_status":"blackout",
-                    "message":f"MACRO BLACKOUT: {event_name} — trading suspended","live":LIVE_MODE})
+                    "message":f"MACRO BLACKOUT: {event_name} — trading suspended",
+                    "live":LIVE_MODE,"regime":market_regime,"blackout":True,
+                    "macro":macro_status,"mins_since_open":mins_since_open(),
+                    "mins_until_close":mins_until_close()})
                 time.sleep(300); continue
 
             if not window_open:
                 socketio.emit("state", {"tickers":{},"account":get_account_state(),
                     "trades":trade_log[:40],"market_status":"closed",
-                    "message":"Trading window closed — resumes 9:35 AM ET","live":LIVE_MODE})
+                    "message":"Trading window closed — resumes 9:35 AM ET",
+                    "live":LIVE_MODE,"regime":market_regime,"blackout":False,
+                    "macro":macro_status,"mins_since_open":mins_since_open(),
+                    "mins_until_close":mins_until_close()})
                 time.sleep(60); continue
 
             if not market_open:
                 socketio.emit("state", {"tickers":{},"account":get_account_state(),
                     "trades":trade_log[:40],"market_status":"closed",
-                    "message":"Warming up — market opens 9:30 AM ET","live":LIVE_MODE})
+                    "message":"Warming up — market opens 9:30 AM ET",
+                    "live":LIVE_MODE,"regime":market_regime,"blackout":False,
+                    "macro":macro_status,"mins_since_open":mins_since_open(),
+                    "mins_until_close":mins_until_close()})
                 time.sleep(30); continue
 
             if not last_regime or (now - last_regime).total_seconds() > 1800:
