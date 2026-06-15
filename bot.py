@@ -1601,15 +1601,67 @@ def macro_loop():
             print(f"Macro loop error: {e}")
         time.sleep(60)
 
+def promote_news_tickers():
+    """
+    Intraday news check — runs every 30 minutes during market hours.
+    Pulls market-wide news, finds tickers trending in headlines that aren't
+    already being watched, and injects the top 2 into the active list.
+    This catches breaking stories (FDA, earnings, M&A, IPOs) between the
+    scheduled 10 AM and noon full scans.
+    """
+    global active_tickers
+    try:
+        from scanner import get_news_universe
+    except Exception as e:
+        print(f"  promote_news_tickers import error: {e}")
+        return
+
+    acct_size = get_account_size()
+    floor     = get_price_floor(acct_size)
+    ceiling   = get_price_ceiling(acct_size)
+
+    try:
+        news_items = get_news_universe(api)
+    except Exception as e:
+        print(f"  promote_news_tickers: news fetch error: {e}")
+        return
+
+    if not news_items:
+        return
+
+    movers = [
+        item["symbol"] for item in news_items
+        if item["symbol"] not in active_tickers
+        and floor <= item.get("price", 0) <= ceiling
+    ]
+
+    if not movers:
+        return
+
+    print(f"  Intraday news movers: {movers[:5]}")
+    for sym in movers[:2]:
+        if sym not in active_tickers:
+            if len(active_tickers) >= 8:
+                removed = active_tickers[-1]
+                active_tickers = active_tickers[:-1]
+                print(f"  News inject: {sym} replaced {removed}")
+            active_tickers = [sym] + active_tickers
+            price_history.setdefault(sym, [])
+            volume_history.setdefault(sym, [])
+    print(f"  Active tickers after news inject: {active_tickers}")
+
+
 def premarket_loop():
     gap_day = None; rvol_buckets = set(); rvol_day = None
     promote_buckets = set(); promote_day = None
+    news_buckets = set(); news_day = None
     while True:
         try:
             _hb("premarket_loop")
             now = now_et(); day = now.date()
             if day != rvol_day:     rvol_buckets.clear();    rvol_day    = day
             if day != promote_day:  promote_buckets.clear(); promote_day = day
+            if day != news_day:     news_buckets.clear();    news_day    = day
 
             # Gap scan: 8:45 AM premarket OR first time in window after a mid-day deploy
             if now.weekday()<5 and gap_day!=day:
@@ -1628,11 +1680,19 @@ def premarket_loop():
                     try: update_rvol(); socketio.emit("rvol", rvol_cache)
                     except Exception as e: print(f"RVOL error: {e}")
 
-                # NEW: dynamic rvol promotion — runs every 15 min same bucket cadence
+                # Dynamic rvol promotion — runs every 15 min same bucket cadence
                 if bucket not in promote_buckets:
                     promote_buckets.add(bucket)
                     try: promote_rvol_tickers()
                     except Exception as e: print(f"Promote error: {e}")
+
+                # Intraday news check — every 30 min, catches breaking stories
+                # between the scheduled 10 AM and noon full scans
+                news_bucket = now.hour*2 + now.minute//30
+                if news_bucket not in news_buckets:
+                    news_buckets.add(news_bucket)
+                    try: promote_news_tickers()
+                    except Exception as e: print(f"News inject error: {e}")
 
         except Exception as e:
             _thread_errors["premarket_loop"] = str(e)
