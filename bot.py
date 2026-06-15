@@ -1027,6 +1027,7 @@ def make_decision(ticker, signals, price):
     hot_sectors = macro_status.get("hot_sectors", [])
     if hot_sectors:
         bt = max(1.0, bt-0.1)
+        st = min(st+0.1, 5.0)  # harder to sell when sector is hot — let winners run
 
     # Count active vetos — if any signals are vetoed, note it
     veto_count = sum(1 for s in signals if s.get("veto"))
