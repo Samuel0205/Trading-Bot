@@ -992,7 +992,7 @@ def make_decision(ticker, signals, price):
     # EOD threshold multiplier — harder to enter near close
     tod_mult = get_threshold_multiplier()
 
-    if   pscore >= PRED_STRONG_BUY: bt = st = 1.2 * tod_mult
+    if   pscore >= PRED_STRONG_BUY: bt = 1.2 * tod_mult; st = 2.5 * tod_mult
     elif pscore >= 20:              bt = 1.5 * tod_mult; st = 2.5 * tod_mult
     elif pscore < PRED_NEED_CONF:   bt = 2.5 * tod_mult; st = 2.0 * tod_mult
     else:                           bt = BASE_BUY_THRESHOLD * tod_mult; st = BASE_SELL_THRESHOLD * tod_mult
@@ -1020,7 +1020,7 @@ def make_decision(ticker, signals, price):
         else:
             bt = max(1.0, bt - 0.3)
     if rvol >= 2.0:
-        bt = max(1.0, bt-0.2); st = max(1.0, st-0.2)
+        bt = max(1.0, bt-0.2)  # high rvol lowers entry bar only — not exit bar
     if tf_bias == -1:
         bt += 0.8
 
