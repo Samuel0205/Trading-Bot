@@ -993,7 +993,7 @@ def make_decision(ticker, signals, price):
     tod_mult = get_threshold_multiplier()
 
     if   pscore >= PRED_STRONG_BUY: bt = st = 1.2 * tod_mult
-    elif pscore >= 20:              bt = st = 1.5 * tod_mult
+    elif pscore >= 20:              bt = 1.5 * tod_mult; st = 2.5 * tod_mult
     elif pscore < PRED_NEED_CONF:   bt = 2.5 * tod_mult; st = 2.0 * tod_mult
     else:                           bt = BASE_BUY_THRESHOLD * tod_mult; st = BASE_SELL_THRESHOLD * tod_mult
 
@@ -1086,6 +1086,7 @@ def _register_filled_order(order_id, fill_price):
             "partial_done": False, "is_gap_play": is_gap_play,
             "highest_price": fill_price,
             "opened_date": now_et().strftime("%Y-%m-%d"),
+            "hold_since": time.time(),
         }
 
     try:
@@ -1332,7 +1333,12 @@ def execute(ticker, action, price, signals, reason="signal"):
                   + (f" PDT:{dt_count+1}/{PDT_MAX}" if acct_size < PDT_ACCOUNT_LIMIT else ""))
 
         elif action == "sell" and ticker in open_positions:
-            force_sell(ticker, price, reason=reason or "signal")
+            pos = open_positions.get(ticker, {})
+            held_secs = time.time() - pos.get("hold_since", 0)
+            if held_secs < 300:
+                print(f"  {ticker} min hold: {int(held_secs)}s < 300s — signal sell suppressed")
+            else:
+                force_sell(ticker, price, reason=reason or "signal")
     except Exception as e:
         print(f"Order error {ticker}: {e}")
 
@@ -2387,6 +2393,7 @@ def reconcile_open_positions():
                     "partial_done": False, "is_gap_play": False,
                     "highest_price": entry,
                     "opened_date": today_str if ticker in bought_today else None,
+                    "hold_since": time.time(),
                 }
             price_history.setdefault(ticker, [])
             volume_history.setdefault(ticker, [])
