@@ -1055,7 +1055,7 @@ def make_decision(ticker, signals, price):
     st *= {"trending_up": 1.3,  "ranging": 1.0, "trending_down": 0.8}.get(market_regime, 1.0)
     bt  = min(bt, 5.0); st = min(st, 5.0)
 
-    if buy_w >= bt and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY):
+    if buy_w >= bt and sell_w <= buy_w and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY):
         action = "buy";  reason = f"bw={buy_w:.1f}>={bt:.1f}"
     elif sell_w >= st:
         action = "sell"; reason = f"sw={sell_w:.1f}>={st:.1f}"
