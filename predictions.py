@@ -533,6 +533,7 @@ def run_predictions(api, tickers, market_regime="ranging"):
                 "confidence": "low", "components": {}, "signals": [],
                 "tf_bias": 0, "tf_detail": str(e),
                 "timestamp": datetime.now(NY).strftime("%I:%M %p ET"),
+                "fetched_at": time.time(),   # required for staleness gate in bot.py
             }
     print(f"=== run_predictions done: {len(results)} results ===")
     return results

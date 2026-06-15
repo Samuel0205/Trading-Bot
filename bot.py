@@ -454,7 +454,7 @@ def count_rolling_day_trades():
 
 def is_day_trade_safe():
     count, _, _ = count_rolling_day_trades()
-    return count < MAX_DAILY_TRADES
+    return count < PDT_MAX
 
 # ── Correlation helper ────────────────────────────────────────
 
@@ -511,14 +511,17 @@ def cooldown_remaining(ticker):
 # ── Indicators ────────────────────────────────────────────────
 
 def calc_rsi(prices, period=14):
-    if len(prices) < period+1: return 50
-    gains = losses = 0
-    for i in range(-period, 0):
-        d = prices[i] - prices[i-1]
-        if d > 0: gains += d
-        else:     losses += abs(d)
-    if losses == 0: return 100
-    return 100-(100/(1+gains/losses))
+    if len(prices) < period + 2:
+        return 50
+    changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    avg_gain = sum(max(0,  c) for c in changes[:period]) / period
+    avg_loss = sum(max(0, -c) for c in changes[:period]) / period
+    for c in changes[period:]:
+        avg_gain = (avg_gain * (period - 1) + max(0,  c)) / period
+        avg_loss = (avg_loss * (period - 1) + max(0, -c)) / period
+    if avg_loss == 0:
+        return 100
+    return round(100 - (100 / (1 + avg_gain / avg_loss)), 1)
 
 def calc_ma(prices, n):
     s = prices[-n:] if len(prices) >= n else prices
@@ -868,9 +871,10 @@ def check_stops(ticker, price):
                 open_positions[ticker]["stop"] = be_stop
                 print(f"  GAP breakeven {ticker} → ${be_stop:.3f}")
     else:
-        # Standard trailing stop: once up 5%, move stop to entry+1%
-        if gain_pct > 0.05:
-            new_stop = max(pos["stop"], round(entry * 1.01, 3))
+        # Trailing stop: once up 3%, trail at TRAILING_STOP_GAP_PCT below current price
+        if gain_pct > 0.03:
+            trail_stop = round(price * (1 - TRAILING_STOP_GAP_PCT), 3)
+            new_stop   = max(pos["stop"], trail_stop)
             if new_stop > pos["stop"]:
                 open_positions[ticker]["stop"] = new_stop
                 print(f"  Trail stop {ticker} → ${new_stop:.3f}")
@@ -964,7 +968,15 @@ def close_all_positions_eod():
         print(f"EOD cancel orders error: {e}")
     try:
         for pos in api.list_positions():
-            force_sell(pos.symbol, float(pos.current_price), reason="eod_close")
+            price = float(pos.current_price) if pos.current_price is not None else 0.0
+            if price <= 0:
+                # Price unavailable after market close — use last known bar
+                try:
+                    bar   = api.get_latest_bar(pos.symbol, feed="iex")
+                    price = float(bar.c)
+                except Exception:
+                    price = float(pos.avg_entry_price)  # worst-case fallback
+            force_sell(pos.symbol, price, reason="eod_close")
         print("EOD: all positions closed")
     except Exception as e:
         print(f"EOD close error: {e}")
@@ -979,10 +991,10 @@ def make_decision(ticker, signals, price):
     rvol    = rvol_cache.get(ticker, 1.0)
     is_gap  = ticker in gap_candidates
 
-    # Staleness gate: if prediction is >90 min old, treat as neutral before allowing buys.
-    # This prevents buying against an hours-old bullish score when price has reversed.
+    # Staleness gate: if prediction is >90 min old, treat as neutral.
+    # Applies to both bullish and bearish scores — stale data should not drive decisions.
     pred_age = time.time() - pred.get("fetched_at", 0)
-    if pred_age > PRED_MAX_AGE_SECS and pscore > 0:
+    if pred_age > PRED_MAX_AGE_SECS and pscore != 0:
         print(f"  {ticker}: prediction stale ({pred_age/60:.0f}min old) — capping score to 0")
         pscore = 0
 
@@ -994,7 +1006,7 @@ def make_decision(ticker, signals, price):
 
     if   pscore >= PRED_STRONG_BUY: bt = 1.2 * tod_mult; st = 2.5 * tod_mult
     elif pscore >= 20:              bt = 1.5 * tod_mult; st = 2.5 * tod_mult
-    elif pscore < PRED_NEED_CONF:   bt = 2.5 * tod_mult; st = 2.0 * tod_mult
+    elif pscore < PRED_NEED_CONF:   bt = 3.0 * tod_mult; st = 2.5 * tod_mult  # bt>st causes whipsaw — st must be <= bt
     else:                           bt = BASE_BUY_THRESHOLD * tod_mult; st = BASE_SELL_THRESHOLD * tod_mult
 
     # Confidence multiplier — prediction confidence now affects entry threshold.
@@ -1388,6 +1400,11 @@ def apply_scan_results(results_today, acct_size=None):
             price_history[t]  = ph if ph else []
             volume_history[t] = vh if vh else []
         active_tickers = new_tickers
+        # Never drop a ticker that has an open position from stop monitoring
+        for t in list(open_positions.keys()):
+            if t not in active_tickers:
+                active_tickers.append(t)
+                print(f"  Keeping {t} in active list (open position)")
         print(f"Active tickers updated: {active_tickers}")
         try:
             _ops_stats["scan_tickers"] = new_tickers
@@ -1452,10 +1469,14 @@ def promote_rvol_tickers():
         for p in promoted[:2]:   # promote up to 2 tickers at a time
             t = p["ticker"]
             if t not in active_tickers:
-                # Replace last ticker in list (lowest priority)
+                # Replace last ticker in list (lowest priority), never evict open positions
                 if len(active_tickers) >= 8:
-                    removed = active_tickers[-1]
-                    active_tickers = active_tickers[:-1]
+                    evictable = [x for x in active_tickers if x not in open_positions]
+                    if not evictable:
+                        print(f"  Can't promote {t}: all active tickers have open positions")
+                        continue
+                    removed = evictable[-1]
+                    active_tickers = [x for x in active_tickers if x != removed]
                     print(f"  Swapped {removed} → {t} (rvol {p['rvol']}x)")
                 active_tickers = [t] + active_tickers
                 price_history.setdefault(t, [])
@@ -1484,13 +1505,16 @@ def run_gap_scan():
             if hasattr(bars.index,'levels'):
                 if ticker in bars.index.get_level_values(0): bars=bars.loc[ticker]
                 else: continue
-            prev_close = float(bars.iloc[-1]["close"])
+            prev_close = float(bars.iloc[-2]["close"])  # iloc[-1] may be today's partial bar
             avg_vol    = float(bars["volume"].mean())
             latest     = api.get_latest_bar(ticker, feed="iex")
             cur_price  = float(latest.c); cur_vol = float(latest.v)
             if not(floor<=cur_price<=ceiling): continue
-            gap_pct = (cur_price-prev_close)/prev_close*100
-            rvol    = cur_vol/(avg_vol/390) if avg_vol>0 else 1
+            gap_pct   = (cur_price-prev_close)/prev_close*100
+            now_g     = now_et()
+            mins_open = max(1, (now_g.hour-9)*60 + now_g.minute - 30)
+            projected = cur_vol * (390 / mins_open) if mins_open < 390 else cur_vol
+            rvol      = projected / avg_vol if avg_vol > 0 else 1
             if GAP_MIN_PCT<=abs(gap_pct)<=GAP_MAX_PCT and rvol>=GAP_MIN_RVOL:
                 candidates[ticker] = {
                     "ticker":ticker,"price":round(cur_price,2),
@@ -1523,8 +1547,12 @@ def run_gap_scan():
             reverse=True,
         )
         gap_tickers = up_tickers[:3]
-        current     = [t for t in active_tickers if t not in gap_tickers]
+        current        = [t for t in active_tickers if t not in gap_tickers]
         active_tickers = (gap_tickers + current)[:5]
+        # Never drop a ticker with an open position from stop monitoring
+        for t in list(open_positions.keys()):
+            if t not in active_tickers:
+                active_tickers.append(t)
         for t in gap_tickers:
             ph, vh = load_price_history(t)
             price_history[t]  = ph if ph else []
@@ -1649,8 +1677,12 @@ def promote_news_tickers():
     for sym in movers[:2]:
         if sym not in active_tickers:
             if len(active_tickers) >= 8:
-                removed = active_tickers[-1]
-                active_tickers = active_tickers[:-1]
+                evictable = [t for t in active_tickers if t not in open_positions]
+                if not evictable:
+                    print(f"  News inject: skipping {sym} — all slots have open positions")
+                    continue
+                removed = evictable[-1]
+                active_tickers = [t for t in active_tickers if t != removed]
                 print(f"  News inject: {sym} replaced {removed}")
             active_tickers = [sym] + active_tickers
             price_history.setdefault(sym, [])
@@ -2331,7 +2363,7 @@ def health_data():
         "pdt_rolling_count":pdt_count,
         "pdt_window_start": pdt_ws,
         "pdt_reset_date":   pdt_rd,
-        "pdt_safe":         pdt_count < MAX_DAILY_TRADES,
+        "pdt_safe":         pdt_count < PDT_MAX,
         "open_positions":   len(open_positions),
         "position_tickers": list(open_positions.keys()),
         "pending_orders":   len(_pending_orders),

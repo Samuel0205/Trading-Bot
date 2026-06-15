@@ -154,15 +154,17 @@ def save_trade_open(ticker, qty, price, stop, target, pred_score,
                     rvol, is_gap, active_signals, ts):
     with _db_lock:
         conn = get_conn()
-        conn.execute("""
-            INSERT INTO trades (ticker, side, qty, price, stop_price, target_price,
-                                pred_score, rvol, is_gap, active_signals, entry_ts, date)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (ticker, "BUY", qty, price, stop, target, pred_score, rvol,
-              1 if is_gap else 0, json.dumps(active_signals), ts,
-              datetime.now(NY).strftime("%Y-%m-%d")))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("""
+                INSERT INTO trades (ticker, side, qty, price, stop_price, target_price,
+                                    pred_score, rvol, is_gap, active_signals, entry_ts, date)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (ticker, "BUY", qty, price, stop, target, pred_score, rvol,
+                  1 if is_gap else 0, json.dumps(active_signals), ts,
+                  datetime.now(NY).strftime("%Y-%m-%d")))
+            conn.commit()
+        finally:
+            conn.close()
 
 def save_trade_close(ticker, exit_price, pnl, reason, exit_ts):
     """
@@ -233,13 +235,15 @@ def get_trade_stats_from_db():
 def save_signal_performance(signal_name, was_win, ticker, pnl):
     with _db_lock:
         conn = get_conn()
-        conn.execute("""
-            INSERT INTO signal_performance (signal_name, was_win, ticker, pnl, date)
-            VALUES (?,?,?,?,?)
-        """, (signal_name, 1 if was_win else 0, ticker, pnl,
-              datetime.now(NY).strftime("%Y-%m-%d")))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("""
+                INSERT INTO signal_performance (signal_name, was_win, ticker, pnl, date)
+                VALUES (?,?,?,?,?)
+            """, (signal_name, 1 if was_win else 0, ticker, pnl,
+                  datetime.now(NY).strftime("%Y-%m-%d")))
+            conn.commit()
+        finally:
+            conn.close()
 
 def get_signal_win_rates():
     with _db_lock:
@@ -268,16 +272,18 @@ def save_portfolio_snapshot(equity, cash, pnl_day, regime, trade_count):
     today = datetime.now(NY).strftime("%Y-%m-%d")
     with _db_lock:
         conn = get_conn()
-        conn.execute("""
-            INSERT INTO portfolio_snapshots (date, equity, cash, pnl_day, regime, trade_count)
-            VALUES (?,?,?,?,?,?)
-            ON CONFLICT(date) DO UPDATE SET
-                equity=excluded.equity, cash=excluded.cash,
-                pnl_day=excluded.pnl_day, regime=excluded.regime,
-                trade_count=excluded.trade_count
-        """, (today, equity, cash, pnl_day, regime, trade_count))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("""
+                INSERT INTO portfolio_snapshots (date, equity, cash, pnl_day, regime, trade_count)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(date) DO UPDATE SET
+                    equity=excluded.equity, cash=excluded.cash,
+                    pnl_day=excluded.pnl_day, regime=excluded.regime,
+                    trade_count=excluded.trade_count
+            """, (today, equity, cash, pnl_day, regime, trade_count))
+            conn.commit()
+        finally:
+            conn.close()
 
 def get_portfolio_history(days=90):
     with _db_lock:
@@ -294,14 +300,16 @@ def get_portfolio_history(days=90):
 def save_macro_event(event_date, event_name, impact="high", source="manual"):
     with _db_lock:
         conn = get_conn()
-        conn.execute("""
-            INSERT INTO macro_events (event_date, event_name, impact, source)
-            VALUES (?,?,?,?)
-            ON CONFLICT(event_date) DO UPDATE SET
-                event_name=excluded.event_name, impact=excluded.impact
-        """, (event_date, event_name, impact, source))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("""
+                INSERT INTO macro_events (event_date, event_name, impact, source)
+                VALUES (?,?,?,?)
+                ON CONFLICT(event_date) DO UPDATE SET
+                    event_name=excluded.event_name, impact=excluded.impact
+            """, (event_date, event_name, impact, source))
+            conn.commit()
+        finally:
+            conn.close()
 
 def is_macro_blackout(check_date=None):
     """Returns (True, event_name) if date is a high-impact macro event day."""
@@ -333,12 +341,14 @@ def get_upcoming_macro_events(days=7):
 def save_alert(level, message, ticker=None):
     with _db_lock:
         conn = get_conn()
-        conn.execute("""
-            INSERT INTO alerts (ts, level, message, ticker)
-            VALUES (?,?,?,?)
-        """, (int(datetime.now().timestamp() * 1000), level, message, ticker))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("""
+                INSERT INTO alerts (ts, level, message, ticker)
+                VALUES (?,?,?,?)
+            """, (int(datetime.now().timestamp() * 1000), level, message, ticker))
+            conn.commit()
+        finally:
+            conn.close()
     print(f"[{level}] {message}" + (f" ({ticker})" if ticker else ""))
 
 def get_alerts(limit=50, unacknowledged_only=False):
@@ -364,17 +374,20 @@ def acknowledge_alerts():
 def save_price_history(ticker, prices, volumes):
     """Persist recent price/volume history so signals survive restarts."""
     today = datetime.now(NY).strftime("%Y-%m-%d")
+    capped = list(prices[-200:])
     with _db_lock:
         conn = get_conn()
-        conn.execute("DELETE FROM price_cache WHERE ticker=?", (ticker,))
-        ts = int(datetime.now().timestamp() * 1000)
-        for i, (p, v) in enumerate(zip(prices[-200:], volumes[-200:])):
-            conn.execute("""
-                INSERT INTO price_cache (ticker, price, volume, ts, date)
-                VALUES (?,?,?,?,?)
-            """, (ticker, p, v or 0, ts - (len(prices) - i) * 30000, today))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("DELETE FROM price_cache WHERE ticker=?", (ticker,))
+            ts = int(datetime.now().timestamp() * 1000)
+            for i, (p, v) in enumerate(zip(capped, list(volumes[-200:]))):
+                conn.execute("""
+                    INSERT INTO price_cache (ticker, price, volume, ts, date)
+                    VALUES (?,?,?,?,?)
+                """, (ticker, p, v or 0, ts - (len(capped) - i) * 30000, today))
+            conn.commit()
+        finally:
+            conn.close()
 
 def load_price_history(ticker):
     """Load persisted price history for a ticker."""
@@ -398,13 +411,15 @@ def save_partial_exit(ticker, qty, entry_price, exit_price, pnl, ts):
     """
     with _db_lock:
         conn = get_conn()
-        conn.execute("""
-            INSERT INTO trades (ticker, side, qty, price, pnl, reason, entry_ts, date)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (ticker, "PARTIAL", qty, exit_price, pnl, "partial_exit", ts,
-              datetime.now(NY).strftime("%Y-%m-%d")))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("""
+                INSERT INTO trades (ticker, side, qty, price, pnl, reason, entry_ts, date)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (ticker, "PARTIAL", qty, exit_price, pnl, "partial_exit", ts,
+                  datetime.now(NY).strftime("%Y-%m-%d")))
+            conn.commit()
+        finally:
+            conn.close()
 
 # ── Position stop/target lookup ──────────────────────────────
 
@@ -426,10 +441,12 @@ def save_scan_result(tickers, scores):
     now = datetime.now(NY)
     with _db_lock:
         conn = get_conn()
-        conn.execute("""
-            INSERT INTO scan_history (date, scan_time, tickers, scores)
-            VALUES (?,?,?,?)
-        """, (now.strftime("%Y-%m-%d"), now.strftime("%H:%M"),
-              json.dumps(tickers), json.dumps(scores)))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("""
+                INSERT INTO scan_history (date, scan_time, tickers, scores)
+                VALUES (?,?,?,?)
+            """, (now.strftime("%Y-%m-%d"), now.strftime("%H:%M"),
+                  json.dumps(tickers), json.dumps(scores)))
+            conn.commit()
+        finally:
+            conn.close()

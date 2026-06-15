@@ -406,8 +406,8 @@ def get_price_data(api, ticker):
 def composite_score(pd, sentiment, news_count, account_size,
                     politician_score=0, social_score=0, short_score=0, insider_score=0,
                     catalyst_score=0, gap_pct=0):
-    s  = abs(pd["change_pct"]) * 2.5
-    s += abs(pd["rs_5d"])      * 1.5
+    s  = max(0, pd["change_pct"]) * 2.5   # only reward positive momentum
+    s += max(0, pd["rs_5d"])      * 1.5   # only reward positive 5-day trend
     vr = pd["vol_ratio"]
     if   vr > 5.0: s += 25
     elif vr > 3.0: s += 18
@@ -427,7 +427,7 @@ def composite_score(pd, sentiment, news_count, account_size,
         if   pd["price"] < 5: s +=  8
         elif pd["price"] < 8: s +=  3
     if politician_score > 0:
-        s += politician_score * 3.5
+        s += min(politician_score * 3.5, 30)   # cap at 30 pts (max raw score 25 → 87.5 uncapped)
     # Social sentiment: crowd is directly relevant for meme/momentum universe
     if social_score != 0:
         s += social_score * 1.5   # -15 to +15
@@ -436,10 +436,10 @@ def composite_score(pd, sentiment, news_count, account_size,
         s += short_score * 1.2    # 0 to +18
     # Insider (Form 4) buying: slower signal but high conviction
     if insider_score > 0:
-        s += insider_score * 2.5  # 0 to +50 at max, capped below
+        s += min(insider_score * 2.5, 25)   # cap at 25 pts (max raw score 20 → 50 uncapped)
     if catalyst_score != 0:
         s += catalyst_score * 2.0  # EDGAR/news catalyst quality boost
-    # Gap bonus — a stock gapping >5% is a high-priority event play
+    # Gap bonus — only reward upward gaps (positive gap_pct)
     if gap_pct >= 10: s += 30
     elif gap_pct >= 5: s += 15
     elif gap_pct >= 3: s += 8
@@ -532,7 +532,7 @@ def run_scan(api, universe, days_back=1, account_size=20):
                 short_score=short_score,
                 insider_score=insider_score,
                 catalyst_score=cat_score,
-                gap_pct=abs(pd["change_pct"]),
+                gap_pct=max(0, pd["change_pct"]),   # only positive gaps trigger the bonus
             )
             grade             = risk_grade(pd)
             results.append({
