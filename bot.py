@@ -398,7 +398,10 @@ def is_correlated_with_open_position(ticker, threshold=0.75):
     candidate = price_history.get(ticker, [])
     if len(candidate) < 10:
         return False
-    for pos_ticker in list(open_positions.keys()):
+    # Check both confirmed open positions AND pending orders so same-cycle
+    # buys don't bypass concentration risk before the first fill comes back.
+    check_set = set(open_positions.keys()) | _pending_buy_tickers
+    for pos_ticker in check_set:
         if pos_ticker == ticker:
             continue
         pos_prices = price_history.get(pos_ticker, [])
@@ -406,7 +409,7 @@ def is_correlated_with_open_position(ticker, threshold=0.75):
             continue
         corr = _pearson(candidate, pos_prices)
         if corr > threshold:
-            print(f"  {ticker} corr={corr:.2f} with open {pos_ticker} — skipping (concentration risk)")
+            print(f"  {ticker} corr={corr:.2f} with open/pending {pos_ticker} — skipping (concentration risk)")
             return True
     return False
 
@@ -966,7 +969,10 @@ def make_decision(ticker, signals, price):
     st *= {"trending_up": 1.3,  "ranging": 1.0, "trending_down": 0.8}.get(market_regime, 1.0)
     bt  = min(bt, 5.0); st = min(st, 5.0)
 
-    if buy_w >= bt and sell_w <= buy_w and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY):
+    n_buy_votes = sum(1 for s in signals if s.get("action") == "buy")
+
+    if (buy_w >= bt and sell_w <= buy_w and n_buy_votes >= 2
+            and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY)):
         action = "buy";  reason = f"bw={buy_w:.1f}>={bt:.1f}"
     elif sell_w >= st:
         action = "sell"; reason = f"sw={sell_w:.1f}>={st:.1f}"
