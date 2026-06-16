@@ -1469,20 +1469,30 @@ def update_rvol():
             if hasattr(bars.index,'levels'):
                 if ticker in bars.index.get_level_values(0): bars=bars.loc[ticker]
                 else: continue
-            avg_vol   = float(bars["volume"].mean())
-            latest    = api.get_latest_bar(ticker, feed="iex")
-            today_vol = float(latest.v)
-            now       = now_et()
-            mins_open = max(1,(now.hour-9)*60+now.minute-30)
-            # IEX sometimes returns v=0 for stocks that trade on NASDAQ/NYSE,
-            # not IEX. Fall back to volume history, but if that's also near-zero
-            # it means IEX has no coverage — don't cache anything (gate treats
-            # None as unknown and allows the trade through).
-            if today_vol <= 0:
+            avg_vol = float(bars["volume"].mean())
+
+            # Cumulative volume since market open today (sum of 1-min bars).
+            # get_latest_bar().v is a single minute bar — wrong scale vs daily avg_vol.
+            now         = now_et()
+            market_open = NY.localize(datetime.combine(now.date(),
+                              datetime.strptime("09:30", "%H:%M").time()))
+            open_str    = market_open.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            now_str     = datetime.now(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            mbars       = api.get_bars(ticker, "1Min", start=open_str, end=now_str,
+                              feed="iex", limit=400).df
+            if mbars is None or mbars.empty:
+                today_vol = 0
+            else:
+                if hasattr(mbars.index, 'levels'):
+                    if ticker in mbars.index.get_level_values(0): mbars = mbars.loc[ticker]
+                    else: time.sleep(0.2); continue
+                today_vol = float(mbars["volume"].sum())
+
+            mins_open = max(1, (now.hour - 9) * 60 + now.minute - 30)
+            if today_vol < 500:
                 vols = volume_history.get(ticker, [])
                 if vols: today_vol = sum(vols[-10:]) * (390 / mins_open / 10)
             if today_vol < 500:
-                # No real IEX volume data — leave rvol_cache[ticker] as None
                 time.sleep(0.2)
                 continue
             projected = today_vol * (390 / mins_open) if mins_open < 390 else today_vol
