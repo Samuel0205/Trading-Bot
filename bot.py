@@ -111,6 +111,7 @@ PRED_STRONG_BUY      = 40
 PRED_SKIP            = -35
 PRED_NEED_CONF       = -10
 DB_SNAPSHOT_INTERVAL = 3600
+DAILY_LOSS_LIMIT     = 300.0  # halt new buys if today's realized+unrealized P&L drops below -$300
 
 # NEW: RSI veto thresholds — hard blocks regardless of other signals
 RSI_OVERBOUGHT_VETO  = 75   # block buys when RSI above this
@@ -721,12 +722,12 @@ def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=
         # Small accounts need concentration to afford stocks; large accounts
         # don't — a 45% position in a $100k account is $45k in one volatile stock.
         if is_gap_play:
-            if   account_size > 10_000: pct = min(pct, 0.15)
-            elif account_size > 1_000:  pct = min(pct, 0.30)
+            if   account_size > 10_000: pct = min(pct, 0.12)
+            elif account_size > 1_000:  pct = min(pct, 0.25)
         else:
-            if   account_size > 10_000: pct = min(pct, 0.10)
-            elif account_size > 1_000:  pct = min(pct, 0.20)
-            elif account_size > 100:    pct = min(pct, 0.35)
+            if   account_size > 10_000: pct = min(pct, 0.07)
+            elif account_size > 1_000:  pct = min(pct, 0.18)
+            elif account_size > 100:    pct = min(pct, 0.30)
         max_spend = usable * pct
         if max_spend < price:
             print(f"  Can't afford ${price:.2f} (max ${max_spend:.2f})"); return 0
@@ -962,12 +963,14 @@ def make_decision(ticker, signals, price):
     # Trending down: buy is 1.5× harder + must have strong individual setup (pred >= PRED_STRONG_BUY).
     # Trending up:   buy is 0.85× easier; sell is 1.3× harder (let winners run).
     # Ranging:       neutral.
-    bt *= {"trending_up": 0.85, "ranging": 1.0, "trending_down": 1.5}.get(market_regime, 1.0)
+    bt *= {"trending_up": 0.85, "ranging": 1.2, "trending_down": 1.5}.get(market_regime, 1.0)
     st *= {"trending_up": 1.3,  "ranging": 1.0, "trending_down": 0.8}.get(market_regime, 1.0)
     bt  = min(bt, 5.0); st = min(st, 5.0)
 
-    if buy_w >= bt and sell_w <= buy_w and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY):
-        action = "buy";  reason = f"bw={buy_w:.1f}>={bt:.1f}"
+    n_buy_votes = sum(1 for s in signals if s.get("action") == "buy")
+    if (buy_w >= bt and sell_w <= buy_w and n_buy_votes >= 2
+            and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY)):
+        action = "buy";  reason = f"bw={buy_w:.1f}>={bt:.1f} v={n_buy_votes}"
     elif sell_w >= st:
         action = "sell"; reason = f"sw={sell_w:.1f}>={st:.1f}"
     elif buy_w >= bt and market_regime == "trending_down":
@@ -1102,6 +1105,20 @@ def execute(ticker, action, price, signals, reason="signal"):
             blackout, event_name = cached_blackout_today()
             if blackout:
                 print(f"  MACRO BLACKOUT: {event_name} — no trades today"); return
+
+            # Daily loss circuit breaker — halt new buys when today's P&L (realized +
+            # unrealized) drops below -DAILY_LOSS_LIMIT.  Uses Alpaca's equity vs
+            # last_equity so it captures open losses, not just closed ones.
+            try:
+                _cb_acct = get_account()
+                if _cb_acct:
+                    _daily_pnl = float(_cb_acct.equity) - float(_cb_acct.last_equity)
+                    if _daily_pnl < -DAILY_LOSS_LIMIT:
+                        print(f"  CIRCUIT BREAKER: daily P&L ${_daily_pnl:+.2f} "
+                              f"< -${DAILY_LOSS_LIMIT:.0f} — no new buys today")
+                        return
+            except Exception as _e:
+                print(f"  circuit breaker check error: {_e}")
 
             if not can_enter_new_position():
                 return
@@ -1652,7 +1669,7 @@ def prediction_loop():
             now  = now_et(); hour = now.hour; day = now.date()
             if day != pred_day: pred_done.clear(); pred_day = day
             changed = set(active_tickers) != set(last_tickers)
-            should  = (now.weekday()<5 and in_trading_window() and
+            should  = (now.weekday()<5 and in_trading_window() and is_market_open() and
                       ((hour in PRED_HOURS and hour not in pred_done) or changed))
             if should:
                 pred_done.add(hour); last_tickers = list(active_tickers)
@@ -1697,7 +1714,8 @@ def scanner_loop():
             need_startup = (not startup_scanned and now.weekday() < 5
                             and is_market_open() and in_trading_window())
             need_hourly  = (now.weekday() < 5 and hour in SCAN_HOURS
-                            and hour not in scan_done and in_trading_window())
+                            and hour not in scan_done and in_trading_window()
+                            and is_market_open())
             if need_startup or need_hourly:
                 startup_scanned = True
                 if need_hourly: scan_done.add(hour)
