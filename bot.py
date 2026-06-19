@@ -1652,7 +1652,7 @@ def prediction_loop():
             now  = now_et(); hour = now.hour; day = now.date()
             if day != pred_day: pred_done.clear(); pred_day = day
             changed = set(active_tickers) != set(last_tickers)
-            should  = (now.weekday()<5 and in_trading_window() and
+            should  = (now.weekday()<5 and in_trading_window() and is_market_open() and
                       ((hour in PRED_HOURS and hour not in pred_done) or changed))
             if should:
                 pred_done.add(hour); last_tickers = list(active_tickers)
@@ -1697,7 +1697,8 @@ def scanner_loop():
             need_startup = (not startup_scanned and now.weekday() < 5
                             and is_market_open() and in_trading_window())
             need_hourly  = (now.weekday() < 5 and hour in SCAN_HOURS
-                            and hour not in scan_done and in_trading_window())
+                            and hour not in scan_done and in_trading_window()
+                            and is_market_open())
             if need_startup or need_hourly:
                 startup_scanned = True
                 if need_hourly: scan_done.add(hour)
