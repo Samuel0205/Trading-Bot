@@ -968,7 +968,7 @@ def make_decision(ticker, signals, price):
     bt  = min(bt, 5.0); st = min(st, 5.0)
 
     n_buy_votes = sum(1 for s in signals if s.get("action") == "buy")
-    if (buy_w >= bt and sell_w <= buy_w and n_buy_votes >= 2
+    if (buy_w >= bt and sell_w < buy_w and n_buy_votes >= 2
             and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY)):
         action = "buy";  reason = f"bw={buy_w:.1f}>={bt:.1f} v={n_buy_votes}"
     elif sell_w >= st:
