@@ -481,8 +481,15 @@ def get_signals(ticker, price):
     ma50      = calc_ma(hist, min(50, n))
     ma200     = calc_ma(hist, min(200, n))
     mean, upper, lower = calc_bollinger(hist)
-    vwap      = calc_vwap(hist[-78:], vols[-78:])
+    # Use all available bars for VWAP (better approximation of session VWAP than 39-min window)
+    vwap      = calc_vwap(hist, vols)
     macd_line = calc_macd(hist)
+    # In ranging markets VWAP is a mean-reversion anchor: buy below it, sell above it.
+    # In trending markets VWAP is a momentum filter: buy above it (strength), sell below it.
+    if market_regime == "ranging":
+        vwap_bc, vwap_sc = price < vwap * 0.999, price > vwap * 1.001
+    else:
+        vwap_bc, vwap_sc = price > vwap * 1.001, price < vwap * 0.999
     z         = (price-mean)/max((upper-mean), 0.01)
     # Regime no longer hard-gates buys/sells — threshold multipliers in make_decision
     # handle it instead. Strong individual stocks can always be bought or sold.
@@ -526,10 +533,10 @@ def get_signals(ticker, price):
         },
         {
             "name":"VWAP",
-            "action": act(price>vwap*1.001, price<vwap*0.999,
+            "action": act(vwap_bc, vwap_sc,
                           veto_buy=rsi_overbought or price_extended),
             "signal": min(95,max(5,50+(price-vwap)/max(vwap,1)*500)),
-            "veto":   (rsi_overbought or price_extended) and price>vwap*1.001,
+            "veto":   (rsi_overbought or price_extended) and vwap_bc,
             "veto_reason": "RSI overbought" if rsi_overbought else ("extended" if price_extended else ""),
         },
         {
@@ -744,8 +751,8 @@ def check_stops(ticker, price):
     entry         = pos["entry"]
     gain_pct      = (price - entry) / entry
 
-    # Track highest price for gap play trailing stops
-    if pos.get("is_gap_play") and price > pos.get("highest_price", entry):
+    # Track highest price for trailing stop calculations (all positions, not just gap plays)
+    if price > pos.get("highest_price", entry):
         open_positions[ticker]["highest_price"] = price
 
     # partial exit — sell half at PARTIAL_EXIT_PCT gain, let rest run
@@ -776,7 +783,7 @@ def check_stops(ticker, price):
                 ticker)
         except Exception as e:
             print(f"  Partial exit error {ticker}: {e}")
-        return
+        # Fall through so stop/target checks still run on this tick
 
     if pos.get("is_gap_play"):
         highest = pos.get("highest_price", price)
@@ -791,13 +798,15 @@ def check_stops(ticker, price):
                 open_positions[ticker]["stop"] = be_stop
                 print(f"  GAP breakeven {ticker} → ${be_stop:.3f}")
     else:
-        # Trailing stop: once up 3%, trail at TRAILING_STOP_GAP_PCT below current price
-        if gain_pct > 0.03:
-            trail_stop = round(price * (1 - TRAILING_STOP_GAP_PCT), 3)
+        # Trailing stop: once up 5%, trail TRAILING_STOP_GAP_PCT below the highest price
+        # (tracks high-water mark, not current price, so a dip doesn't lower the trail)
+        if gain_pct > 0.05:
+            highest    = pos.get("highest_price", price)
+            trail_stop = round(highest * (1 - TRAILING_STOP_GAP_PCT), 3)
             new_stop   = max(pos["stop"], trail_stop)
             if new_stop > pos["stop"]:
                 open_positions[ticker]["stop"] = new_stop
-                print(f"  Trail stop {ticker} → ${new_stop:.3f}")
+                print(f"  Trail stop {ticker} → ${new_stop:.3f} (high=${highest:.2f})")
 
     if   price <= pos["stop"]:   force_sell(ticker, price, reason="stop_loss")
     elif price >= pos["target"]: force_sell(ticker, price, reason="take_profit")
@@ -971,7 +980,7 @@ def make_decision(ticker, signals, price):
     if (buy_w >= bt and sell_w < buy_w and n_buy_votes >= 2
             and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY)):
         action = "buy";  reason = f"bw={buy_w:.1f}>={bt:.1f} v={n_buy_votes}"
-    elif sell_w >= st:
+    elif sell_w >= st and buy_w < sell_w:
         action = "sell"; reason = f"sw={sell_w:.1f}>={st:.1f}"
     elif buy_w >= bt and market_regime == "trending_down":
         action = "hold"; reason = f"downtrend:pred({pscore:+.0f})<{PRED_STRONG_BUY}"
@@ -1263,7 +1272,7 @@ def execute(ticker, action, price, signals, reason="signal"):
             if held_secs < 300:
                 print(f"  {ticker} min hold: {int(held_secs)}s < 300s — signal sell suppressed")
             else:
-                force_sell(ticker, price, reason=reason or "signal")
+                force_sell(ticker, price, reason="signal")
     except Exception as e:
         print(f"Order error {ticker}: {e}")
 
