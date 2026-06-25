@@ -102,7 +102,7 @@ GAP_ENTRY_WINDOW_MINS = 90     # don't enter gap plays after 90 min post-open
 TRAILING_STOP_GAP_PCT = 0.03   # trail stop 3% below highest price for gap plays
 BREAKEVEN_TRIGGER_PCT = 0.08   # move stop to breakeven when up 8%
 TRAILING_TRIGGER_PCT  = 0.15   # activate 3% trail once up 15%
-RVOL_THRESHOLD        = 1.2
+RVOL_THRESHOLD        = 1.5
 CHOP_BLOCK_THRESHOLD  = 2      # stop a ticker for rest of day after this many stop losses
 RVOL_PROMOTE_MIN     = 2.5   # NEW: promote ticker to active list if rvol exceeds this
 BASE_BUY_THRESHOLD   = 2.0
@@ -110,11 +110,17 @@ BASE_SELL_THRESHOLD  = 2.0
 PRED_STRONG_BUY      = 40
 PRED_SKIP            = -35
 PRED_NEED_CONF       = -10
+MIN_BUY_PRED         = 10     # minimum prediction score required to enter a buy
 DB_SNAPSHOT_INTERVAL = 3600
 DAILY_LOSS_LIMIT     = 300.0  # halt new buys if today's realized+unrealized P&L drops below -$300
+RISK_PER_TRADE       = 150.0  # max dollar risk per trade (ATR-based sizing)
+ATR_STOP_MULT        = 1.5    # stop distance = ATR × this multiplier
+REGIME_COOLDOWN_SECS = 7200   # min seconds between regime changes (prevents intraday flipping)
 
-# NEW: RSI veto thresholds — hard blocks regardless of other signals
-RSI_OVERBOUGHT_VETO  = 75   # block buys when RSI above this
+# RSI veto thresholds — hard blocks regardless of other signals
+# Overbought lowered to 70 to match the momentum RSI buy zone (50-70);
+# anything above 70 is too extended to add exposure.
+RSI_OVERBOUGHT_VETO  = 70   # block buys when RSI above this
 RSI_OVERSOLD_VETO    = 25   # block sells when RSI below this
 
 # NEW: price extension veto — don't chase extended moves
@@ -126,7 +132,7 @@ BASE_SIGNAL_WEIGHTS = {
     "Bollinger":      1.0,
     "VWAP":           1.5,
     "MACD":           1.0,
-    "Mean Reversion": 0.8,
+    "Mean Reversion": 0.3,  # reduced — momentum strategy doesn't buy weakness
 }
 
 FALLBACK_TICKERS = ["SOFI","HOOD","NIO","MARA","RIOT","PLTR","AFRM","DKNG","SNAP","RIVN"]
@@ -166,6 +172,7 @@ ORDER_FILL_TIMEOUT   = 90       # seconds before an unfilled limit order is canc
 _blackout_cache      = {"date": None, "result": (False, None)}
 _blackout_cache_lock = threading.Lock()
 _regime_lock         = threading.Lock()
+_last_regime_time    = 0.0   # Unix timestamp of last regime change (cooldown guard)
 _trade_count_lock    = threading.Lock()
 _positions_lock      = threading.Lock()   # guards open_positions check-then-set
 
@@ -499,9 +506,16 @@ def get_signals(ticker, price):
     ma_conf   = min(1.0, n/20)
 
     # NEW: veto conditions — hard blocks independent of vote weights
-    rsi_overbought    = rsi > RSI_OVERBOUGHT_VETO
-    rsi_oversold      = rsi < RSI_OVERSOLD_VETO
+    rsi_overbought    = rsi > RSI_OVERBOUGHT_VETO   # RSI > 70
+    rsi_oversold      = rsi < RSI_OVERSOLD_VETO     # RSI < 25
     price_extended    = (price - mean) / max(mean, 0.01) > PRICE_EXTENSION_VETO
+    # Bollinger direction depends on regime:
+    #   ranging  → bounce: buy at lower band, sell at upper band (mean reversion)
+    #   trending → breakout: buy above upper band, sell below lower band (momentum)
+    if market_regime == "ranging":
+        boll_bc, boll_sc = price < lower * 0.99, price > upper * 1.01
+    else:
+        boll_bc, boll_sc = price > upper * 1.01, price < lower * 0.99
 
     def act(bc, sc, veto_buy=False, veto_sell=False):
         if bc and ok_buy  and not veto_buy:  return "buy"
@@ -519,17 +533,20 @@ def get_signals(ticker, price):
         },
         {
             "name":"RSI",
-            "action": act(rsi<35, rsi>65),
+            # Momentum RSI: buy when RSI is in the 50-70 strength zone (confirmed momentum,
+            # not yet overbought). Sell when RSI drops below 40 (momentum lost).
+            # Replaces the old mean-reversion RSI (buy <35 oversold, sell >65 overbought).
+            "action": act(50<=rsi<=70, rsi<40),
             "signal": 100-rsi,
             "veto":   False, "veto_reason": "",
         },
         {
             "name":"Bollinger",
-            "action": act(price<lower*0.99, price>upper*1.01,
+            "action": act(boll_bc, boll_sc,
                           veto_buy=rsi_overbought or price_extended,
                           veto_sell=rsi_oversold),
             "signal": max(5,min(95,50-z*40)),
-            "veto":   (rsi_overbought or price_extended) and price<lower*0.99,
+            "veto":   (rsi_overbought or price_extended) and boll_bc,
             "veto_reason": "RSI overbought" if rsi_overbought else ("extended" if price_extended else ""),
         },
         {
@@ -609,10 +626,21 @@ def update_market_regime():
         ma5    = calc_ma(closes, min(5,  len(closes)))
         ma10   = calc_ma(closes, min(10, len(closes)))
         latest = closes[-1]
+        # Tighter 1% threshold reduces false regime flips on small daily moves
+        if   ma5 > ma10 * 1.010 and latest > ma5: new_regime = "trending_up"
+        elif ma5 < ma10 * 0.990 and latest < ma5: new_regime = "trending_down"
+        else:                                      new_regime = "ranging"
+        global _last_regime_time
+        now_ts = time.time()
+        if new_regime != market_regime:
+            elapsed = now_ts - _last_regime_time
+            if elapsed < REGIME_COOLDOWN_SECS:
+                print(f"  Regime: {new_regime} detected but cooldown "
+                      f"({elapsed/60:.0f}/{REGIME_COOLDOWN_SECS//60}min) — keeping {market_regime}")
+                return
+            _last_regime_time = now_ts
         with _regime_lock:
-            if   ma5>ma10*1.005 and latest>ma5: market_regime="trending_up"
-            elif ma5<ma10*0.995 and latest<ma5: market_regime="trending_down"
-            else:                               market_regime="ranging"
+            market_regime = new_regime
         print(f"Regime: {market_regime} (source: {regime_src}, ma5={ma5:.2f} ma10={ma10:.2f})")
     except Exception as e:
         print(f"Regime error: {e}")
@@ -711,32 +739,44 @@ def passes_filters(ticker, price, account_size=None):
 
 # ── Position sizing ───────────────────────────────────────────
 
-def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=False):
+def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=False, atr=None):
     try:
         if account_size is None: account_size = get_account_size()
         usable = get_available_cash()
         if usable <= 0: return 0
-        if is_gap_play:
-            pct = 0.65   # larger allocation for catalyst-driven gap plays
-        elif pred_score >= PRED_STRONG_BUY: pct = 0.60
-        elif pred_score >= 0:               pct = MAX_TRADE_PCT
-        else:                               pct = 0.30
-        if not is_gap_play:
-            if   rvol >= 3.0: pct = min(pct*1.15, 0.65)
-            elif rvol >= 2.0: pct = min(pct*1.05, 0.55)
-        if   price < 1.00: pct *= 0.80
-        elif price < 2.00: pct *= 0.90
-        # Hard cap on single-position concentration as account grows.
-        # Small accounts need concentration to afford stocks; large accounts
-        # don't — a 45% position in a $100k account is $45k in one volatile stock.
-        if is_gap_play:
-            if   account_size > 10_000: pct = min(pct, 0.12)
-            elif account_size > 1_000:  pct = min(pct, 0.25)
+
+        if atr is not None and atr > 0 and not is_gap_play:
+            # ATR-based risk sizing: risk exactly RISK_PER_TRADE dollars per trade.
+            # stop_distance = ATR × ATR_STOP_MULT; shares = budget / stop_distance.
+            # This automatically sizes smaller on volatile stocks and larger on calm ones.
+            stop_dist = atr * ATR_STOP_MULT
+            atr_qty   = int(RISK_PER_TRADE / stop_dist)
+            max_spend = atr_qty * price
+            # Hard cap: never risk more than 7% of account regardless of ATR
+            max_spend = min(max_spend, usable * 0.07)
+            print(f"  ATR sizing: atr={atr:.3f} stop_dist={stop_dist:.3f} "
+                  f"qty={atr_qty} spend=${max_spend:.0f}")
         else:
-            if   account_size > 10_000: pct = min(pct, 0.07)
-            elif account_size > 1_000:  pct = min(pct, 0.18)
-            elif account_size > 100:    pct = min(pct, 0.30)
-        max_spend = usable * pct
+            # Fallback: percentage-based sizing (gap plays, or when ATR unavailable)
+            if is_gap_play:
+                pct = 0.65
+            elif pred_score >= PRED_STRONG_BUY: pct = 0.60
+            elif pred_score >= 0:               pct = MAX_TRADE_PCT
+            else:                               pct = 0.30
+            if not is_gap_play:
+                if   rvol >= 3.0: pct = min(pct*1.15, 0.65)
+                elif rvol >= 2.0: pct = min(pct*1.05, 0.55)
+            if   price < 1.00: pct *= 0.80
+            elif price < 2.00: pct *= 0.90
+            if is_gap_play:
+                if   account_size > 10_000: pct = min(pct, 0.12)
+                elif account_size > 1_000:  pct = min(pct, 0.25)
+            else:
+                if   account_size > 10_000: pct = min(pct, 0.07)
+                elif account_size > 1_000:  pct = min(pct, 0.18)
+                elif account_size > 100:    pct = min(pct, 0.30)
+            max_spend = usable * pct
+
         if max_spend < price:
             print(f"  Can't afford ${price:.2f} (max ${max_spend:.2f})"); return 0
         return max(0, int(max_spend/price))
@@ -979,6 +1019,7 @@ def make_decision(ticker, signals, price):
 
     n_buy_votes = sum(1 for s in signals if s.get("action") == "buy")
     if (buy_w >= bt and sell_w < buy_w and n_buy_votes >= 2
+            and pscore >= MIN_BUY_PRED
             and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY)):
         action = "buy";  reason = f"bw={buy_w:.1f}>={bt:.1f} v={n_buy_votes}"
     elif sell_w >= st and buy_w < sell_w:
@@ -1169,10 +1210,9 @@ def execute(ticker, action, price, signals, reason="signal"):
             is_gap_play = (ticker in gap_candidates and
                            gap_candidates.get(ticker, {}).get("direction") == "up" and
                            abs(gap_candidates.get(ticker, {}).get("gap_pct", 0)) >= GAP_GO_MIN_PCT)
-            qty         = position_size(price, acct_size, pred_score, rvol, is_gap_play)
-            if qty == 0:
-                print(f"  {ticker} qty 0"); return
 
+            # Compute ATR-based stop FIRST so position_size can use it for
+            # risk-calibrated sizing (RISK_PER_TRADE / stop_distance = shares).
             stop   = round(price*(1-STOP_LOSS_PCT), 3)
             target = round(price*(1+TAKE_PROFIT_PCT), 3)
             atr    = None
@@ -1182,6 +1222,10 @@ def execute(ticker, action, price, signals, reason="signal"):
                     stop, target, atr = calculate_stops(api, ticker, price,
                                                         STOP_LOSS_PCT, TAKE_PROFIT_PCT)
             except: pass
+
+            qty = position_size(price, acct_size, pred_score, rvol, is_gap_play, atr=atr)
+            if qty == 0:
+                print(f"  {ticker} qty 0"); return
 
             if is_gap_play:
                 target = round(price * 2.0, 3)   # gap-and-go: target 100% gain (let momentum run)
