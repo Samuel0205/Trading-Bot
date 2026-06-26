@@ -508,7 +508,9 @@ def get_signals(ticker, price):
     # NEW: veto conditions — hard blocks independent of vote weights
     rsi_overbought    = rsi > RSI_OVERBOUGHT_VETO   # RSI > 70
     rsi_oversold      = rsi < RSI_OVERSOLD_VETO     # RSI < 25
-    price_extended    = (price - mean) / max(mean, 0.01) > PRICE_EXTENSION_VETO
+    rvol_now          = rvol_cache.get(ticker, 0.0)
+    # High-rvol breakouts (≥5×) are genuine momentum setups — extension veto doesn't apply
+    price_extended    = rvol_now < 5.0 and (price - mean) / max(mean, 0.01) > PRICE_EXTENSION_VETO
     # Bollinger direction depends on regime:
     #   ranging  → bounce: buy at lower band, sell at upper band (mean reversion)
     #   trending → breakout: buy above upper band, sell below lower band (momentum)
@@ -1715,7 +1717,7 @@ def premarket_loop():
         time.sleep(60)
 
 def prediction_loop():
-    global prediction_cache
+    global prediction_cache, active_tickers
     pred_done = set(); pred_day = None; last_tickers = []
     while True:
         try:
@@ -1739,6 +1741,14 @@ def prediction_loop():
                         prediction_cache.update(results)
                         summary = [(t,f"{r.get('score',0):+.0f}") for t,r in results.items()]
                         print(f"Predictions: {summary}")
+                        # Prune tickers with strongly negative predictions — won't buy them
+                        prune = [t for t in list(active_tickers)
+                                 if prediction_cache.get(t, {}).get("score", 0) < -30
+                                 and t not in open_positions
+                                 and t not in FALLBACK_TICKERS]
+                        if prune:
+                            active_tickers = [t for t in active_tickers if t not in prune]
+                            print(f"Pruned from active_tickers (neg pred): {prune}")
                         socketio.emit("predictions", {
                             t:{"score":r.get("score",0),"label":r.get("label","neutral"),
                                "confidence":r.get("confidence","low"),
@@ -1952,10 +1962,14 @@ def bot_loop():
                         "catalyst_headline":  cat.get("headline", ""),
                         "is_gap_play":        pos.get("is_gap_play", False) if pos else False,
                     }
-                    print(f"  {ticker}: ${price:.2f} | {action} | "
+                    _rvol_disp   = rvol_cache.get(ticker)
+                    _rvol_low    = (_rvol_disp is not None and _rvol_disp >= 0.10
+                                    and _rvol_disp < RVOL_THRESHOLD)
+                    display_act  = "hold(rvol_low)" if action == "buy" and _rvol_low else action
+                    print(f"  {ticker}: ${price:.2f} | {display_act} | "
                           f"v={n_b}b/{n_s}s veto={n_v} w={buy_w:.1f}/{sell_w:.1f} | "
                           f"{market_regime} pred={pred.get('score',0):+.0f}"
-                          +(f" rvol={rvol_cache.get(ticker,0):.1f}x" if ticker in rvol_cache else "")
+                          +(f" rvol={_rvol_disp:.1f}x" if _rvol_disp is not None else "")
                           +(f" GAP" if ticker in gap_candidates else "")
                           +(f" cd:{cd}s" if cd else ""))
                 except Exception as e:
