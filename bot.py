@@ -508,7 +508,9 @@ def get_signals(ticker, price):
     # NEW: veto conditions — hard blocks independent of vote weights
     rsi_overbought    = rsi > RSI_OVERBOUGHT_VETO   # RSI > 70
     rsi_oversold      = rsi < RSI_OVERSOLD_VETO     # RSI < 25
-    price_extended    = (price - mean) / max(mean, 0.01) > PRICE_EXTENSION_VETO
+    rvol_now          = rvol_cache.get(ticker, 0.0)
+    # High-rvol breakouts (≥5×) are genuine momentum setups — extension veto doesn't apply
+    price_extended    = rvol_now < 5.0 and (price - mean) / max(mean, 0.01) > PRICE_EXTENSION_VETO
     # Bollinger direction depends on regime:
     #   ranging  → bounce: buy at lower band, sell at upper band (mean reversion)
     #   trending → breakout: buy above upper band, sell below lower band (momentum)
@@ -1142,20 +1144,20 @@ def execute(ticker, action, price, signals, reason="signal"):
             # Block if there's already a pending limit order for this ticker
             if ticker in _pending_buy_tickers:
                 print(f"  {ticker} pending limit order in flight — skipping")
-                return
+                return "blk:pending"
 
             if is_on_cooldown(ticker):
-                print(f"  {ticker} cooldown {cooldown_remaining(ticker)}s"); return
+                print(f"  {ticker} cooldown {cooldown_remaining(ticker)}s"); return "blk:cooldown"
 
             # Anti-chop gate: block re-entry if stopped out CHOP_BLOCK_THRESHOLD times today
             today_str = now_et().strftime("%Y-%m-%d")
             stops_today = _daily_stop_counts.get(ticker, {}).get(today_str, 0)
             if stops_today >= CHOP_BLOCK_THRESHOLD:
-                print(f"  CHOP BLOCK: {ticker} stopped out {stops_today}x today"); return
+                print(f"  CHOP BLOCK: {ticker} stopped out {stops_today}x today"); return "blk:chop"
 
             blackout, event_name = cached_blackout_today()
             if blackout:
-                print(f"  MACRO BLACKOUT: {event_name} — no trades today"); return
+                print(f"  MACRO BLACKOUT: {event_name} — no trades today"); return "blk:blackout"
 
             # Daily loss circuit breaker — halt new buys when today's P&L (realized +
             # unrealized) drops below -DAILY_LOSS_LIMIT.  Uses Alpaca's equity vs
@@ -1167,16 +1169,16 @@ def execute(ticker, action, price, signals, reason="signal"):
                     if _daily_pnl < -DAILY_LOSS_LIMIT:
                         print(f"  CIRCUIT BREAKER: daily P&L ${_daily_pnl:+.2f} "
                               f"< -${DAILY_LOSS_LIMIT:.0f} — no new buys today")
-                        return
+                        return "blk:circuit"
             except Exception as _e:
                 print(f"  circuit breaker check error: {_e}")
 
             if not can_enter_new_position():
-                return
+                return "blk:maxpos"
 
             # Correlation check — avoid doubling up on highly correlated positions
             if open_positions and is_correlated_with_open_position(ticker):
-                return
+                return "blk:corr"
 
             # Earnings risk — cached per ticker per day
             today_str = now_et().strftime("%Y-%m-%d")
@@ -1187,11 +1189,11 @@ def execute(ticker, action, price, signals, reason="signal"):
                 earn_risk, earn_adj, earn_detail = check_earnings_risk(api, ticker)
                 _earnings_cache[ticker] = (today_str, (earn_risk, earn_adj, earn_detail))
             if earn_risk == "high":
-                print(f"  {ticker} earnings risk HIGH — skipping"); return
+                print(f"  {ticker} earnings risk HIGH — skipping"); return "blk:earnings"
 
             acct_size = get_account_size()
             if not passes_filters(ticker, price, acct_size):
-                return  # passes_filters already prints its reason
+                return "blk:filter"  # passes_filters already prints its reason
 
             # Real-time trend check: if price is below the 20-bar MA and prediction
             # isn't strongly bullish, skip the buy. Catches downtrends early without
@@ -1203,7 +1205,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                 if price < ma20 * 0.995 and pred_score_rt < PRED_STRONG_BUY:
                     print(f"  {ticker} below MA20 (${ma20:.2f}) + pred not strong "
                           f"({pred_score_rt:+.0f}) — skipping buy")
-                    return
+                    return "blk:trend"
 
             pred_score  = prediction_cache.get(ticker, {}).get("score", 0)
             rvol        = rvol_cache.get(ticker, 1.0)
@@ -1225,12 +1227,12 @@ def execute(ticker, action, price, signals, reason="signal"):
 
             qty = position_size(price, acct_size, pred_score, rvol, is_gap_play, atr=atr)
             if qty == 0:
-                print(f"  {ticker} qty 0"); return
+                print(f"  {ticker} qty 0"); return "blk:qty0"
 
             if is_gap_play:
                 target = round(price * 2.0, 3)   # gap-and-go: target 100% gain (let momentum run)
             if (target-price)/price < MIN_PROFIT_PCT:
-                print(f"  {ticker} profit too low"); return
+                print(f"  {ticker} profit too low"); return "blk:lowprofit"
 
             with _trade_count_lock:
                 today = now_et().date()
@@ -1244,7 +1246,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                         _ops_stats["blocked_buy_tickers"].add(ticker)
                     except Exception:
                         pass
-                    return
+                    return "blk:daily"
                 # Rolling 2-hour window throttle — spread entries across the trading day
                 # so the full daily budget isn't consumed in the first session
                 _now_ts = time.time()
@@ -1253,7 +1255,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                 if len(_trade_window_times) >= MAX_WINDOW_TRADES:
                     print(f"  Window limit: {len(_trade_window_times)}/{MAX_WINDOW_TRADES} "
                           f"trades in last {TRADE_WINDOW_SECS//60}min")
-                    return
+                    return "blk:window"
                 daily_trade_count += 1
                 current_count = daily_trade_count
                 _trade_window_times.append(_now_ts)
@@ -1266,7 +1268,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                         daily_trade_count = max(0, daily_trade_count - 1)
                         try: _trade_window_times.remove(_now_ts)
                         except ValueError: pass
-                    return
+                    return "blk:race"
 
             # Submit as limit order at 0.3% above current price.
             # Eliminates market-order slippage on thin stocks while still filling
@@ -1286,7 +1288,7 @@ def execute(ticker, action, price, signals, reason="signal"):
                     daily_trade_count = max(0, daily_trade_count - 1)
                     try: _trade_window_times.remove(_now_ts)
                     except ValueError: pass
-                return
+                return "blk:orderfail"
 
             with _pending_lock:
                 _pending_orders[order.id] = {
@@ -1310,16 +1312,19 @@ def execute(ticker, action, price, signals, reason="signal"):
             print(f"{mode} LIMIT ORDER {qty}x {ticker} @ ${limit_price:.3f} "
                   f"SL${stop} TP${target} pred={pred_score:+.0f} "
                   f"#{current_count}/{MAX_DAILY_TRADES}")
+            return "submitted"
 
         elif action == "sell" and ticker in open_positions:
             pos = open_positions.get(ticker, {})
             held_secs = time.time() - pos.get("hold_since", 0)
             if held_secs < 300:
                 print(f"  {ticker} min hold: {int(held_secs)}s < 300s — signal sell suppressed")
-            else:
-                force_sell(ticker, price, reason="signal")
+                return "blk:minhold"
+            force_sell(ticker, price, reason="signal")
+            return "sold"
     except Exception as e:
         print(f"Order error {ticker}: {e}")
+        return "blk:error"
 
 # ── Universe / tickers ────────────────────────────────────────
 
@@ -1715,7 +1720,7 @@ def premarket_loop():
         time.sleep(60)
 
 def prediction_loop():
-    global prediction_cache
+    global prediction_cache, active_tickers
     pred_done = set(); pred_day = None; last_tickers = []
     while True:
         try:
@@ -1739,6 +1744,14 @@ def prediction_loop():
                         prediction_cache.update(results)
                         summary = [(t,f"{r.get('score',0):+.0f}") for t,r in results.items()]
                         print(f"Predictions: {summary}")
+                        # Prune tickers with strongly negative predictions — won't buy them
+                        prune = [t for t in list(active_tickers)
+                                 if prediction_cache.get(t, {}).get("score", 0) < -30
+                                 and t not in open_positions
+                                 and t not in FALLBACK_TICKERS]
+                        if prune:
+                            active_tickers = [t for t in active_tickers if t not in prune]
+                            print(f"Pruned from active_tickers (neg pred): {prune}")
                         socketio.emit("predictions", {
                             t:{"score":r.get("score",0),"label":r.get("label","neutral"),
                                "confidence":r.get("confidence","low"),
@@ -1921,8 +1934,9 @@ def bot_loop():
                     check_stops(ticker, price)
                     sigs              = get_signals(ticker, price)
                     action, reason, buy_w, sell_w = make_decision(ticker, sigs, price)
+                    exec_outcome = None
                     if action != "hold":
-                        execute(ticker, action, price, sigs, reason=reason)
+                        exec_outcome = execute(ticker, action, price, sigs, reason=reason)
                     pos  = open_positions.get(ticker)
                     pred = prediction_cache.get(ticker, {})
                     cd   = cooldown_remaining(ticker)
@@ -1951,11 +1965,18 @@ def bot_loop():
                         "catalyst_score":     cat.get("score"),
                         "catalyst_headline":  cat.get("headline", ""),
                         "is_gap_play":        pos.get("is_gap_play", False) if pos else False,
+                        "outcome":            exec_outcome,
                     }
-                    print(f"  {ticker}: ${price:.2f} | {action} | "
+                    # Display the real execution outcome (submitted / blk:<reason>)
+                    # when execute() ran — otherwise the raw decision. This keeps the
+                    # log honest: a "buy" decision that was blocked downstream no longer
+                    # prints as "buy".
+                    _rvol_disp   = rvol_cache.get(ticker)
+                    display_act  = exec_outcome or action
+                    print(f"  {ticker}: ${price:.2f} | {display_act} | "
                           f"v={n_b}b/{n_s}s veto={n_v} w={buy_w:.1f}/{sell_w:.1f} | "
                           f"{market_regime} pred={pred.get('score',0):+.0f}"
-                          +(f" rvol={rvol_cache.get(ticker,0):.1f}x" if ticker in rvol_cache else "")
+                          +(f" rvol={_rvol_disp:.1f}x" if _rvol_disp is not None else "")
                           +(f" GAP" if ticker in gap_candidates else "")
                           +(f" cd:{cd}s" if cd else ""))
                 except Exception as e:
