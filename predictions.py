@@ -353,25 +353,35 @@ def market_condition_forecast(api, regime):
 
 def calculate_stops(api, ticker, entry_price, stop_pct=0.05, target_pct=0.10):
     """
-    ATR-adjusted stop and target.
-    Stop:   entry - (ATR × 1.5)   — room for normal volatility
-    Target: entry + (ATR × 3.0)   — 2:1 reward/risk minimum
+    Intraday stop/target with a fixed 2:1 reward/risk.
+
+    The stop distance starts from 1.5×(daily ATR) but is CLAMPED to a reachable
+    intraday band [1.5%, 4%] of price, and the target is always exactly 2× that
+    stop distance. This is deliberate:
+
+    - The old version set stop = entry-1.5×ATR (a *daily* ATR ≈ 8-10% for a meme
+      stock) then clamped it to [2%,10%]. A ~10% stop and a 3×ATR (~28%) target
+      almost never trigger within one session, so every position rode to the 3:28pm
+      EOD market dump — the ATR "risk management" never actually engaged intraday.
+    - It also disagreed with position_size(), which sized shares as if the stop sat
+      at exactly 1.5×ATR, so realized risk ≠ RISK_PER_TRADE.
+
+    Returning a tight, reachable stop and a consistent 2× target means exits fire
+    intraday and the payoff is symmetric-positive (risk 1R, target 2R). Callers
+    size the position off the ACTUAL stop distance (entry - stop) so $ risk is real.
     """
     bars = safe_bars(api, ticker, days=10, limit=10)
+    atr  = None
     if bars is not None and len(bars) >= 5:
-        atr = calc_atr(bars, period=min(10, len(bars)-1))
-        if atr > 0:
-            stop   = round(entry_price - (atr * 1.5), 3)
-            target = round(entry_price + (atr * 3.0), 3)
-            stop   = max(stop,   entry_price * 0.90)
-            stop   = min(stop,   entry_price * 0.98)
-            target = max(target, entry_price * 1.05)
-            return stop, target, round(atr, 4)
-    return (
-        round(entry_price * (1 - stop_pct),  3),
-        round(entry_price * (1 + target_pct), 3),
-        None
-    )
+        a = calc_atr(bars, period=min(10, len(bars)-1))
+        if a and a > 0:
+            atr = a
+    raw_dist  = (atr * 1.5) if atr else (entry_price * stop_pct)
+    # Clamp the stop distance to a reachable intraday band: 1.5%–4% of price.
+    stop_dist = min(max(raw_dist, entry_price * 0.015), entry_price * 0.04)
+    stop      = round(entry_price - stop_dist, 3)
+    target    = round(entry_price + stop_dist * 2.0, 3)   # fixed 2:1 reward/risk
+    return stop, target, (round(atr, 4) if atr else None)
 
 # ── Master prediction for one ticker ─────────────────────────
 

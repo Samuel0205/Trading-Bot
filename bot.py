@@ -74,7 +74,7 @@ DEFAULT_MAX_ACCOUNT  = float(os.environ.get("MAX_ACCOUNT", "30.00"))
 MAX_TRADE_PCT        = 0.45
 STOP_LOSS_PCT        = 0.05
 TAKE_PROFIT_PCT      = 0.12
-PARTIAL_EXIT_PCT     = 0.06   # NEW: sell half position at 6% gain
+PARTIAL_EXIT_PCT     = 0.06   # fallback partial-exit gain when per-trade risk (1R) is unknown
 INTERVAL             = 30
 MIN_GRADE            = ["A","B","C","D"]
 COOLDOWN_STOP        = 900
@@ -90,10 +90,17 @@ SCAN_HOURS           = [10, 12]
 PRED_HOURS           = [9, 10, 11, 12, 13, 14]   # refresh every hour during trading day
 PRED_MAX_AGE_SECS    = 5400                        # 90 min — treat stale prediction as neutral
 MACRO_REFRESH_HOURS  = [8, 12]
-MIN_PROFIT_PCT       = 0.04
+MIN_PROFIT_PCT       = 0.025  # min target distance; must sit below the 2:1 target of the
+                              # tightest stop (1.5% stop → 3% target) or valid low-ATR
+                              # entries get blocked with blk:lowprofit
 MAX_DAILY_TRADES     = 10
 TRADE_WINDOW_SECS    = 7200   # 2-hour rolling window for trade spreading
 MAX_WINDOW_TRADES    = 4      # max new entries in any 2-hour window
+MAX_OPEN_POSITIONS   = 4      # max concurrent open positions (concentration cap)
+SIGNAL_WARMUP_BARS   = 16     # bars before signals may vote — the RSI-defaults-to-50
+                              # phantom-buy needs ≥16 bars to clear; MACD safely holds
+                              # (returns 0) below 26, so this doesn't starve gap-and-go
+MAX_PER_SECTOR       = 2      # max watchlist names from any one sector group
 GAP_MIN_PCT          = 2.0
 GAP_MAX_PCT          = 15.0
 GAP_MIN_RVOL          = 1.5
@@ -114,7 +121,6 @@ MIN_BUY_PRED         = 10     # minimum prediction score required to enter a buy
 DB_SNAPSHOT_INTERVAL = 3600
 DAILY_LOSS_LIMIT     = 300.0  # halt new buys if today's realized+unrealized P&L drops below -$300
 RISK_PER_TRADE       = 150.0  # max dollar risk per trade (ATR-based sizing)
-ATR_STOP_MULT        = 1.5    # stop distance = ATR × this multiplier
 REGIME_COOLDOWN_SECS = 7200   # min seconds between regime changes (prevents intraday flipping)
 
 # RSI veto thresholds — hard blocks regardless of other signals
@@ -249,6 +255,14 @@ def can_enter_new_position():
         return False
     if remaining < 5:
         print(f"  Time gate: too close to close ({remaining}min left)")
+        return False
+    # Concentration cap: never hold more than MAX_OPEN_POSITIONS at once. Counts
+    # in-flight pending buy orders too — otherwise up to MAX_WINDOW_TRADES limit
+    # orders could all be submitted while open_positions still reads under the cap,
+    # then all fill and breach it. Bounds how much a single macro move can cost.
+    in_flight = len(open_positions) + len(_pending_buy_tickers)
+    if in_flight >= MAX_OPEN_POSITIONS:
+        print(f"  Position cap: {in_flight}/{MAX_OPEN_POSITIONS} (open+pending) — no new entry")
         return False
     return True
 
@@ -397,12 +411,38 @@ def _pearson(a, b, n=30):
     sb     = (sum((y-mb)**2 for y in b) / n) ** 0.5
     return cov / (sa*sb) if sa > 0 and sb > 0 else 0.0
 
+def _ticker_sector(ticker):
+    """Sector-group name for a ticker (from scanner.SECTOR_GROUPS), or None."""
+    try:
+        from scanner import TICKER_SECTOR
+        return TICKER_SECTOR.get(ticker)
+    except Exception:
+        return None
+
 def is_correlated_with_open_position(ticker, threshold=0.75):
     """
-    Returns True if the candidate ticker's recent price moves are highly
-    correlated with any currently open position.  Prevents doubling up on
-    the same underlying bet (e.g. MARA + RIOT both tracking Bitcoin).
+    Returns True if the candidate ticker is highly correlated with any currently
+    open position — prevents doubling up on the same underlying bet (e.g. MARA +
+    RIOT both tracking Bitcoin).
+
+    Two checks, so the guard works even before intraday price history accumulates:
+      1. Sector membership — same scanner sector group ⇒ correlated. This catches
+         the crypto/EV clusters at 9:35 AM when there aren't yet 10 price samples
+         to compute a Pearson correlation (the old blind spot that let the bot open
+         MARA+RIOT back-to-back before any data existed).
+      2. Pearson correlation of recent moves > threshold, when enough data exists.
     """
+    cand_sector = _ticker_sector(ticker)
+    # Include in-flight pending buys so two same-sector orders can't both be submitted
+    # before either fills (they wouldn't yet appear in open_positions).
+    for pos_ticker in list(open_positions.keys()) + list(_pending_buy_tickers):
+        if pos_ticker == ticker:
+            continue
+        # 1. Sector-cluster block (works with zero price history)
+        if cand_sector and _ticker_sector(pos_ticker) == cand_sector:
+            print(f"  {ticker} same sector ({cand_sector}) as open/pending {pos_ticker} — skipping (concentration risk)")
+            return True
+    # 2. Statistical correlation (needs history on both legs)
     candidate = price_history.get(ticker, [])
     if len(candidate) < 10:
         return False
@@ -478,7 +518,11 @@ def get_signals(ticker, price):
     hist = price_history.get(ticker, [])
     vols = volume_history.get(ticker, [])
     n    = len(hist)
-    if n < 5:
+    # Warm-up guard: RSI/Bollinger/MACD/VWAP all return neutral/garbage on thin data
+    # (calc_rsi defaults to 50 — inside the buy zone — with <16 bars, which produced
+    # phantom buy votes on every restart). Require enough bars for the heaviest
+    # indicator (MACD=26) before any signal is allowed to vote.
+    if n < SIGNAL_WARMUP_BARS:
         return [{
             "name":k,"action":"hold","signal":50,
             "veto":False,"veto_reason":""
@@ -491,13 +535,13 @@ def get_signals(ticker, price):
     # Use all available bars for VWAP (full session approximation, not just last 39 min)
     vwap      = calc_vwap(hist, vols)
     macd_line = calc_macd(hist)
-    # VWAP direction is regime-aware:
-    #   ranging   → buy below VWAP (mean-reversion: price will bounce back up)
-    #   trending  → buy above VWAP (momentum: price is above the day's average)
-    if market_regime == "ranging":
-        vwap_bc, vwap_sc = price < vwap * 0.999, price > vwap * 1.001
-    else:
-        vwap_bc, vwap_sc = price > vwap * 1.001, price < vwap * 0.999
+    # VWAP is ALWAYS momentum-directional: buy strength (price above VWAP), sell
+    # weakness (below). The old regime-aware inversion made the highest-weighted
+    # signal (1.5) buy dips below VWAP in "ranging" — which, because the regime was
+    # stuck on "ranging", meant the momentum bot systematically faded the very
+    # momentum names the scanner selected. Regime now only tunes thresholds in
+    # make_decision, never flips signal direction.
+    vwap_bc, vwap_sc = price > vwap * 1.001, price < vwap * 0.999
     z         = (price-mean)/max((upper-mean), 0.01)
     # Regime no longer hard-gates buys/sells — threshold multipliers in make_decision
     # handle it instead. Strong individual stocks can always be bought or sold.
@@ -511,13 +555,11 @@ def get_signals(ticker, price):
     rvol_now          = rvol_cache.get(ticker, 0.0)
     # High-rvol breakouts (≥5×) are genuine momentum setups — extension veto doesn't apply
     price_extended    = rvol_now < 5.0 and (price - mean) / max(mean, 0.01) > PRICE_EXTENSION_VETO
-    # Bollinger direction depends on regime:
-    #   ranging  → bounce: buy at lower band, sell at upper band (mean reversion)
-    #   trending → breakout: buy above upper band, sell below lower band (momentum)
-    if market_regime == "ranging":
-        boll_bc, boll_sc = price < lower * 0.99, price > upper * 1.01
-    else:
-        boll_bc, boll_sc = price > upper * 1.01, price < lower * 0.99
+    # Bollinger is ALWAYS momentum-directional: buy the upper-band breakout, sell the
+    # lower-band breakdown. (Previously inverted to lower-band bounce in "ranging",
+    # which — with the regime stuck on "ranging" — turned this into a mean-reversion
+    # signal fighting the strategy's own momentum thesis.)
+    boll_bc, boll_sc = price > upper * 1.01, price < lower * 0.99
 
     def act(bc, sc, veto_buy=False, veto_sell=False):
         if bc and ok_buy  and not veto_buy:  return "buy"
@@ -568,13 +610,16 @@ def get_signals(ticker, price):
             "veto_reason": "RSI overbought" if rsi_overbought else ("extended" if price_extended else ""),
         },
         {
+            # Retired in the momentum strategy: a mean-reversion "buy the dip below the
+            # 20-bar mean" vote directly contradicts the other five momentum signals and
+            # could supply the decisive 2nd buy vote on a falling knife (n_buy_votes>=2
+            # counts actions regardless of weight). Held neutral so it never casts a
+            # weakness-buy or a sell-into-strength. Kept in the list for display stability.
             "name":"Mean Reversion",
-            "action": act(price<mean*0.96, price>mean*1.04,
-                          veto_buy=rsi_overbought,
-                          veto_sell=rsi_oversold),
+            "action": "hold",
             "signal": min(92,max(8,50+(mean-price)/max(mean,1)*250)),
-            "veto":   rsi_overbought and price<mean*0.96,
-            "veto_reason": "RSI overbought" if rsi_overbought else "",
+            "veto":   False,
+            "veto_reason": "",
         },
     ]
 
@@ -628,10 +673,15 @@ def update_market_regime():
         ma5    = calc_ma(closes, min(5,  len(closes)))
         ma10   = calc_ma(closes, min(10, len(closes)))
         latest = closes[-1]
-        # Tighter 1% threshold reduces false regime flips on small daily moves
-        if   ma5 > ma10 * 1.010 and latest > ma5: new_regime = "trending_up"
-        elif ma5 < ma10 * 0.990 and latest < ma5: new_regime = "trending_down"
-        else:                                      new_regime = "ranging"
+        # 0.3% separation of the 5d vs 10d SMA is a realistic uptrend for a broad
+        # ETF (~0.15%/day drift). The old 1.0% band was mathematically unreachable
+        # for SPY/QQQ, pinning the regime to "ranging" ~100% of the time and
+        # silently flipping the momentum strategy into mean-reversion. The `latest`
+        # confirmation is loosened to a tolerance so a single noisy partial-day IEX
+        # bar can't veto an otherwise-clear trend.
+        if   ma5 > ma10 * 1.003 and latest >= ma5 * 0.997: new_regime = "trending_up"
+        elif ma5 < ma10 * 0.997 and latest <= ma5 * 1.003: new_regime = "trending_down"
+        else:                                              new_regime = "ranging"
         global _last_regime_time
         now_ts = time.time()
         if new_regime != market_regime:
@@ -741,23 +791,23 @@ def passes_filters(ticker, price, account_size=None):
 
 # ── Position sizing ───────────────────────────────────────────
 
-def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=False, atr=None):
+def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=False, stop_dist=None):
     try:
         if account_size is None: account_size = get_account_size()
         usable = get_available_cash()
         if usable <= 0: return 0
 
-        if atr is not None and atr > 0 and not is_gap_play:
-            # ATR-based risk sizing: risk exactly RISK_PER_TRADE dollars per trade.
-            # stop_distance = ATR × ATR_STOP_MULT; shares = budget / stop_distance.
-            # This automatically sizes smaller on volatile stocks and larger on calm ones.
-            stop_dist = atr * ATR_STOP_MULT
-            atr_qty   = int(RISK_PER_TRADE / stop_dist)
-            max_spend = atr_qty * price
-            # Hard cap: never risk more than 7% of account regardless of ATR
+        if stop_dist is not None and stop_dist > 0 and not is_gap_play:
+            # Risk sizing off the ACTUAL stop distance (entry - stop) so a stop-out
+            # loses exactly RISK_PER_TRADE. Previously this used atr×1.5, but the real
+            # stop from calculate_stops is clamped to a different distance, so the
+            # $150 risk cap was never actually enforced.
+            risk_qty  = int(RISK_PER_TRADE / stop_dist)
+            max_spend = risk_qty * price
+            # Hard cap: never deploy more than 7% of account on one position
             max_spend = min(max_spend, usable * 0.07)
-            print(f"  ATR sizing: atr={atr:.3f} stop_dist={stop_dist:.3f} "
-                  f"qty={atr_qty} spend=${max_spend:.0f}")
+            print(f"  Risk sizing: stop_dist={stop_dist:.3f} "
+                  f"qty={risk_qty} spend=${max_spend:.0f} (risk≈${RISK_PER_TRADE:.0f})")
         else:
             # Fallback: percentage-based sizing (gap plays, or when ATR unavailable)
             if is_gap_play:
@@ -798,8 +848,14 @@ def check_stops(ticker, price):
     if price > pos.get("highest_price", entry):
         open_positions[ticker]["highest_price"] = price
 
-    # partial exit — sell half at PARTIAL_EXIT_PCT gain, let rest run
-    if not pos.get("partial_done") and gain_pct >= PARTIAL_EXIT_PCT:
+    # Partial exit — bank half the position at +1R (one unit of the entry risk),
+    # then move the stop to breakeven so the remainder is risk-free while it runs to
+    # the 2R target. Scaling to actual risk (not a fixed 6%) keeps the payoff
+    # symmetric-positive: the old fixed 6% partial vs a ~10% stop capped winners far
+    # tighter than losers. Falls back to PARTIAL_EXIT_PCT if risk is unknown.
+    _risk_ps      = pos.get("risk")
+    _partial_gain = (_risk_ps / entry) if (_risk_ps and entry > 0) else PARTIAL_EXIT_PCT
+    if not pos.get("partial_done") and gain_pct >= _partial_gain:
         half_qty = max(1, pos["qty"] // 2)
         try:
             api.submit_order(symbol=ticker, qty=half_qty, side="sell",
@@ -1017,7 +1073,11 @@ def make_decision(ticker, signals, price):
     # Ranging:       neutral.
     bt *= {"trending_up": 0.85, "ranging": 1.2, "trending_down": 1.5}.get(market_regime, 1.0)
     st *= {"trending_up": 1.3,  "ranging": 1.0, "trending_down": 0.8}.get(market_regime, 1.0)
-    bt  = min(bt, 5.0); st = min(st, 5.0)
+    # Re-impose the 1.0 buy-threshold floor AFTER the regime multiplier. Every
+    # entry-easing step above floors at max(1.0, …), but the trending_up ×0.85 ran
+    # last with no floor and could drop bt to 0.85 — low enough for a 2-signal noise
+    # entry to clear. Floor it so the intended minimum bar holds in every regime.
+    bt  = min(max(bt, 1.0), 5.0); st = min(st, 5.0)
 
     n_buy_votes = sum(1 for s in signals if s.get("action") == "buy")
     if (buy_w >= bt and sell_w < buy_w and n_buy_votes >= 2
@@ -1034,10 +1094,12 @@ def make_decision(ticker, signals, price):
 
 # ── Trade execution ───────────────────────────────────────────
 
-def _register_filled_order(order_id, fill_price):
+def _register_filled_order(order_id, fill_price, filled_qty=None):
     """
-    Called when a pending limit order has been confirmed filled.
-    Creates the open_positions entry, saves to DB, and logs the trade.
+    Called when a pending limit order has been confirmed filled (or partially
+    filled and then canceled). Creates the open_positions entry, saves to DB, and
+    logs the trade. `filled_qty`, when given, overrides the ordered qty so a partial
+    fill registers exactly the shares actually held (never leaving unmanaged shares).
     """
     with _pending_lock:
         pdata = _pending_orders.pop(order_id, None)
@@ -1048,6 +1110,10 @@ def _register_filled_order(order_id, fill_price):
 
     ticker      = pdata["ticker"]
     qty         = pdata["qty"]
+    if filled_qty is not None:
+        qty = int(filled_qty)
+        if qty <= 0:
+            return
     stop        = pdata["stop"]
     target      = pdata["target"]
     atr         = pdata["atr"]
@@ -1067,6 +1133,9 @@ def _register_filled_order(order_id, fill_price):
             "highest_price": fill_price,
             "opened_date": now_et().strftime("%Y-%m-%d"),
             "hold_since": time.time(),
+            # Per-share dollar risk at entry (1R). Used to scale the partial exit and
+            # trailing trigger to each trade's actual risk instead of a fixed %.
+            "risk": round(fill_price - stop, 4) if fill_price > stop else None,
         }
 
     try:
@@ -1107,25 +1176,37 @@ def check_pending_orders():
             order = api.get_order(order_id)
             status = order.status
 
+            filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+
             if status == "filled":
                 fill_price = float(order.filled_avg_price or order.limit_price)
                 _register_filled_order(order_id, fill_price)
 
             elif status in ("canceled", "expired", "rejected"):
-                with _pending_lock:
-                    removed = _pending_orders.pop(order_id, None)
+                if filled_qty > 0:
+                    # Partial fill before cancel/expiry: we actually own filled_qty
+                    # shares. Register them as a real position (with stop/target) so
+                    # check_stops manages them — otherwise they'd sit unhedged with no
+                    # stop until the EOD dump. The trade slot was legitimately used.
+                    fill_price = float(order.filled_avg_price or order.limit_price)
+                    print(f"  Limit order {status} with partial fill: "
+                          f"{pdata['ticker']} {filled_qty:.0f}/{pdata['qty']} — registering position")
+                    _register_filled_order(order_id, fill_price, filled_qty=filled_qty)
+                else:
+                    with _pending_lock:
+                        removed = _pending_orders.pop(order_id, None)
+                        if removed:
+                            _pending_buy_tickers.discard(removed["ticker"])
                     if removed:
-                        _pending_buy_tickers.discard(removed["ticker"])
-                if removed:
-                    with _trade_count_lock:
-                        daily_trade_count = max(0, daily_trade_count - 1)
-                        wts = removed.get("window_ts")
-                        if wts is not None:
-                            try: _trade_window_times.remove(wts)
-                            except ValueError: pass
-                        elif _trade_window_times:
-                            _trade_window_times.pop()
-                    print(f"  Limit order {status}: {removed['ticker']} — count rolled back")
+                        with _trade_count_lock:
+                            daily_trade_count = max(0, daily_trade_count - 1)
+                            wts = removed.get("window_ts")
+                            if wts is not None:
+                                try: _trade_window_times.remove(wts)
+                                except ValueError: pass
+                            elif _trade_window_times:
+                                _trade_window_times.pop()
+                        print(f"  Limit order {status}: {removed['ticker']} — count rolled back")
 
             elif time.time() - pdata["submitted_at"] > ORDER_FILL_TIMEOUT:
                 print(f"  Limit order timeout ({ORDER_FILL_TIMEOUT}s): cancelling {pdata['ticker']}")
@@ -1225,7 +1306,9 @@ def execute(ticker, action, price, signals, reason="signal"):
                                                         STOP_LOSS_PCT, TAKE_PROFIT_PCT)
             except: pass
 
-            qty = position_size(price, acct_size, pred_score, rvol, is_gap_play, atr=atr)
+            # Size off the ACTUAL stop distance so a stop-out loses ~RISK_PER_TRADE.
+            _stop_dist = round(price - stop, 4) if (stop and stop < price) else None
+            qty = position_size(price, acct_size, pred_score, rvol, is_gap_play, stop_dist=_stop_dist)
             if qty == 0:
                 print(f"  {ticker} qty 0"); return "blk:qty0"
 
@@ -1363,9 +1446,24 @@ def apply_scan_results(results_today, acct_size=None):
                   if get_price_floor(acct_size)<=s["price"]<=get_price_ceiling(acct_size)
                   and s.get("grade","F") in MIN_GRADE]
     if affordable:
-        new_tickers = [s["ticker"] for s in affordable[:8]]
-        for s in affordable[:8]:
-            ticker_grades[s["ticker"]] = s.get("grade","C")
+        # Per-sector cap: keep at most MAX_PER_SECTOR names from any one sector group
+        # so the watchlist isn't dominated by a correlated cluster (the scanner injects
+        # whole sector cohorts, e.g. all 8 crypto miners). Preserves score order.
+        new_tickers = []
+        _sector_counts = {}
+        for s in affordable:
+            if len(new_tickers) >= 8:
+                break
+            sec = _ticker_sector(s["ticker"])
+            if sec is not None and _sector_counts.get(sec, 0) >= MAX_PER_SECTOR:
+                print(f"  Sector cap: skipping {s['ticker']} ({sec} already has {MAX_PER_SECTOR})")
+                continue
+            new_tickers.append(s["ticker"])
+            if sec is not None:
+                _sector_counts[sec] = _sector_counts.get(sec, 0) + 1
+        for t in new_tickers:
+            grade = next((s.get("grade","C") for s in affordable if s["ticker"] == t), "C")
+            ticker_grades[t] = grade
         for t in new_tickers:
             ph, vh = load_price_history(t)
             price_history[t]  = ph if ph else []
@@ -1382,7 +1480,10 @@ def apply_scan_results(results_today, acct_size=None):
         except Exception:
             pass
         try:
-            scores = {s["ticker"]:s["score"] for s in affordable[:8]}
+            # Key scores on the actually-selected tickers (after the per-sector cap),
+            # not the pre-cap top-8 — otherwise the saved tickers/scores diverge.
+            _score_by_ticker = {s["ticker"]: s["score"] for s in affordable}
+            scores = {t: _score_by_ticker.get(t) for t in new_tickers}
             save_scan_result(new_tickers, scores)
         except: pass
 
@@ -1918,7 +2019,19 @@ def bot_loop():
                 try: check_pending_orders()
                 except Exception as e: print(f"check_pending_orders error: {e}")
 
-            for ticker in list(active_tickers):
+            # Process best-setup-first so the scarce daily/window trade slots go to the
+            # strongest setups. The throttle is first-come-first-served, so without this
+            # an early mediocre ticker consumes a slot a later high-quality setup then
+            # can't use (the RIVN-blocked-by-window pattern). Ranking by prediction score
+            # + a rvol bump reorders only WHO reaches execute() first; every ticker is
+            # still processed for price/stop updates.
+            _ranked_tickers = sorted(
+                list(active_tickers),
+                key=lambda t: (prediction_cache.get(t, {}).get("score", 0)
+                               + rvol_cache.get(t, 0.0) * 10),
+                reverse=True,
+            )
+            for ticker in _ranked_tickers:
                 try:
                     bar   = api.get_latest_bar(ticker, feed="iex")
                     price = float(bar.c); vol = float(bar.v)
