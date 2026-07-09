@@ -74,7 +74,7 @@ DEFAULT_MAX_ACCOUNT  = float(os.environ.get("MAX_ACCOUNT", "30.00"))
 MAX_TRADE_PCT        = 0.45
 STOP_LOSS_PCT        = 0.05
 TAKE_PROFIT_PCT      = 0.12
-PARTIAL_EXIT_PCT     = 0.06   # NEW: sell half position at 6% gain
+PARTIAL_EXIT_PCT     = 0.06   # fallback partial-exit gain when per-trade risk (1R) is unknown
 INTERVAL             = 30
 MIN_GRADE            = ["A","B","C","D"]
 COOLDOWN_STOP        = 900
@@ -90,12 +90,16 @@ SCAN_HOURS           = [10, 12]
 PRED_HOURS           = [9, 10, 11, 12, 13, 14]   # refresh every hour during trading day
 PRED_MAX_AGE_SECS    = 5400                        # 90 min — treat stale prediction as neutral
 MACRO_REFRESH_HOURS  = [8, 12]
-MIN_PROFIT_PCT       = 0.04
+MIN_PROFIT_PCT       = 0.025  # min target distance; must sit below the 2:1 target of the
+                              # tightest stop (1.5% stop → 3% target) or valid low-ATR
+                              # entries get blocked with blk:lowprofit
 MAX_DAILY_TRADES     = 10
 TRADE_WINDOW_SECS    = 7200   # 2-hour rolling window for trade spreading
 MAX_WINDOW_TRADES    = 4      # max new entries in any 2-hour window
 MAX_OPEN_POSITIONS   = 4      # max concurrent open positions (concentration cap)
-SIGNAL_WARMUP_BARS   = 26     # bars of history before signals may vote (MACD needs 26)
+SIGNAL_WARMUP_BARS   = 16     # bars before signals may vote — the RSI-defaults-to-50
+                              # phantom-buy needs ≥16 bars to clear; MACD safely holds
+                              # (returns 0) below 26, so this doesn't starve gap-and-go
 MAX_PER_SECTOR       = 2      # max watchlist names from any one sector group
 GAP_MIN_PCT          = 2.0
 GAP_MAX_PCT          = 15.0
@@ -117,7 +121,6 @@ MIN_BUY_PRED         = 10     # minimum prediction score required to enter a buy
 DB_SNAPSHOT_INTERVAL = 3600
 DAILY_LOSS_LIMIT     = 300.0  # halt new buys if today's realized+unrealized P&L drops below -$300
 RISK_PER_TRADE       = 150.0  # max dollar risk per trade (ATR-based sizing)
-ATR_STOP_MULT        = 1.5    # stop distance = ATR × this multiplier
 REGIME_COOLDOWN_SECS = 7200   # min seconds between regime changes (prevents intraday flipping)
 
 # RSI veto thresholds — hard blocks regardless of other signals
@@ -253,11 +256,13 @@ def can_enter_new_position():
     if remaining < 5:
         print(f"  Time gate: too close to close ({remaining}min left)")
         return False
-    # Concentration cap: never hold more than MAX_OPEN_POSITIONS at once. Combined
-    # with the correlation guard this bounds how much a single macro move (e.g. a
-    # Bitcoin dip hitting a cluster of miners) can cost.
-    if len(open_positions) >= MAX_OPEN_POSITIONS:
-        print(f"  Position cap: {len(open_positions)}/{MAX_OPEN_POSITIONS} open — no new entry")
+    # Concentration cap: never hold more than MAX_OPEN_POSITIONS at once. Counts
+    # in-flight pending buy orders too — otherwise up to MAX_WINDOW_TRADES limit
+    # orders could all be submitted while open_positions still reads under the cap,
+    # then all fill and breach it. Bounds how much a single macro move can cost.
+    in_flight = len(open_positions) + len(_pending_buy_tickers)
+    if in_flight >= MAX_OPEN_POSITIONS:
+        print(f"  Position cap: {in_flight}/{MAX_OPEN_POSITIONS} (open+pending) — no new entry")
         return False
     return True
 
@@ -428,12 +433,14 @@ def is_correlated_with_open_position(ticker, threshold=0.75):
       2. Pearson correlation of recent moves > threshold, when enough data exists.
     """
     cand_sector = _ticker_sector(ticker)
-    for pos_ticker in list(open_positions.keys()):
+    # Include in-flight pending buys so two same-sector orders can't both be submitted
+    # before either fills (they wouldn't yet appear in open_positions).
+    for pos_ticker in list(open_positions.keys()) + list(_pending_buy_tickers):
         if pos_ticker == ticker:
             continue
         # 1. Sector-cluster block (works with zero price history)
         if cand_sector and _ticker_sector(pos_ticker) == cand_sector:
-            print(f"  {ticker} same sector ({cand_sector}) as open {pos_ticker} — skipping (concentration risk)")
+            print(f"  {ticker} same sector ({cand_sector}) as open/pending {pos_ticker} — skipping (concentration risk)")
             return True
     # 2. Statistical correlation (needs history on both legs)
     candidate = price_history.get(ticker, [])
@@ -603,13 +610,16 @@ def get_signals(ticker, price):
             "veto_reason": "RSI overbought" if rsi_overbought else ("extended" if price_extended else ""),
         },
         {
+            # Retired in the momentum strategy: a mean-reversion "buy the dip below the
+            # 20-bar mean" vote directly contradicts the other five momentum signals and
+            # could supply the decisive 2nd buy vote on a falling knife (n_buy_votes>=2
+            # counts actions regardless of weight). Held neutral so it never casts a
+            # weakness-buy or a sell-into-strength. Kept in the list for display stability.
             "name":"Mean Reversion",
-            "action": act(price<mean*0.96, price>mean*1.04,
-                          veto_buy=rsi_overbought,
-                          veto_sell=rsi_oversold),
+            "action": "hold",
             "signal": min(92,max(8,50+(mean-price)/max(mean,1)*250)),
-            "veto":   rsi_overbought and price<mean*0.96,
-            "veto_reason": "RSI overbought" if rsi_overbought else "",
+            "veto":   False,
+            "veto_reason": "",
         },
     ]
 
@@ -1063,7 +1073,11 @@ def make_decision(ticker, signals, price):
     # Ranging:       neutral.
     bt *= {"trending_up": 0.85, "ranging": 1.2, "trending_down": 1.5}.get(market_regime, 1.0)
     st *= {"trending_up": 1.3,  "ranging": 1.0, "trending_down": 0.8}.get(market_regime, 1.0)
-    bt  = min(bt, 5.0); st = min(st, 5.0)
+    # Re-impose the 1.0 buy-threshold floor AFTER the regime multiplier. Every
+    # entry-easing step above floors at max(1.0, …), but the trending_up ×0.85 ran
+    # last with no floor and could drop bt to 0.85 — low enough for a 2-signal noise
+    # entry to clear. Floor it so the intended minimum bar holds in every regime.
+    bt  = min(max(bt, 1.0), 5.0); st = min(st, 5.0)
 
     n_buy_votes = sum(1 for s in signals if s.get("action") == "buy")
     if (buy_w >= bt and sell_w < buy_w and n_buy_votes >= 2
@@ -1466,7 +1480,10 @@ def apply_scan_results(results_today, acct_size=None):
         except Exception:
             pass
         try:
-            scores = {s["ticker"]:s["score"] for s in affordable[:8]}
+            # Key scores on the actually-selected tickers (after the per-sector cap),
+            # not the pre-cap top-8 — otherwise the saved tickers/scores diverge.
+            _score_by_ticker = {s["ticker"]: s["score"] for s in affordable}
+            scores = {t: _score_by_ticker.get(t) for t in new_tickers}
             save_scan_result(new_tickers, scores)
         except: pass
 
