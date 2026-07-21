@@ -28,7 +28,15 @@ NY = pytz.timezone("America/New_York")
 def safe_bars(api, ticker, timeframe="1Day", days=20, limit=20):
     """Fetch bars with IEX feed. Returns clean DataFrame or None."""
     try:
-        end   = datetime.now(pytz.utc) - timedelta(minutes=20)
+        if timeframe == "1Day":
+            # End at last midnight ET so today's PARTIAL daily bar is excluded.
+            # Including the in-progress bar let a morning pop register as "3-day
+            # momentum + breakout" at the 10am refresh — the score then chased the
+            # very move it should have been judging.
+            end = datetime.now(NY).replace(hour=0, minute=0, second=0,
+                                           microsecond=0).astimezone(pytz.utc)
+        else:
+            end = datetime.now(pytz.utc) - timedelta(minutes=20)
         start = end - timedelta(days=days + 5)
         bars  = api.get_bars(
             ticker, timeframe,
@@ -135,7 +143,11 @@ def news_sentiment_trend(api, ticker):
         fb_total, method = finbert_score(all_h)
         kw_total = sum(kw_scores)
         if method == "finbert" and kw_total != 0:
-            scale = fb_total / kw_total
+            # Magnitude-only calibration: a signed ratio flipped EVERY day's sign
+            # when keyword and FinBERT totals disagreed in direction (worsening
+            # news scored as "improving"). Clamp so one outlier can't blow up the
+            # scale.
+            scale = min(max(abs(fb_total) / abs(kw_total), 0.2), 5.0)
             daily_scores = [round(s * scale, 3) for s in kw_scores]
         elif method == "finbert":
             # All keyword scores were 0 — split FinBERT total evenly
@@ -232,13 +244,15 @@ def volatility_forecast(bars):
             "expansion":  round(ratio, 2),
             "atr_pct":    round(atr_pct, 2),
         }
+        # Symmetric scoring — the old {+10,+8,+2,-5} handed nearly every stock free
+        # positive points regardless of direction, inflating all scores.
         if ratio > 1.3:
             state = "expanding"
-            score = 10 if atr_pct < 8 else -5
+            score = 4 if atr_pct < 8 else -5
         elif ratio < 0.75:
-            state = "contracting"; score = 8
+            state = "contracting"; score = 0
         else:
-            state = "stable";      score = 2
+            state = "stable";      score = 0
         details["state"] = state
         return score, state, details
     except Exception as e:
@@ -312,8 +326,10 @@ def earnings_risk(api, ticker):
                     end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     limit=20)
         count = len(news) if news else 0
+        # "beat" removed: a positive earnings beat was scoring -20 "high risk" and
+        # blocking entry on exactly the post-earnings runners we want.
         words = ["earnings","eps","revenue","quarterly","guidance",
-                 "results","beat","miss","q1","q2","q3","q4"]
+                 "results","miss","q1","q2","q3","q4"]
         hits  = sum(1 for n in (news or [])
                     if any(w in n.headline.lower() for w in words))
         if hits >= 2:                  return "high",    -20
@@ -472,7 +488,9 @@ def predict_ticker(api, ticker, regime="ranging"):
             pat_score           * 0.8 * tf_multiplier +
             earn_adj            * 1.0 +
             mkt_score           * 0.7 +
-            tf_bias             * 10  +
+            # tf_bias's +/-10 additive removed: the same daily-MA fact already acts
+            # through tf_multiplier (1.2x/0.5x on dir+pattern) — counting it twice
+            # (plus a third time in bot.py) made one up-move worth ~80 points.
             pol_pred_score      * 1.0 +
             insider_pred_score  * 1.2 +   # slightly higher weight: faster + more direct signal
             social_pred_score   * 0.8 +   # crowd can be noisy; moderate weight
