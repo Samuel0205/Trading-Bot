@@ -101,6 +101,9 @@ SIGNAL_WARMUP_BARS   = 16     # bars before signals may vote — the RSI-default
                               # phantom-buy needs ≥16 bars to clear; MACD safely holds
                               # (returns 0) below 26, so this doesn't starve gap-and-go
 MAX_PER_SECTOR       = 2      # max watchlist names from any one sector group
+ACTION_PERSIST_TICKS = 3      # buy/sell decision must persist this many consecutive
+                              # loop ticks (~90s at INTERVAL=30) before executing —
+                              # kills single-tick whipsaw entries/exits on 30s-bar noise
 GAP_MIN_PCT          = 2.0
 GAP_MAX_PCT          = 15.0
 GAP_MIN_RVOL          = 1.5
@@ -173,6 +176,7 @@ signal_weights    = dict(BASE_SIGNAL_WEIGHTS)
 _pending_orders      = {}
 _pending_buy_tickers = set()    # tickers with an open limit order (blocks duplicate entries)
 _pending_lock        = threading.Lock()
+_action_streak       = {}       # ticker → {"action", "count"} — decision-persistence debounce
 ORDER_FILL_TIMEOUT   = 90       # seconds before an unfilled limit order is cancelled
 
 _blackout_cache      = {"date": None, "result": (False, None)}
@@ -418,6 +422,32 @@ def _ticker_sector(ticker):
         return TICKER_SECTOR.get(ticker)
     except Exception:
         return None
+
+def _cap_by_sector(candidates, limit=None, existing=None):
+    """
+    Filter `candidates` (in priority order) so no sector group ends up with more
+    than MAX_PER_SECTOR tickers, counting any already-kept names in `existing`.
+    Every watchlist mutation path must funnel through this — the scan, gap, rvol
+    and news paths each add tickers, and any one of them skipping the cap lets a
+    correlated cluster (e.g. 3 crypto miners) rebuild itself.
+    """
+    counts = {}
+    for t in (existing or []):
+        sec = _ticker_sector(t)
+        if sec:
+            counts[sec] = counts.get(sec, 0) + 1
+    kept = []
+    for t in candidates:
+        if limit is not None and len(kept) >= limit:
+            break
+        sec = _ticker_sector(t)
+        if sec and counts.get(sec, 0) >= MAX_PER_SECTOR:
+            print(f"  Sector cap: skipping {t} ({sec} already has {counts[sec]})")
+            continue
+        kept.append(t)
+        if sec:
+            counts[sec] = counts.get(sec, 0) + 1
+    return kept
 
 def is_correlated_with_open_position(ticker, threshold=0.75):
     """
@@ -1446,21 +1476,8 @@ def apply_scan_results(results_today, acct_size=None):
                   if get_price_floor(acct_size)<=s["price"]<=get_price_ceiling(acct_size)
                   and s.get("grade","F") in MIN_GRADE]
     if affordable:
-        # Per-sector cap: keep at most MAX_PER_SECTOR names from any one sector group
-        # so the watchlist isn't dominated by a correlated cluster (the scanner injects
-        # whole sector cohorts, e.g. all 8 crypto miners). Preserves score order.
-        new_tickers = []
-        _sector_counts = {}
-        for s in affordable:
-            if len(new_tickers) >= 8:
-                break
-            sec = _ticker_sector(s["ticker"])
-            if sec is not None and _sector_counts.get(sec, 0) >= MAX_PER_SECTOR:
-                print(f"  Sector cap: skipping {s['ticker']} ({sec} already has {MAX_PER_SECTOR})")
-                continue
-            new_tickers.append(s["ticker"])
-            if sec is not None:
-                _sector_counts[sec] = _sector_counts.get(sec, 0) + 1
+        # Sector-capped selection in score order (see _cap_by_sector)
+        new_tickers = _cap_by_sector([s["ticker"] for s in affordable], limit=8)
         for t in new_tickers:
             grade = next((s.get("grade","C") for s in affordable if s["ticker"] == t), "C")
             ticker_grades[t] = grade
@@ -1541,6 +1558,10 @@ def promote_rvol_tickers():
         for p in promoted[:2]:   # promote up to 2 tickers at a time
             t = p["ticker"]
             if t not in active_tickers:
+                # Sector cap applies to promotions too — a high-rvol miner must not
+                # rebuild the correlated cluster the scan-time cap just prevented.
+                if not _cap_by_sector([t], existing=active_tickers):
+                    continue
                 # Replace last ticker in list (lowest priority), never evict open positions
                 if len(active_tickers) >= 8:
                     evictable = [x for x in active_tickers if x not in open_positions]
@@ -1618,9 +1639,11 @@ def run_gap_scan():
             key=lambda t: (candidates[t].get("catalyst_score", 0), candidates[t]["rvol"]),
             reverse=True,
         )
-        gap_tickers = up_tickers[:3]
+        # Sector-cap BOTH the gap picks and the merged watchlist — the gap scanner
+        # was taking the raw top-3, which is how 3 crypto miners loaded together.
+        gap_tickers    = _cap_by_sector(up_tickers, limit=3)
         current        = [t for t in active_tickers if t not in gap_tickers]
-        active_tickers = (gap_tickers + current)[:5]
+        active_tickers = _cap_by_sector(gap_tickers + current, limit=5)
         # Never drop a ticker with an open position from stop monitoring
         for t in list(open_positions.keys()):
             if t not in active_tickers:
@@ -1758,6 +1781,9 @@ def promote_news_tickers():
     print(f"  Intraday news movers: {movers[:5]}")
     for sym in movers[:2]:
         if sym not in active_tickers:
+            # Sector cap applies to news injections too
+            if not _cap_by_sector([sym], existing=active_tickers):
+                continue
             if len(active_tickers) >= 8:
                 evictable = [t for t in active_tickers if t not in open_positions]
                 if not evictable:
@@ -2047,9 +2073,26 @@ def bot_loop():
                     check_stops(ticker, price)
                     sigs              = get_signals(ticker, price)
                     action, reason, buy_w, sell_w = make_decision(ticker, sigs, price)
+                    # Decision-persistence debounce: a buy/sell must hold for
+                    # ACTION_PERSIST_TICKS consecutive loops (~90s) before executing.
+                    # On 30s bars a 2-vote signal can appear and vanish within a tick —
+                    # the ACHR pattern: buy at 14:31, votes gone 14:32, signal-sold
+                    # 14:33. One-tick blips no longer trade; stop/target exits in
+                    # check_stops stay immediate (risk controls are not debounced).
                     exec_outcome = None
                     if action != "hold":
-                        exec_outcome = execute(ticker, action, price, sigs, reason=reason)
+                        streak = _action_streak.get(ticker)
+                        if streak and streak["action"] == action:
+                            streak["count"] += 1
+                        else:
+                            streak = {"action": action, "count": 1}
+                        _action_streak[ticker] = streak
+                        if streak["count"] >= ACTION_PERSIST_TICKS:
+                            exec_outcome = execute(ticker, action, price, sigs, reason=reason)
+                        else:
+                            exec_outcome = f"confirm:{action}({streak['count']}/{ACTION_PERSIST_TICKS})"
+                    else:
+                        _action_streak.pop(ticker, None)
                     pos  = open_positions.get(ticker)
                     pred = prediction_cache.get(ticker, {})
                     cd   = cooldown_remaining(ticker)
