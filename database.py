@@ -135,6 +135,14 @@ def init_db():
             )
         """)
 
+        # ── Migrations (idempotent) ───────────────────────────
+        # exit_price: sells previously never stored their price anywhere — the
+        # trades row kept the ENTRY price under side='SELL'.
+        try:
+            c.execute("ALTER TABLE trades ADD COLUMN exit_price REAL")
+        except Exception:
+            pass  # column already exists
+
         # ── Indexes (performance) ─────────────────────────────
         c.execute("CREATE INDEX IF NOT EXISTS idx_trades_ticker   ON trades(ticker)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts       ON trades(entry_ts)")
@@ -149,6 +157,12 @@ def init_db():
     print("Database initialized:", DB_PATH)
 
 # ── Trade operations ──────────────────────────────────────────
+
+# Date the momentum strategy overhaul went live. Signal names kept their identity
+# across the rewrite but their MEANING flipped (RSI mean-reversion → momentum,
+# VWAP/Bollinger direction inverted), so win-rate stats from before this date
+# describe different signals and must never train today's weights.
+STRATEGY_EPOCH = "2026-07-21"
 
 def save_trade_open(ticker, qty, price, stop, target, pred_score,
                     rvol, is_gap, active_signals, ts):
@@ -186,9 +200,9 @@ def save_trade_close(ticker, exit_price, pnl, reason, exit_ts):
             if row:
                 conn.execute("""
                     UPDATE trades
-                    SET pnl=?, reason=?, exit_ts=?, side='SELL'
+                    SET pnl=?, reason=?, exit_ts=?, exit_price=?, side='SELL'
                     WHERE id=?
-                """, (pnl, reason, exit_ts, row["id"]))
+                """, (pnl, reason, exit_ts, exit_price, row["id"]))
                 conn.commit()
             else:
                 print(f"  save_trade_close: no open BUY found for {ticker}")
@@ -209,10 +223,15 @@ def get_recent_trades(days=30):
     return [dict(r) for r in rows]
 
 def get_trade_stats_from_db():
+    # Current-strategy trades only (date >= STRATEGY_EPOCH), and PARTIAL rows are
+    # excluded from win/loss counts — a partial is half of one trade taken at +1R
+    # (nearly always green), so counting it as its own "trade" inflated the win rate.
     with _db_lock:
         conn = get_conn()
         rows = conn.execute(
-            "SELECT pnl FROM trades WHERE pnl IS NOT NULL"
+            "SELECT pnl FROM trades WHERE pnl IS NOT NULL "
+            "AND side != 'PARTIAL' AND date >= ?",
+            (STRATEGY_EPOCH,)
         ).fetchall()
         conn.close()
     pnls   = [r["pnl"] for r in rows]
@@ -246,6 +265,10 @@ def save_signal_performance(signal_name, was_win, ticker, pnl):
             conn.close()
 
 def get_signal_win_rates():
+    # CRITICAL: only learn from trades made by the CURRENT strategy. Without the
+    # epoch filter, the adaptive weighter was training today's momentum signals on
+    # months of trades from the old inverted strategy — penalizing today's RSI for
+    # the opposite signal's losses.
     with _db_lock:
         conn  = get_conn()
         rows  = conn.execute("""
@@ -253,8 +276,9 @@ def get_signal_win_rates():
                    SUM(was_win) as wins,
                    COUNT(*)     as total
             FROM signal_performance
+            WHERE date >= ?
             GROUP BY signal_name
-        """).fetchall()
+        """, (STRATEGY_EPOCH,)).fetchall()
         conn.close()
     result = {}
     for r in rows:

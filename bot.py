@@ -113,6 +113,9 @@ TRAILING_STOP_GAP_PCT = 0.03   # trail stop 3% below highest price for gap plays
 BREAKEVEN_TRIGGER_PCT = 0.08   # move stop to breakeven when up 8%
 TRAILING_TRIGGER_PCT  = 0.15   # activate 3% trail once up 15%
 RVOL_THRESHOLD        = 1.5
+IEX_MIN_DOLLAR_VOL   = 150_000  # min avg daily IEX dollar volume (~$5-7M consolidated at
+                                # IEX's 2-3% share) — blocks illiquid names whose spread
+                                # eats the whole 2:1 edge
 CHOP_BLOCK_THRESHOLD  = 2      # stop a ticker for rest of day after this many stop losses
 RVOL_PROMOTE_MIN     = 2.5   # NEW: promote ticker to active list if rvol exceeds this
 BASE_BUY_THRESHOLD   = 2.0
@@ -806,10 +809,14 @@ def passes_filters(ticker, price, account_size=None):
                 except Exception:
                     pass
                 return False
-        passed = float(bars["volume"].mean()) >= min_vol
+        avg_shares = float(bars["volume"].mean())
+        # Share floor AND dollar floor — 2,000 IEX shares of a $3 stock is ~$6k of
+        # visible liquidity; the spread on that eats the whole 2:1 edge.
+        passed = avg_shares >= min_vol and avg_shares * price >= IEX_MIN_DOLLAR_VOL
         _vol_check_cache[ticker] = (today_str, passed)
         if not passed:
-            print(f"  {ticker} low volume")
+            print(f"  {ticker} low volume ({avg_shares:,.0f} sh / "
+                  f"${avg_shares*price:,.0f} IEX avg)")
             try:
                 _ops_stats["filter_blocks"]["volume"] = _ops_stats["filter_blocks"].get("volume", 0) + 1
             except Exception:
@@ -888,27 +895,35 @@ def check_stops(ticker, price):
     if not pos.get("partial_done") and gain_pct >= _partial_gain:
         half_qty = max(1, pos["qty"] // 2)
         try:
-            api.submit_order(symbol=ticker, qty=half_qty, side="sell",
-                             type="market", time_in_force="day")
-            partial_pnl = round((price - entry) * half_qty, 2)
+            p_order = api.submit_order(symbol=ticker, qty=half_qty, side="sell",
+                                       type="market", time_in_force="day")
+            # Use the real fill when confirmable — tick-price PnL understates slippage
+            p_fill      = _poll_fill_price(p_order.id)
+            p_exit      = p_fill if p_fill else price
+            partial_pnl = round((p_exit - entry) * half_qty, 2)
             open_positions[ticker]["qty"]          = pos["qty"] - half_qty
             open_positions[ticker]["partial_done"] = True
+            # Bank the partial's PnL on the position so the final was_win reflects the
+            # WHOLE trade — without this, a +1R partial followed by a breakeven stop
+            # was recorded as a loss, anti-training the weighter on its best pattern.
+            open_positions[ticker]["banked_pnl"]   = round(
+                pos.get("banked_pnl", 0) + partial_pnl, 2)
             # Move stop to breakeven after partial exit
             open_positions[ticker]["stop"]         = round(entry * 1.005, 3)
-            print(f"  PARTIAL EXIT {half_qty}x {ticker} @ ${price:.2f} "
+            print(f"  PARTIAL EXIT {half_qty}x {ticker} @ ${p_exit:.2f} "
                   f"pnl=${partial_pnl:+.2f} | stop → breakeven")
             ts_partial = int(time.time()*1000)
             trade_log.insert(0, {
                 "type":"SELL","ticker":ticker,"qty":half_qty,
-                "price":round(price,2),"pnl":partial_pnl,
+                "price":round(p_exit,2),"pnl":partial_pnl,
                 "reason":"partial_exit","ts":ts_partial
             })
             try:
-                save_partial_exit(ticker, half_qty, entry, price, partial_pnl, ts_partial)
+                save_partial_exit(ticker, half_qty, entry, p_exit, partial_pnl, ts_partial)
             except Exception as e:
                 print(f"  DB save_partial_exit error: {e}")
             save_alert("INFO",
-                f"PARTIAL EXIT {half_qty}x {ticker} @ ${price:.2f} +${partial_pnl:.2f}",
+                f"PARTIAL EXIT {half_qty}x {ticker} @ ${p_exit:.2f} +${partial_pnl:.2f}",
                 ticker)
         except Exception as e:
             print(f"  Partial exit error {ticker}: {e}")
@@ -940,6 +955,19 @@ def check_stops(ticker, price):
     if   price <= pos["stop"]:   force_sell(ticker, price, reason="stop_loss")
     elif price >= pos["target"]: force_sell(ticker, price, reason="take_profit")
 
+def _poll_fill_price(order_id, tries=3, delay=0.4):
+    """Briefly poll a just-submitted order for its actual fill price. Returns the
+    filled_avg_price or None if not confirmed in time (caller falls back to tick)."""
+    try:
+        for _ in range(tries):
+            time.sleep(delay)
+            od = api.get_order(order_id)
+            if od.status == "filled" and od.filled_avg_price:
+                return float(od.filled_avg_price)
+    except Exception:
+        pass
+    return None
+
 def force_sell(ticker, price, reason="stop_loss"):
     try:
         try:
@@ -956,19 +984,37 @@ def force_sell(ticker, price, reason="stop_loss"):
             with _positions_lock:
                 open_positions.pop(ticker, None)
             return
-        entry   = float(pos_api.avg_entry_price)
-        pnl     = round((price - entry) * qty, 2)
-        api.submit_order(symbol=ticker, qty=qty, side="sell",
-                         type="market", time_in_force="day")
-        was_win = pnl > 0
+        # Oversell guard: right after a partial exit the Alpaca qty can still show the
+        # pre-partial size until the half-sell settles. Selling that stale qty would
+        # oversell into a short. Trust our tracked remaining qty when it's smaller.
+        tracked_qty = open_positions.get(ticker, {}).get("qty")
+        if tracked_qty and 0 < tracked_qty < qty:
+            qty = int(tracked_qty)
+        entry = float(pos_api.avg_entry_price)
+        order = api.submit_order(symbol=ticker, qty=qty, side="sell",
+                                 type="market", time_in_force="day")
+        # Use the ACTUAL fill price for PnL when available. Tick-price PnL was
+        # systematically optimistic (market-order slippage on thin IEX names) and
+        # poisons the win-rate stats that update_signal_weights_from_db learns from.
+        fill_price = _poll_fill_price(order.id)
+        exit_price = fill_price if fill_price else price
+        if fill_price and abs(fill_price - price) >= 0.005:
+            print(f"  Slippage {ticker}: tick ${price:.2f} → fill ${fill_price:.2f} "
+                  f"({fill_price - price:+.3f}/share)")
+        pnl     = round((exit_price - entry) * qty, 2)
         with _positions_lock:
             pos_data = open_positions.pop(ticker, {})
         active_sigs = pos_data.get("active_signals", [])
+        # Judge the trade on its TOTAL PnL including any banked partial exit. A +1R
+        # partial followed by a breakeven stop is a WIN for the signals that picked
+        # it — recording only the remainder's ~0 marked it a loss.
+        whole_trade_pnl = round(pnl + pos_data.get("banked_pnl", 0), 2)
+        was_win = whole_trade_pnl > 0
 
         try:
-            save_trade_close(ticker, price, pnl, reason, int(time.time()*1000))
+            save_trade_close(ticker, exit_price, pnl, reason, int(time.time()*1000))
             for sig in active_sigs:
-                save_signal_performance(sig, was_win, ticker, pnl)
+                save_signal_performance(sig, was_win, ticker, whole_trade_pnl)
         except Exception as e:
             print(f"  DB save error: {e}")
 
@@ -976,7 +1022,7 @@ def force_sell(ticker, price, reason="stop_loss"):
 
         trade_log.insert(0, {
             "type":"SELL","ticker":ticker,"qty":qty,
-            "price":round(price,2),"pnl":pnl,"reason":reason,
+            "price":round(exit_price,2),"pnl":pnl,"reason":reason,
             "ts":int(time.time()*1000)
         })
         set_cooldown(ticker, reason)
@@ -996,7 +1042,7 @@ def force_sell(ticker, price, reason="stop_loss"):
 
         wr   = get_trade_stats_from_db().get("win_rate", 0)
         mode = "🔴 LIVE" if LIVE_MODE else "PAPER"
-        print(f"{mode} SELL {qty}x {ticker} @ ${price:.2f} "
+        print(f"{mode} SELL {qty}x {ticker} @ ${exit_price:.2f} "
               f"| {reason} | PnL ${pnl:+.2f} | WR:{wr:.0f}%")
 
         if abs(pnl) > 0.01:
@@ -1059,12 +1105,10 @@ def make_decision(ticker, signals, price):
     elif pscore < PRED_NEED_CONF:   bt = 3.0 * tod_mult; st = 2.5 * tod_mult  # bt>st causes whipsaw — st must be <= bt
     else:                           bt = BASE_BUY_THRESHOLD * tod_mult; st = BASE_SELL_THRESHOLD * tod_mult
 
-    # Confidence multiplier — prediction confidence now affects entry threshold.
-    # High confidence → lower bar (0.85×), low confidence → raise bar (1.20×).
-    pred_conf = pred.get("confidence", "low")
-    conf_mult = {"high": 0.85, "medium": 1.0, "low": 1.20}.get(pred_conf, 1.0)
-    bt *= conf_mult
-    st *= conf_mult
+    # Confidence multiplier REMOVED: "confidence" is computed from momentum
+    # magnitude (|dir_score| and |pat_score|), so it was lowering the entry bar
+    # precisely for the most extended names — and lowering the SELL bar for them
+    # too. Until confidence measures data quality, it gets no threshold authority.
 
     gap_data = gap_candidates.get(ticker, {})
     if is_gap and gap_data.get("direction") == "up":
@@ -1083,8 +1127,9 @@ def make_decision(ticker, signals, price):
             bt = max(1.0, bt - 0.3)
     if rvol >= 2.0:
         bt = max(1.0, bt-0.2)  # high rvol lowers entry bar only — not exit bar
-    if tf_bias == -1:
-        bt += 0.8
+    # tf_bias bt-bump removed: the daily-MA downtrend already halves dir/pattern
+    # inside the prediction (tf_multiplier 0.5×) — this was the same fact's third
+    # application to one decision.
 
     hot_sectors = macro_status.get("hot_sectors", [])
     if hot_sectors:
@@ -1110,10 +1155,18 @@ def make_decision(ticker, signals, price):
     bt  = min(max(bt, 1.0), 5.0); st = min(st, 5.0)
 
     n_buy_votes = sum(1 for s in signals if s.get("action") == "buy")
+    # Hard momentum gate: never enter below session VWAP. Institutions defend VWAP;
+    # a "momentum" entry under it is a countertrend trade. The VWAP signal votes
+    # buy only when price > vwap*1.001, so requiring its vote enforces this (a
+    # vetoed/warming-up VWAP correctly blocks entry too).
+    vwap_buy = any(s.get("name") == "VWAP" and s.get("action") == "buy" for s in signals)
     if (buy_w >= bt and sell_w < buy_w and n_buy_votes >= 2
+            and vwap_buy
             and pscore >= MIN_BUY_PRED
             and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY)):
         action = "buy";  reason = f"bw={buy_w:.1f}>={bt:.1f} v={n_buy_votes}"
+    elif buy_w >= bt and sell_w < buy_w and n_buy_votes >= 2 and not vwap_buy:
+        action = "hold"; reason = "hold(below_vwap)"
     elif sell_w >= st and buy_w < sell_w:
         action = "sell"; reason = f"sw={sell_w:.1f}>={st:.1f}"
     elif buy_w >= bt and market_regime == "trending_down":
@@ -1246,6 +1299,24 @@ def check_pending_orders():
                     pass  # status update will clean up next tick
         except Exception as e:
             print(f"  check_pending_orders error {order_id}: {e}")
+            # Orphan cleanup: if get_order keeps failing (e.g. 404 after a cancel),
+            # this entry would otherwise sit forever — ticker stuck in
+            # _pending_buy_tickers (blocking re-entry) and the trade slot burned.
+            pdata["poll_fails"] = pdata.get("poll_fails", 0) + 1
+            if pdata["poll_fails"] >= 10:
+                with _pending_lock:
+                    removed = _pending_orders.pop(order_id, None)
+                    if removed:
+                        _pending_buy_tickers.discard(removed["ticker"])
+                if removed:
+                    with _trade_count_lock:
+                        daily_trade_count = max(0, daily_trade_count - 1)
+                        wts = removed.get("window_ts")
+                        if wts is not None:
+                            try: _trade_window_times.remove(wts)
+                            except ValueError: pass
+                    print(f"  Orphaned pending order cleaned: {removed['ticker']} "
+                          f"({pdata['poll_fails']} poll failures) — slot rolled back")
 
 
 def execute(ticker, action, price, signals, reason="signal"):
@@ -1306,16 +1377,31 @@ def execute(ticker, action, price, signals, reason="signal"):
             if not passes_filters(ticker, price, acct_size):
                 return "blk:filter"  # passes_filters already prints its reason
 
+            # Lunch-chop gate: 11:30–14:00 ET is the low-volume dead zone where
+            # momentum signals are mostly noise (the July logs' whipsaws clustered
+            # here). Only exceptional setups — strong prediction AND elevated
+            # volume — may enter during it.
+            _now_l = now_et()
+            if (11, 30) <= (_now_l.hour, _now_l.minute) < (14, 0):
+                _pred_l = prediction_cache.get(ticker, {}).get("score", 0)
+                _rvol_l = rvol_cache.get(ticker, 1.0)
+                if not (_pred_l >= PRED_STRONG_BUY and _rvol_l >= 2.0):
+                    print(f"  {ticker} lunch-chop gate: needs pred>={PRED_STRONG_BUY} "
+                          f"& rvol>=2.0 (have {_pred_l:+.0f}/{_rvol_l:.1f}x)")
+                    return "blk:lunch"
+
             # Real-time trend check: if price is below the 20-bar MA and prediction
             # isn't strongly bullish, skip the buy. Catches downtrends early without
             # waiting for the next prediction cycle.
             ph = price_history.get(ticker, [])
             if len(ph) >= 10:
                 ma20 = sum(ph[-20:]) / min(len(ph), 20)
-                pred_score_rt = prediction_cache.get(ticker, {}).get("score", 0)
-                if price < ma20 * 0.995 and pred_score_rt < PRED_STRONG_BUY:
-                    print(f"  {ticker} below MA20 (${ma20:.2f}) + pred not strong "
-                          f"({pred_score_rt:+.0f}) — skipping buy")
+                # UNCONDITIONAL: this is the only forward-looking intraday check in
+                # the entry path. The old pred>=40 bypass let a stale daily-momentum
+                # score override it — i.e. buy names actively trading below their
+                # intraday MA20 (buying the fade). No score overrides this guard.
+                if price < ma20 * 0.995:
+                    print(f"  {ticker} below MA20 (${ma20:.2f}) — skipping buy")
                     return "blk:trend"
 
             pred_score  = prediction_cache.get(ticker, {}).get("score", 0)
@@ -2595,11 +2681,27 @@ def restore_trade_state():
     try:
         today       = now_et().date()
         midnight_et = NY.localize(datetime.combine(today, datetime.min.time()))
-        after_str   = midnight_et.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Convert to real UTC — the old code stamped the ET wall time with a literal
+        # 'Z', shifting the query window ~4-5h and miscounting today's buys.
+        after_str   = midnight_et.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         orders      = api.list_orders(status="filled", after=after_str, limit=50, direction="desc")
-        daily_trade_count = sum(1 for o in orders if o.side == "buy")
+        buys        = [o for o in orders if o.side == "buy"]
+        daily_trade_count = len(buys)
         daily_trade_date  = today
-        print(f"Restored daily_trade_count: {daily_trade_count}/{MAX_DAILY_TRADES} (today's buys)")
+        # Restore the rolling 2-hour window too — leaving it empty let a mid-session
+        # restart immediately fire a fresh MAX_WINDOW_TRADES burst on top of the
+        # trades already placed.
+        now_ts = time.time()
+        for o in buys:
+            try:
+                ft = getattr(o, "filled_at", None) or getattr(o, "submitted_at", None)
+                ts = ft.timestamp() if ft is not None and hasattr(ft, "timestamp") else None
+                if ts and ts >= now_ts - TRADE_WINDOW_SECS:
+                    _trade_window_times.append(ts)
+            except Exception:
+                continue
+        print(f"Restored daily_trade_count: {daily_trade_count}/{MAX_DAILY_TRADES} "
+              f"(today's buys), window: {len(_trade_window_times)}/{MAX_WINDOW_TRADES}")
     except Exception as e:
         print(f"restore_trade_state error: {e}")
 
@@ -2690,7 +2792,12 @@ def _start_bot():
 
     return port
 
-_port = _start_bot()
+if os.environ.get("BOT_REPLAY") == "1":
+    # replay.py imports this module for its decision functions only —
+    # skip DB init and background threads.
+    _port = None
+else:
+    _port = _start_bot()
 
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=_port)
