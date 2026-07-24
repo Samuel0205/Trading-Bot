@@ -321,13 +321,23 @@ def update_signal_weights_from_db():
 
 # ── Account ───────────────────────────────────────────────────
 
+_acct_cache = {"acct": None, "ts": 0.0}
+
 def get_account():
     global _api_last_success
     try:
         acct = api.get_account()
         _api_last_success = time.time()
+        _acct_cache["acct"] = acct
+        _acct_cache["ts"]   = time.time()
         return acct
     except Exception as e:
+        # Alpaca 500s happen in bursts (esp. after hours). Serve the last good
+        # snapshot for up to 10 min so the dashboard and non-critical callers
+        # don't churn — anything risk-critical re-checks soon anyway.
+        if _acct_cache["acct"] is not None and time.time() - _acct_cache["ts"] < 600:
+            print(f"get_account error: {e} — serving cached snapshot")
+            return _acct_cache["acct"]
         print(f"get_account error: {e}")
         return None
 
@@ -834,11 +844,13 @@ def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=
         usable = get_available_cash()
         if usable <= 0: return 0
 
-        if stop_dist is not None and stop_dist > 0 and not is_gap_play:
+        if stop_dist is not None and stop_dist > 0:
             # Risk sizing off the ACTUAL stop distance (entry - stop) so a stop-out
-            # loses exactly RISK_PER_TRADE. Previously this used atr×1.5, but the real
-            # stop from calculate_stops is clamped to a different distance, so the
-            # $150 risk cap was never actually enforced.
+            # loses exactly RISK_PER_TRADE. Applies to gap plays too — they used to
+            # take the percentage path below (12% of the account ≈ $11.6k on $97k),
+            # which with a 1.5-4% stop meant up to ~$560 at risk per gap trade,
+            # 3.7× the intended cap. A gap play's upside comes from its 2× target,
+            # not from oversized risk.
             risk_qty  = int(RISK_PER_TRADE / stop_dist)
             max_spend = risk_qty * price
             # Hard cap: never deploy more than 7% of account on one position
@@ -846,7 +858,7 @@ def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=
             print(f"  Risk sizing: stop_dist={stop_dist:.3f} "
                   f"qty={risk_qty} spend=${max_spend:.0f} (risk≈${RISK_PER_TRADE:.0f})")
         else:
-            # Fallback: percentage-based sizing (gap plays, or when ATR unavailable)
+            # Fallback: percentage-based sizing (only when no stop distance is known)
             if is_gap_play:
                 pct = 0.65
             elif pred_score >= PRED_STRONG_BUY: pct = 0.60
@@ -2381,6 +2393,7 @@ def stats_json():
         "signal_win_rates":  get_signal_win_rates(),
         "live_mode":         LIVE_MODE,
         "daily_trade_count": daily_trade_count,
+        "max_daily_trades":  MAX_DAILY_TRADES,
         "macro_blackout":    blackout,
         "unusual_volume":    unusual_volume[:5],
         "active_tickers":    active_tickers,
