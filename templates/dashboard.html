@@ -214,8 +214,8 @@ h2 { font-size: 11px; font-weight: 500; color: #555; margin: 18px 0 8px; text-tr
       <div id="timeGate" style="font-size:10px;margin-top:2px;color:#555;"></div>
     </div>
     <div class="info-pill">
-      <div class="lbl">Day Trades (5-day)</div>
-      <div class="val" id="pdtCount">—/3</div>
+      <div class="lbl">Trades Today</div>
+      <div class="val" id="pdtCount">—</div>
       <div id="pdtReset" style="font-size:9px;color:#555;margin-top:1px;"></div>
     </div>
     <div class="info-pill">
@@ -537,13 +537,16 @@ function renderAccount(acct) {
   if (!window._lastStatsFetch || now - window._lastStatsFetch > 300000) {
     window._lastStatsFetch = now;
     fetch('/stats').then(r=>r.json()).then(s => {
-      const pdt = s.pdt_rolling_count ?? s.pdt_trades_this_week ?? s.daily_trade_count ?? 0;
-      const pdtEl = document.getElementById('pdtCount');
-      pdtEl.textContent = `${pdt}/3`;
-      pdtEl.style.color = pdt>=3?'#D85A30':pdt>=2?'#E9A84C':'#1D9E75';
+      // PDT rule was eliminated June 4, 2026 (FINRA Notice 26-10) — this pill now
+      // shows the bot's own daily trade throttle, not a regulatory limit.
+      const tCount = s.daily_trade_count ?? 0;
+      const tMax   = s.max_daily_trades ?? 10;
+      const pdtEl  = document.getElementById('pdtCount');
+      pdtEl.textContent = `${tCount}/${tMax}`;
+      pdtEl.style.color = tCount>=tMax?'#D85A30':tCount>=tMax-2?'#E9A84C':'#1D9E75';
       const resetEl = document.getElementById('pdtReset');
-      resetEl.textContent = s.pdt_reset_date ? `resets ${s.pdt_reset_date}` : 'rolling 5-day window';
-      resetEl.style.color = pdt>=2 ? '#E9A84C' : '#555';
+      resetEl.textContent = 'bot throttle (no PDT limit)';
+      resetEl.style.color = '#555';
 
       if (s.unusual_volume && s.unusual_volume.length) renderUnusualVolume(s.unusual_volume);
 

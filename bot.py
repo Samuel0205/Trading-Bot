@@ -80,6 +80,12 @@ MIN_GRADE            = ["A","B","C","D"]
 COOLDOWN_STOP        = 900
 COOLDOWN_PROFIT      = 600
 COOLDOWN_SIGNAL      = 300
+COOLDOWN_LOSS        = 1800   # min cooldown after ANY losing exit — July 23 showed a
+                              # 5-min signal cooldown letting RIOT get re-bought 8 min
+                              # after a loss, then lose again
+SECTOR_LOSS_COOLDOWN = 2700   # after a losing exit, block the whole sector 45 min —
+                              # one macro move (BTC dip) was being paid for serially
+                              # across MARA/RIOT/CIFR/CLSK
 TRADING_START_H      = 9
 TRADING_START_M      = 35
 TRADING_END_H        = 15
@@ -166,6 +172,7 @@ gap_candidates    = {}
 catalyst_cache    = {}
 rvol_cache        = {}
 _daily_stop_counts     = {}   # ticker → {date_str: count}  (anti-chop gate)
+_sector_loss_until     = {}   # sector → epoch ts; block sector entries after a loss
 unusual_volume    = []
 daily_trade_count = 0
 daily_trade_date  = None
@@ -321,13 +328,23 @@ def update_signal_weights_from_db():
 
 # ── Account ───────────────────────────────────────────────────
 
+_acct_cache = {"acct": None, "ts": 0.0}
+
 def get_account():
     global _api_last_success
     try:
         acct = api.get_account()
         _api_last_success = time.time()
+        _acct_cache["acct"] = acct
+        _acct_cache["ts"]   = time.time()
         return acct
     except Exception as e:
+        # Alpaca 500s happen in bursts (esp. after hours). Serve the last good
+        # snapshot for up to 10 min so the dashboard and non-critical callers
+        # don't churn — anything risk-critical re-checks soon anyway.
+        if _acct_cache["acct"] is not None and time.time() - _acct_cache["ts"] < 600:
+            print(f"get_account error: {e} — serving cached snapshot")
+            return _acct_cache["acct"]
         print(f"get_account error: {e}")
         return None
 
@@ -493,11 +510,14 @@ def is_correlated_with_open_position(ticker, threshold=0.75):
 
 # ── Cooldowns ─────────────────────────────────────────────────
 
-def set_cooldown(ticker, reason="signal"):
+def set_cooldown(ticker, reason="signal", was_loss=False):
     d = {"stop_loss":COOLDOWN_STOP,"take_profit":COOLDOWN_PROFIT,
          "signal":COOLDOWN_SIGNAL,"eod_close":COOLDOWN_SIGNAL,
          "partial":COOLDOWN_SIGNAL}
-    cooldowns[ticker] = {"until": time.time()+d.get(reason, COOLDOWN_SIGNAL), "reason": reason}
+    secs = d.get(reason, COOLDOWN_SIGNAL)
+    if was_loss:
+        secs = max(secs, COOLDOWN_LOSS)
+    cooldowns[ticker] = {"until": time.time()+secs, "reason": reason}
 
 def is_on_cooldown(ticker):
     cd = cooldowns.get(ticker)
@@ -834,11 +854,13 @@ def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=
         usable = get_available_cash()
         if usable <= 0: return 0
 
-        if stop_dist is not None and stop_dist > 0 and not is_gap_play:
+        if stop_dist is not None and stop_dist > 0:
             # Risk sizing off the ACTUAL stop distance (entry - stop) so a stop-out
-            # loses exactly RISK_PER_TRADE. Previously this used atr×1.5, but the real
-            # stop from calculate_stops is clamped to a different distance, so the
-            # $150 risk cap was never actually enforced.
+            # loses exactly RISK_PER_TRADE. Applies to gap plays too — they used to
+            # take the percentage path below (12% of the account ≈ $11.6k on $97k),
+            # which with a 1.5-4% stop meant up to ~$560 at risk per gap trade,
+            # 3.7× the intended cap. A gap play's upside comes from its 2× target,
+            # not from oversized risk.
             risk_qty  = int(RISK_PER_TRADE / stop_dist)
             max_spend = risk_qty * price
             # Hard cap: never deploy more than 7% of account on one position
@@ -846,7 +868,7 @@ def position_size(price, account_size=None, pred_score=0, rvol=1.0, is_gap_play=
             print(f"  Risk sizing: stop_dist={stop_dist:.3f} "
                   f"qty={risk_qty} spend=${max_spend:.0f} (risk≈${RISK_PER_TRADE:.0f})")
         else:
-            # Fallback: percentage-based sizing (gap plays, or when ATR unavailable)
+            # Fallback: percentage-based sizing (only when no stop distance is known)
             if is_gap_play:
                 pct = 0.65
             elif pred_score >= PRED_STRONG_BUY: pct = 0.60
@@ -1025,7 +1047,15 @@ def force_sell(ticker, price, reason="stop_loss"):
             "price":round(exit_price,2),"pnl":pnl,"reason":reason,
             "ts":int(time.time()*1000)
         })
-        set_cooldown(ticker, reason)
+        set_cooldown(ticker, reason, was_loss=whole_trade_pnl < 0)
+        # A losing exit also cools the whole sector — the correlated cluster moves
+        # together, so a fresh loss on one miner is information about all of them.
+        if whole_trade_pnl < 0:
+            _sec = _ticker_sector(ticker)
+            if _sec:
+                _sector_loss_until[_sec] = time.time() + SECTOR_LOSS_COOLDOWN
+                print(f"  Sector cooldown: {_sec} blocked "
+                      f"{SECTOR_LOSS_COOLDOWN//60}min after loss on {ticker}")
 
         today_str = now_et().strftime("%Y-%m-%d")
 
@@ -1160,17 +1190,21 @@ def make_decision(ticker, signals, price):
     # buy only when price > vwap*1.001, so requiring its vote enforces this (a
     # vetoed/warming-up VWAP correctly blocks entry too).
     vwap_buy = any(s.get("name") == "VWAP" and s.get("action") == "buy" for s in signals)
+    # HARD regime discipline: no new longs while the market is trending down. The
+    # old pred>=40 exception let July 23's RIOT/CIFR entries (+42/+41, just over
+    # the bar) buy miner bounces into a falling tape — a long-only bot's edge in a
+    # downtrend is cash. Exits are unaffected.
     if (buy_w >= bt and sell_w < buy_w and n_buy_votes >= 2
             and vwap_buy
             and pscore >= MIN_BUY_PRED
-            and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY)):
+            and market_regime != "trending_down"):
         action = "buy";  reason = f"bw={buy_w:.1f}>={bt:.1f} v={n_buy_votes}"
     elif buy_w >= bt and sell_w < buy_w and n_buy_votes >= 2 and not vwap_buy:
         action = "hold"; reason = "hold(below_vwap)"
     elif sell_w >= st and buy_w < sell_w:
         action = "sell"; reason = f"sw={sell_w:.1f}>={st:.1f}"
     elif buy_w >= bt and market_regime == "trending_down":
-        action = "hold"; reason = f"downtrend:pred({pscore:+.0f})<{PRED_STRONG_BUY}"
+        action = "hold"; reason = "downtrend:no_new_longs"
     else:
         action = "hold"; reason = f"hold(b={buy_w:.1f},s={sell_w:.1f})"
     return action, reason, buy_w, sell_w
@@ -1330,6 +1364,12 @@ def execute(ticker, action, price, signals, reason="signal"):
 
             if is_on_cooldown(ticker):
                 print(f"  {ticker} cooldown {cooldown_remaining(ticker)}s"); return "blk:cooldown"
+
+            _sec_cd = _ticker_sector(ticker)
+            if _sec_cd and time.time() < _sector_loss_until.get(_sec_cd, 0):
+                _left = int(_sector_loss_until[_sec_cd] - time.time())
+                print(f"  {ticker} sector ({_sec_cd}) loss cooldown {_left}s")
+                return "blk:sector_cd"
 
             # Anti-chop gate: block re-entry if stopped out CHOP_BLOCK_THRESHOLD times today
             today_str = now_et().strftime("%Y-%m-%d")
@@ -2381,6 +2421,7 @@ def stats_json():
         "signal_win_rates":  get_signal_win_rates(),
         "live_mode":         LIVE_MODE,
         "daily_trade_count": daily_trade_count,
+        "max_daily_trades":  MAX_DAILY_TRADES,
         "macro_blackout":    blackout,
         "unusual_volume":    unusual_volume[:5],
         "active_tickers":    active_tickers,
