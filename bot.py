@@ -80,6 +80,12 @@ MIN_GRADE            = ["A","B","C","D"]
 COOLDOWN_STOP        = 900
 COOLDOWN_PROFIT      = 600
 COOLDOWN_SIGNAL      = 300
+COOLDOWN_LOSS        = 1800   # min cooldown after ANY losing exit — July 23 showed a
+                              # 5-min signal cooldown letting RIOT get re-bought 8 min
+                              # after a loss, then lose again
+SECTOR_LOSS_COOLDOWN = 2700   # after a losing exit, block the whole sector 45 min —
+                              # one macro move (BTC dip) was being paid for serially
+                              # across MARA/RIOT/CIFR/CLSK
 TRADING_START_H      = 9
 TRADING_START_M      = 35
 TRADING_END_H        = 15
@@ -166,6 +172,7 @@ gap_candidates    = {}
 catalyst_cache    = {}
 rvol_cache        = {}
 _daily_stop_counts     = {}   # ticker → {date_str: count}  (anti-chop gate)
+_sector_loss_until     = {}   # sector → epoch ts; block sector entries after a loss
 unusual_volume    = []
 daily_trade_count = 0
 daily_trade_date  = None
@@ -503,11 +510,14 @@ def is_correlated_with_open_position(ticker, threshold=0.75):
 
 # ── Cooldowns ─────────────────────────────────────────────────
 
-def set_cooldown(ticker, reason="signal"):
+def set_cooldown(ticker, reason="signal", was_loss=False):
     d = {"stop_loss":COOLDOWN_STOP,"take_profit":COOLDOWN_PROFIT,
          "signal":COOLDOWN_SIGNAL,"eod_close":COOLDOWN_SIGNAL,
          "partial":COOLDOWN_SIGNAL}
-    cooldowns[ticker] = {"until": time.time()+d.get(reason, COOLDOWN_SIGNAL), "reason": reason}
+    secs = d.get(reason, COOLDOWN_SIGNAL)
+    if was_loss:
+        secs = max(secs, COOLDOWN_LOSS)
+    cooldowns[ticker] = {"until": time.time()+secs, "reason": reason}
 
 def is_on_cooldown(ticker):
     cd = cooldowns.get(ticker)
@@ -1037,7 +1047,15 @@ def force_sell(ticker, price, reason="stop_loss"):
             "price":round(exit_price,2),"pnl":pnl,"reason":reason,
             "ts":int(time.time()*1000)
         })
-        set_cooldown(ticker, reason)
+        set_cooldown(ticker, reason, was_loss=whole_trade_pnl < 0)
+        # A losing exit also cools the whole sector — the correlated cluster moves
+        # together, so a fresh loss on one miner is information about all of them.
+        if whole_trade_pnl < 0:
+            _sec = _ticker_sector(ticker)
+            if _sec:
+                _sector_loss_until[_sec] = time.time() + SECTOR_LOSS_COOLDOWN
+                print(f"  Sector cooldown: {_sec} blocked "
+                      f"{SECTOR_LOSS_COOLDOWN//60}min after loss on {ticker}")
 
         today_str = now_et().strftime("%Y-%m-%d")
 
@@ -1172,17 +1190,21 @@ def make_decision(ticker, signals, price):
     # buy only when price > vwap*1.001, so requiring its vote enforces this (a
     # vetoed/warming-up VWAP correctly blocks entry too).
     vwap_buy = any(s.get("name") == "VWAP" and s.get("action") == "buy" for s in signals)
+    # HARD regime discipline: no new longs while the market is trending down. The
+    # old pred>=40 exception let July 23's RIOT/CIFR entries (+42/+41, just over
+    # the bar) buy miner bounces into a falling tape — a long-only bot's edge in a
+    # downtrend is cash. Exits are unaffected.
     if (buy_w >= bt and sell_w < buy_w and n_buy_votes >= 2
             and vwap_buy
             and pscore >= MIN_BUY_PRED
-            and not (market_regime == "trending_down" and pscore < PRED_STRONG_BUY)):
+            and market_regime != "trending_down"):
         action = "buy";  reason = f"bw={buy_w:.1f}>={bt:.1f} v={n_buy_votes}"
     elif buy_w >= bt and sell_w < buy_w and n_buy_votes >= 2 and not vwap_buy:
         action = "hold"; reason = "hold(below_vwap)"
     elif sell_w >= st and buy_w < sell_w:
         action = "sell"; reason = f"sw={sell_w:.1f}>={st:.1f}"
     elif buy_w >= bt and market_regime == "trending_down":
-        action = "hold"; reason = f"downtrend:pred({pscore:+.0f})<{PRED_STRONG_BUY}"
+        action = "hold"; reason = "downtrend:no_new_longs"
     else:
         action = "hold"; reason = f"hold(b={buy_w:.1f},s={sell_w:.1f})"
     return action, reason, buy_w, sell_w
@@ -1342,6 +1364,12 @@ def execute(ticker, action, price, signals, reason="signal"):
 
             if is_on_cooldown(ticker):
                 print(f"  {ticker} cooldown {cooldown_remaining(ticker)}s"); return "blk:cooldown"
+
+            _sec_cd = _ticker_sector(ticker)
+            if _sec_cd and time.time() < _sector_loss_until.get(_sec_cd, 0):
+                _left = int(_sector_loss_until[_sec_cd] - time.time())
+                print(f"  {ticker} sector ({_sec_cd}) loss cooldown {_left}s")
+                return "blk:sector_cd"
 
             # Anti-chop gate: block re-entry if stopped out CHOP_BLOCK_THRESHOLD times today
             today_str = now_et().strftime("%Y-%m-%d")
