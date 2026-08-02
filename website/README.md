@@ -31,9 +31,13 @@ cd website && python3 -m http.server 8000
 ## Sections
 
 - **Hero** with a live browser-frame mockup of a sample client site
-- **Services** — website builds, online stores, local SEO, booking, copy, care
+- **Services** — website builds, online stores, local SEO, booking, copy, care,
+  and custom software
+- **Custom software** — a dedicated feature panel (booking systems, portals,
+  inventory, dashboards, automations, integrations)
 - **How it works** — a four-step process from discovery call to launch
-- **Pricing** — three build tiers, monthly care plans, and add-ons
+- **Pricing** — three build tiers, a custom-software callout, monthly care
+  plans, and add-ons
 - **FAQ** and a closing call-to-action
 
 ## Make it yours
