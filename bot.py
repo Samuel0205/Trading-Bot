@@ -58,6 +58,9 @@ def get_catalyst_tracker():
 API_KEY    = os.environ.get("APCA_API_KEY_ID")
 SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
 LIVE_MODE  = os.environ.get("LIVE_TRADING", "false").lower() == "true"
+# "simple" = the one-rule ETF trend strategy in simple.py (default).
+# "intraday" = the old multi-signal day-trading engine, kept for reference.
+STRATEGY_MODE = os.environ.get("STRATEGY_MODE", "simple").lower()
 BASE_URL   = "https://api.alpaca.markets" if LIVE_MODE else "https://paper-api.alpaca.markets"
 
 if not API_KEY or not SECRET_KEY:
@@ -2056,6 +2059,68 @@ def scanner_loop():
             print(f"Scanner loop error: {e}")
         time.sleep(60)
 
+def simple_loop():
+    """
+    The entire trading loop for STRATEGY_MODE=simple.
+
+    Once per trading day at 10:00 AM ET, ask simple.py what we should own and
+    fix any difference. Signals come from completed daily bars, so there is no
+    rush to act at a precise moment and nothing to babysit intraday.
+    """
+    import simple
+    last_run_date = None
+    print(f"Simple loop started | universe={simple.UNIVERSE} "
+          f"| hold top {simple.MAX_HOLDINGS} above {simple.TREND_DAYS}d avg")
+
+    while True:
+        try:
+            _hb("simple_loop")
+            now = now_et()
+
+            due = (now.weekday() < 5 and now.hour >= 10
+                   and last_run_date != now.date() and is_market_open())
+            if due:
+                last_run_date = now.date()
+                print(f"=== Daily check {now.strftime('%Y-%m-%d %H:%M')} ET ===")
+                try:
+                    actions = simple.rebalance(api)
+                    for a in actions:
+                        print(f"  {'🔴 LIVE' if LIVE_MODE else 'PAPER'} {a}")
+                        save_alert("INFO", a, a.split()[2] if len(a.split()) > 2 else None)
+                except Exception as e:
+                    print(f"  Rebalance error: {e}")
+
+            # Dashboard state — cheap, uses cached positions/account only
+            try:
+                acct = get_account_state()
+                held = {}
+                for sym, pos in ((p.symbol, p) for p in api.list_positions()):
+                    held[sym] = {
+                        "price":  round(float(pos.current_price or 0), 2),
+                        "qty":    int(float(pos.qty)),
+                        "pnl":    round(float(pos.unrealized_pl or 0), 2),
+                        "action": "hold",
+                    }
+                socketio.emit("state", {
+                    "tickers": held,
+                    "account": acct,
+                    "trades":  trade_log[:40],
+                    "market_status": "open" if is_market_open() else "closed",
+                    "message": ("Simple mode — daily 200d trend check at 10:00 AM ET"
+                                if not held else ""),
+                    "live": LIVE_MODE, "regime": market_regime, "blackout": False,
+                    "macro": macro_status,
+                    "mins_since_open": mins_since_open(),
+                    "mins_until_close": mins_until_close(),
+                })
+            except Exception as e:
+                print(f"  simple state emit error: {e}")
+
+        except Exception as e:
+            _thread_errors["simple_loop"] = str(e)
+            print(f"Simple loop error: {e}")
+        time.sleep(300)
+
 def db_snapshot_loop():
     global last_db_snapshot
     while True:
@@ -2749,9 +2814,14 @@ def restore_trade_state():
 
 def _start_bot():
     port = int(os.environ.get("PORT", 10000))
-    print(f"=== BOT v12 | port {port} | {'🔴 LIVE' if LIVE_MODE else '📄 PAPER'} ===")
-    print(f"=== Improvements: limit orders | confidence scoring | correlation check | "
-          f"social+insider signals | dynamic macro calendar | single RVOL source ===")
+    print(f"=== BOT v13 | port {port} | {'🔴 LIVE' if LIVE_MODE else '📄 PAPER'} "
+          f"| STRATEGY_MODE={STRATEGY_MODE} ===")
+    if STRATEGY_MODE == "simple":
+        print("=== SIMPLE MODE: hold the strongest big ETFs above their 200-day "
+              "average, else cash. One check per day at 10:00 AM ET. ===")
+        print("=== Set STRATEGY_MODE=intraday to restore the old day-trading engine ===")
+    else:
+        print("=== INTRADAY MODE: legacy multi-signal day-trading engine ===")
 
     try:
         init_db()
@@ -2761,6 +2831,19 @@ def _start_bot():
         print(f"=== DB init error: {e} — continuing without persistence ===")
 
     update_signal_weights_from_db()
+
+    def simple_startup():
+        time.sleep(3)
+        try:
+            api.cancel_all_orders()
+        except Exception:
+            pass
+        try:
+            import simple
+            st = simple.status(api)
+            print(f"=== Simple mode ready | targets={st['targets'] or 'CASH'} ===")
+        except Exception as e:
+            print(f"Simple startup error: {e}")
 
     def startup():
         time.sleep(3)
@@ -2823,13 +2906,20 @@ def _start_bot():
             print(f"Startup macro error: {e}")
         print(f"=== Ready | tickers={active_tickers} | regime={market_regime} ===")
 
-    threading.Thread(target=startup,          daemon=True).start()
-    threading.Thread(target=bot_loop,         daemon=True).start()
-    threading.Thread(target=scanner_loop,     daemon=True).start()
-    threading.Thread(target=prediction_loop,  daemon=True).start()
-    threading.Thread(target=premarket_loop,   daemon=True).start()
-    threading.Thread(target=macro_loop,       daemon=True).start()
-    threading.Thread(target=db_snapshot_loop, daemon=True).start()
+    if STRATEGY_MODE == "simple":
+        # One rule, one loop. None of the intraday machinery runs — no scanner,
+        # no predictions, no gap/news/rvol promotion, no 30-second decisions.
+        threading.Thread(target=simple_startup,   daemon=True).start()
+        threading.Thread(target=simple_loop,      daemon=True).start()
+        threading.Thread(target=db_snapshot_loop, daemon=True).start()
+    else:
+        threading.Thread(target=startup,          daemon=True).start()
+        threading.Thread(target=bot_loop,         daemon=True).start()
+        threading.Thread(target=scanner_loop,     daemon=True).start()
+        threading.Thread(target=prediction_loop,  daemon=True).start()
+        threading.Thread(target=premarket_loop,   daemon=True).start()
+        threading.Thread(target=macro_loop,       daemon=True).start()
+        threading.Thread(target=db_snapshot_loop, daemon=True).start()
 
     return port
 
